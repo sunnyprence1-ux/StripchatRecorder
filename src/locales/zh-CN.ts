@@ -333,6 +333,7 @@ export default {
 		connections: "{n} 个连接",
 		uptime: "运行 {t}",
 		copyUrl: "复制地址",
+		stopRelay: "停止转发",
 		desktopUnsupported: "转发流功能仅在 Server 模式下可用",
 		state: {
 			live: "直播中",

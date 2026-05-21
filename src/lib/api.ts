@@ -254,7 +254,7 @@ const COMMAND_MAP: Record<
 	},
 	stop_relay: {
 		method: "POST",
-		url: (a) => `/relay/${a.username}/stop`,
+		url: (a) => `/api/relay/${a.username}/stop`,
 	},
 	get_relay_status: {
 		method: "GET",

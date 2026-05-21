@@ -3,6 +3,7 @@
 //! 端点：
 //! - GET  /stream/{modelname}       → 持续输出 MPEG-TS 流（按需启动 worker）
 //! - GET  /api/relay/sessions       → 查询所有活跃转发会话状态
+//! - POST /api/relay/{modelname}/stop → 强制停止指定主播的转发 worker
 //!
 //! 转发流永远可访问，无需手动启动：
 //! - 有请求时自动启动 worker
@@ -118,4 +119,19 @@ pub async fn relay_sessions(
 ) -> impl IntoResponse {
     let sessions = s.relay_manager.get_all_status();
     Json(sessions)
+}
+
+/// POST /api/relay/{modelname}/stop
+///
+/// 强制停止指定主播的转发 worker，无论当前是否有播放器连接。
+/// 适用于 PotPlayer 等在关闭时会短暂重连、导致空闲超时无法触发的播放器。
+///
+/// Forcefully stops the relay worker for the given streamer, regardless of active connections.
+/// Useful for players like PotPlayer that briefly reconnect on close, preventing idle timeout.
+pub async fn stop_relay_handler(
+    AxumState(s): AxumState<RelayState>,
+    Path(modelname): Path<String>,
+) -> impl IntoResponse {
+    s.relay_manager.remove(&modelname);
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
 }

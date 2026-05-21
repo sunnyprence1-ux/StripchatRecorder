@@ -38,7 +38,9 @@ pub fn start_streamer(
 
 /// 无播放器连接超过此时长（秒）后自动停止转发 worker。
 /// Auto-stop relay worker after this many seconds with no connected players.
-const IDLE_STOP_SECS: u64 = 5; // 5 秒 / 5 seconds
+/// 设为 30 秒以兼容 PotPlayer 等在关闭时会短暂重连的播放器。
+/// Set to 30s to accommodate players like PotPlayer that briefly reconnect on close.
+const IDLE_STOP_SECS: u64 = 30;
 
 /// 子函数退出原因 / Reason a sub-function exited
 enum WorkerExit {

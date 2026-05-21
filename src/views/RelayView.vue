@@ -17,7 +17,7 @@
 	import { Badge } from "@/components/ui/badge";
 	import { Button } from "@/components/ui/button";
 	import { Card, CardContent } from "@/components/ui/card";
-	import { Copy, Check, Radio, Wifi, WifiOff, AlertCircle, Loader } from "lucide-vue-next";
+	import { Copy, Check, Radio, Wifi, WifiOff, AlertCircle, Loader, Square } from "lucide-vue-next";
 	import { useI18n } from "vue-i18n";
 	import { useStreamersStore } from "@/stores/streamers";
 
@@ -137,6 +137,22 @@
 				copiedMap.value[username] = false;
 			}, 2000);
 		} catch {}
+	}
+
+	const stoppingMap = ref<Record<string, boolean>>({});
+
+	async function stopRelay(username: string) {
+		stoppingMap.value[username] = true;
+		try {
+			await call("stop_relay", { username });
+			// 立即从本地列表移除，无需等待下次轮询
+			// Remove from local list immediately without waiting for next poll
+			sessions.value = sessions.value.filter(s => s.username !== username);
+		} catch {
+			// 静默失败，下次轮询会自动同步 / Fail silently; next poll will sync
+		} finally {
+			stoppingMap.value[username] = false;
+		}
 	}
 
 	function stateVariant(state: StreamState): Record<string, string> {
@@ -303,6 +319,17 @@
 						>
 							<Check v-if="copiedMap[session.username]" class="size-3.5 text-green-400" />
 							<Copy v-else class="size-3.5" />
+						</Button>
+						<Button
+							size="sm"
+							variant="ghost"
+							class="shrink-0 px-2 h-7 text-muted-foreground hover:text-red-400"
+							:title="t('relay.stopRelay')"
+							:disabled="stoppingMap[session.username]"
+							@click="stopRelay(session.username)"
+						>
+							<Loader v-if="stoppingMap[session.username]" class="size-3.5 animate-spin" />
+							<Square v-else class="size-3.5" />
 						</Button>
 					</div>
 				</CardContent>

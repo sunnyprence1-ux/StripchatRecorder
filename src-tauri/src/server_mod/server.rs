@@ -10,7 +10,7 @@
 use crate::config::settings::AppState;
 use crate::core::emitter::{BroadcastEmitter, EmitterExt, Event};
 use crate::recording::recorder::RecorderManager;
-use crate::relay::handler::{RelayState, relay_sessions, stream_handler};
+use crate::relay::handler::{RelayState, relay_sessions, stop_relay_handler, stream_handler};
 use crate::relay::state::RelayManager;
 use crate::streaming::monitor::StatusMonitor;
 use axum::extract::Query;
@@ -105,6 +105,7 @@ pub fn build_router(state: ServerState) -> Router {
     // /api/relay/sessions 路由 / /api/relay/sessions route
     let relay_api_router: Router<()> = Router::new()
         .route("/sessions", get(relay_sessions))
+        .route("/{modelname}/stop", post(stop_relay_handler))
         .with_state(relay_state);
 
     // 主路由器先固化 state，再合并转发路由

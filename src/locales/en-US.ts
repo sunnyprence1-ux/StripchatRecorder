@@ -334,6 +334,7 @@ export default {
 		connections: "{n} connection(s)",
 		uptime: "Up {t}",
 		copyUrl: "Copy URL",
+		stopRelay: "Stop Relay",
 		desktopUnsupported: "Relay streams are only available in Server mode",
 		state: {
 			live: "Live",
