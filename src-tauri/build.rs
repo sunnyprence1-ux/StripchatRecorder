@@ -33,12 +33,5 @@ fn main() {
     // Ensure dist/ exists so RustEmbed doesn't fail when the frontend hasn't been built yet
     let _ = fs::create_dir_all("../dist");
 
-    tauri_build::build();
-
-    // Windows 上保留控制台子系统，使 TUI 首次配置界面可以正常显示。
-    // Tauri 默认会将子系统设为 WINDOWS（无控制台），这里覆盖回 CONSOLE。
-    // Keep the console subsystem on Windows so the first-launch TUI works correctly.
-    // Tauri's build script sets /SUBSYSTEM:WINDOWS by default; override it back to CONSOLE.
-    #[cfg(target_os = "windows")]
-    println!("cargo:rustc-link-arg=/SUBSYSTEM:CONSOLE");
+    tauri_build::build()
 }
