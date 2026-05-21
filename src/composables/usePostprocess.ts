@@ -14,10 +14,12 @@
  * - Restoring task state from backend after page refresh
  */
 
-import { ref } from "vue";
 import { call } from "@/lib/api";
 import { usePostprocessStore } from "@/stores/postprocess";
+import { usePpStatusStore } from "@/stores/ppStatus";
+import { storeToRefs } from "pinia";
 import { useNotify } from "./useNotify";
+import { useI18n } from "vue-i18n";
 
 /** 后处理任务状态 / Post-processing task status */
 export type PpStatus = "idle" | "waiting" | "running" | "done" | "error";
@@ -46,6 +48,11 @@ export interface PpProgress {
 	moduleExecLabel: string;
 	/** 当前模块完整显示文字 / Full display text for current module */
 	currentModuleText: string;
+	/**
+	 * 各模块执行结果（完成后填充，来自 postprocess-done 事件或 meta pp_results）。
+	 * Per-module execution results (filled after completion, from postprocess-done event or meta pp_results).
+	 */
+	moduleResults?: { moduleId: string; success: boolean; message: string }[];
 }
 
 /**
@@ -65,6 +72,19 @@ function formatPct2(value: number): string {
 	return `${clampPct2(value).toFixed(2)}%`;
 }
 
+/** 传入 makePpProgress 的 i18n 标签 / i18n labels passed to makePpProgress */
+export interface PpProgressLabels {
+	/** 无模块名时的占位文字 / Placeholder when module name is empty */
+	processing: string;
+	/** 无进度数据时的标签文字 / Label when no progress data is available */
+	waiting: string;
+}
+
+const DEFAULT_LABELS: PpProgressLabels = {
+	processing: "processing",
+	waiting: "waiting",
+};
+
 /**
  * 根据整体进度和模块进度构建 PpProgress 对象。
  * Build a PpProgress object from overall and module progress values.
@@ -75,6 +95,9 @@ function formatPct2(value: number): string {
  * @param moduleTotal - 当前模块总进度 / Current module total progress
  * @param moduleName - 当前模块名称 / Current module name
  * @param overallPctFallback - 整体进度的备用百分比（来自后端上报）/ Fallback overall percentage (from backend)
+ * @param prevModuleName - 上一次的模块名称（用于防止进度倒退）/ Previous module name (for regression prevention)
+ * @param prevModulePct - 上一次的模块进度（用于防止进度倒退）/ Previous module progress (for regression prevention)
+ * @param labels - i18n 标签 / i18n labels
  */
 export function makePpProgress(
 	overallDone: number,
@@ -85,6 +108,7 @@ export function makePpProgress(
 	overallPctFallback = 0,
 	prevModuleName = "",
 	prevModulePct = 0,
+	labels: PpProgressLabels = DEFAULT_LABELS,
 ): PpProgress {
 	const overallPctByNode =
 		overallTotal > 0 ? clampPct2((overallDone * 100) / overallTotal) : 0;
@@ -101,8 +125,11 @@ export function makePpProgress(
 		: 0;
 	// 同一模块内防止进度倒退；模块切换时允许从 0 重新开始
 	// Prevent regression within the same module; allow reset to 0 on module switch
-	const isSameModule = moduleName.trim() === prevModuleName.trim() && moduleName.trim() !== "";
-	const modulePct = isSameModule ? Math.max(rawModulePct, prevModulePct) : rawModulePct;
+	const isSameModule =
+		moduleName.trim() === prevModuleName.trim() && moduleName.trim() !== "";
+	const modulePct = isSameModule
+		? Math.max(rawModulePct, prevModulePct)
+		: rawModulePct;
 
 	// 计算当前执行的模块序号（1-based）
 	// Calculate the current executing module index (1-based)
@@ -114,7 +141,7 @@ export function makePpProgress(
 		moduleExecLabel = `${moduleIndex}/${overallTotal}`;
 	}
 
-	const normalizedModuleName = moduleName.trim() || "处理中";
+	const normalizedModuleName = moduleName.trim() || labels.processing;
 
 	return {
 		overallDone,
@@ -124,7 +151,7 @@ export function makePpProgress(
 		moduleDone,
 		moduleTotal,
 		modulePct,
-		moduleLabel: hasModuleProgress ? formatPct2(modulePct) : "等待进度…",
+		moduleLabel: hasModuleProgress ? formatPct2(modulePct) : labels.waiting,
 		moduleName: normalizedModuleName,
 		moduleExecLabel,
 		currentModuleText: moduleExecLabel
@@ -139,14 +166,18 @@ export function makePpProgress(
  */
 export function usePostprocess() {
 	const ppStore = usePostprocessStore();
+	const ppStatusStore = usePpStatusStore();
 	const { toast } = useNotify();
+	const { t } = useI18n();
 
-	/** 各文件路径的后处理状态 / Post-processing status per file path */
-	const ppStatus = ref<Record<string, PpStatus>>({});
-	/** 各文件路径的后处理进度 / Post-processing progress per file path */
-	const ppProgress = ref<Record<string, PpProgress>>({});
-	/** 各文件路径的模块输出路径（如 contact_sheet 图片路径）/ Module output paths per file path */
-	const moduleOutputs = ref<Record<string, Record<string, string>>>({});
+	/** i18n 标签，传入 makePpProgress / i18n labels passed to makePpProgress */
+	const ppLabels = (): PpProgressLabels => ({
+		processing: t("usePostprocess.processing"),
+		waiting: t("usePostprocess.waitingProgress"),
+	});
+
+	/** 各文件路径的后处理状态（来自全局 store）/ Post-processing status per file path (from global store) */
+	const { ppStatus, ppProgress, moduleOutputs } = storeToRefs(ppStatusStore);
 
 	/** 是否在 Tauri 桌面环境中运行 / Whether running in Tauri desktop environment */
 	const isTauri =
@@ -194,11 +225,11 @@ export function usePostprocess() {
 			const result = await call<Record<string, string>>("get_module_outputs", {
 				path,
 			});
-			if (Object.keys(result).length > 0) {
+			if (result && Object.keys(result).length > 0) {
 				moduleOutputs.value = { ...moduleOutputs.value, [path]: result };
 			}
 		} catch {
-			toast("获取模块输出失败", "error");
+			toast(t("usePostprocess.fetchOutputFailed"), "error");
 		}
 	}
 
@@ -210,7 +241,7 @@ export function usePostprocess() {
 	 */
 	async function runPostprocess(path: string) {
 		ppStatus.value[path] = "running";
-		ppProgress.value[path] = makePpProgress(0, 0, 0, 0, "", 0);
+		ppProgress.value[path] = makePpProgress(0, 0, 0, 0, "", 0, "", 0, ppLabels());
 		try {
 			await call("run_postprocess_cmd", { path });
 		} catch (e) {
@@ -222,7 +253,10 @@ export function usePostprocess() {
 
 	/**
 	 * 从后端恢复所有后处理任务状态（页面刷新或 SSE 重连后调用）。
+	 * 仅恢复运行中/等待中的瞬态任务；done/error 状态由 list_recordings 返回的 meta 字段负责。
+	 *
 	 * Restore all post-processing task states from the backend (called after page refresh or SSE reconnect).
+	 * Only restores running/waiting transient tasks; done/error status is handled by meta fields from list_recordings.
 	 */
 	async function restoreFromBackend() {
 		try {
@@ -240,35 +274,15 @@ export function usePostprocess() {
 				}[]
 			>("get_postprocess_tasks");
 			for (const t of tasks) {
-				if (t.status === "error") {
-					ppStatus.value[t.path] = "error";
-					continue;
-				}
-				if (t.status === "done") {
-					ppStatus.value[t.path] = "done";
-					ppProgress.value[t.path] = makePpProgress(
-						t.done,
-						t.total,
-						t.modDone,
-						t.modTotal,
-						t.moduleName,
-						t.pct,
-					);
-					// 推断并缓存模块输出路径 / Infer and cache module output paths
-					const inferred = inferModuleOutputs(t.path);
-					if (Object.keys(inferred).length > 0) {
-						moduleOutputs.value = {
-							...moduleOutputs.value,
-							[t.path]: inferred,
-						};
-					}
-					continue;
-				}
-				// 仅恢复来自内存的运行中/等待中任务（持久化任务已在 done/error 中处理）
-				// Only restore in-memory running/waiting tasks (persisted tasks handled above)
+				// 仅恢复来自内存的运行中/等待中任务
+				// Only restore in-memory running/waiting tasks
 				if (!t.fromMemory) continue;
 				if (t.status === "waiting") {
-					ppStatus.value[t.path] = "waiting";
+					// 若已有更新的状态（running），不降级覆盖
+					// Don't downgrade if a newer status (running) is already set
+					if (ppStatus.value[t.path] !== "running") {
+						ppStatus.value[t.path] = "waiting";
+					}
 				} else if (t.status === "running") {
 					ppStatus.value[t.path] = t.status as PpStatus;
 					ppProgress.value[t.path] = makePpProgress(
@@ -278,11 +292,14 @@ export function usePostprocess() {
 						t.modTotal,
 						t.moduleName,
 						t.pct,
+						"",
+						0,
+						ppLabels(),
 					);
 				}
 			}
 		} catch {
-			toast("获取后处理任务失败", "error");
+			toast(t("usePostprocess.fetchTasksFailed"), "error");
 		}
 	}
 
@@ -292,6 +309,7 @@ export function usePostprocess() {
 	 *
 	 * @param payload - 后端推送的完成事件数据 / Done event data from backend
 	 * @param onLoad - 文件列表刷新回调 / File list reload callback
+	 * @param isFileDeleted - 文件是否已被用户删除（为 true 时跳过 toast 提示）/ Whether the file was deleted by the user (skip toast if true)
 	 */
 	function handlePostprocessDone(
 		payload: {
@@ -299,46 +317,65 @@ export function usePostprocess() {
 			results: { moduleId: string; success: boolean; message: string }[];
 		},
 		onLoad: () => Promise<void>,
+		isFileDeleted?: () => boolean,
 	) {
 		const allOk = payload.results.every((r) => r.success);
 		ppStatus.value[payload.path] = allOk ? "done" : "error";
+
+		// 若文件已被用户删除，跳过所有 toast 提示，仅刷新列表
+		// If the file was deleted by the user, skip all toasts and just reload
+		const deleted = isFileDeleted?.() ?? false;
+
 		if (allOk) {
 			// 所有模块成功：更新进度为 100% 并收集输出路径
 			// All modules succeeded: set progress to 100% and collect output paths
-			ppProgress.value[payload.path] = makePpProgress(
-				payload.results.length,
-				payload.results.length,
-				0,
-				0,
-				"",
-				100,
-			);
-			const names = payload.results.map((r) => r.moduleId).join(" → ");
-			toast(`后处理完成：${names}`, "success");
-			// 从模块返回的 OUTPUT: 前缀消息中提取输出路径
-			// Extract output paths from module messages prefixed with "OUTPUT:"
-			const outputs: Record<string, string> = {};
-			for (const r of payload.results) {
-				if (r.success && r.message.startsWith("OUTPUT:")) {
-					outputs[r.moduleId] = r.message.slice("OUTPUT:".length).trim();
-				}
+			ppProgress.value[payload.path] = {
+				...makePpProgress(
+					payload.results.length,
+					payload.results.length,
+					0,
+					0,
+					"",
+					100,
+					"",
+					0,
+					ppLabels(),
+				),
+				moduleResults: payload.results,
+			};
+			if (!deleted) {
+				const names = payload.results.map((r) => r.moduleId).join(" → ");
+				toast(t("usePostprocess.done", { modules: names }), "success");
 			}
-			// 合并推断路径和实际输出路径，实际路径优先
-			// Merge inferred and actual output paths, actual paths take precedence
+			// NodeResult.output 字段在序列化时被 #[serde(skip)] 跳过，前端无法直接获取。
+			// 使用 inferModuleOutputs 根据流水线配置推断输出路径（如 contact_sheet 图片路径）。
+			// NodeResult.output is skipped during serialization (#[serde(skip)]), so the frontend
+			// cannot access it directly. Use inferModuleOutputs to derive output paths from the
+			// pipeline config (e.g., the contact_sheet image path).
 			const inferred = inferModuleOutputs(payload.path);
-			const merged = { ...inferred, ...outputs };
-			if (Object.keys(merged).length > 0) {
+			if (Object.keys(inferred).length > 0) {
 				moduleOutputs.value = {
 					...moduleOutputs.value,
-					[payload.path]: merged,
+					[payload.path]: inferred,
 				};
 			} else {
 				fetchModuleOutputs(payload.path);
 			}
 		} else {
-			delete ppProgress.value[payload.path];
-			const failed = payload.results.find((r) => !r.success);
-			toast(`后处理失败 [${failed?.moduleId}]：${failed?.message}`, "error");
+			ppProgress.value[payload.path] = {
+				...makePpProgress(0, payload.results.length, 0, 0, "", 0, "", 0, ppLabels()),
+				moduleResults: payload.results,
+			};
+			if (!deleted) {
+				const failed = payload.results.find((r) => !r.success);
+				toast(
+					t("usePostprocess.failed", {
+						moduleId: failed?.moduleId,
+						message: failed?.message,
+					}),
+					"error",
+				);
+			}
 		}
 		return onLoad();
 	}
@@ -350,9 +387,7 @@ export function usePostprocess() {
 	 * @param path - 视频文件路径 / Video file path
 	 */
 	function removeFile(path: string) {
-		delete ppStatus.value[path];
-		delete ppProgress.value[path];
-		delete moduleOutputs.value[path];
+		ppStatusStore.removeFile(path);
 	}
 
 	return {

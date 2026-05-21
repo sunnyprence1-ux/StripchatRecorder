@@ -7,20 +7,22 @@
 //! plus an SSE real-time event stream.
 //! Also embeds frontend static assets (compiled into the binary via rust-embed).
 
-use crate::core::emitter::{BroadcastEmitter, EmitterExt, Event};
-use crate::streaming::monitor::StatusMonitor;
-use crate::recording::recorder::RecorderManager;
 use crate::config::settings::AppState;
+use crate::core::emitter::{BroadcastEmitter, EmitterExt, Event};
+use crate::recording::recorder::RecorderManager;
+use crate::relay::handler::{RelayState, relay_sessions, stream_handler};
+use crate::relay::state::RelayManager;
+use crate::streaming::monitor::StatusMonitor;
 use axum::extract::Query;
 use axum::{
+    Json, Router,
     extract::{Path, State as AxumState},
-    http::{header, StatusCode, Uri},
+    http::{StatusCode, Uri, header},
     response::{
-        sse::{self, Sse},
         IntoResponse, Response,
+        sse::{self, Sse},
     },
     routing::{delete, get, post},
-    Json, Router,
 };
 use rust_embed::RustEmbed;
 use serde::Deserialize;
@@ -64,6 +66,8 @@ pub struct ServerState {
     pub emitter: Arc<dyn crate::core::emitter::Emitter>,
     /// SSE 广播发送端 / SSE broadcast sender
     pub broadcast_tx: broadcast::Sender<Event>,
+    /// 转发管理器 / Relay manager
+    pub relay_manager: Arc<RelayManager>,
 }
 
 struct ApiError(String);
@@ -90,18 +94,35 @@ pub fn build_router(state: ServerState) -> Router {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    Router::new()
+    let relay_state = RelayState {
+        app_state: Arc::clone(&state.app_state),
+        relay_manager: Arc::clone(&state.relay_manager),
+    };
+    // /stream/{modelname} 路由（独立 state）/ /stream/{modelname} route (independent state)
+    let stream_router: Router<()> = Router::new()
+        .route("/{modelname}", get(stream_handler))
+        .with_state(relay_state.clone());
+    // /api/relay/sessions 路由 / /api/relay/sessions route
+    let relay_api_router: Router<()> = Router::new()
+        .route("/sessions", get(relay_sessions))
+        .with_state(relay_state);
+
+    // 主路由器先固化 state，再合并转发路由
+    // Finalize main router state first, then merge relay router
+    let main_router: Router<()> = Router::new()
         .route("/api/streamers", get(list_streamers).post(add_streamer))
         .route("/api/streamers/{name}", delete(remove_streamer))
         .route("/api/streamers/{name}/auto-record", post(set_auto_record))
         .route("/api/streamers/{name}/start", post(start_recording))
         .route("/api/streamers/{name}/stop", post(stop_recording))
+        .route("/api/streamers/{name}/verify", get(verify_streamer))
         .route("/api/settings", get(get_settings).post(save_settings))
         .route(
             "/api/mouflon-keys",
             get(list_mouflon_keys).post(add_mouflon_key),
         )
         .route("/api/mouflon-keys/{pkey}", delete(remove_mouflon_key))
+        .route("/api/mouflon-keys/sync", post(sync_mouflon_keys))
         .route("/api/startup-warnings", get(get_startup_warnings_handler))
         .route(
             "/api/startup-warnings/pp-results",
@@ -128,9 +149,15 @@ pub fn build_router(state: ServerState) -> Router {
         .route("/api/recordings/module-outputs", post(get_module_outputs))
         .route("/api/files", get(serve_output_file))
         .route("/api/events", get(sse_handler))
-        .layer(cors)
         .with_state(state)
-        .fallback(static_handler)
+        .fallback(static_handler);
+
+    // 合并转发路由（两者都是 Router<()>，可以直接 merge）
+    // Merge relay routes (both are Router<()>, can merge directly)
+    main_router
+        .nest("/stream", stream_router)
+        .nest("/api/relay", relay_api_router)
+        .layer(cors)
 }
 
 async fn sse_handler(
@@ -144,7 +171,14 @@ async fn sse_handler(
                     let data = format!(r#"{{"event":"{}","payload":{}}}"#, e.name, e.payload);
                     yield Ok(sse::Event::default().data(data));
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    // 队列溢出，丢失了 n 条事件；断开连接让前端重连并恢复状态
+                    // Queue overflow, lost n events; close connection so frontend reconnects and restores state
+                    tracing::warn!("SSE broadcast lagged, {} events dropped", n);
+                    let data = r#"{"event":"sse-lagged","payload":{}}"#;
+                    yield Ok(sse::Event::default().data(data));
+                    break;
+                }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
@@ -278,7 +312,8 @@ async fn start_recording(
             settings.cdn_proxy_url.as_deref(),
             settings.sc_mirror_url.as_deref(),
         )
-        .map_err(ApiError::from)?;
+        .map_err(ApiError::from)?
+        .with_mouflon_keys(s.app_state.get_mouflon_keys());
         let info = api
             .get_stream_info(&name, true)
             .await
@@ -310,6 +345,26 @@ async fn stop_recording(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+async fn verify_streamer(
+    AxumState(s): AxumState<ServerState>,
+    Path(name): Path<String>,
+) -> ApiResult<serde_json::Value> {
+    let settings = s.app_state.get_settings();
+    let api = crate::streaming::stripchat::StripchatApi::new_api_only(
+        settings.api_proxy_url.as_deref(),
+        settings.cdn_proxy_url.as_deref(),
+        settings.sc_mirror_url.as_deref(),
+    )
+    .map_err(ApiError::from)?;
+    match api.get_stream_info(&name, false).await {
+        Ok(_) => Ok(Json(serde_json::json!({ "exists": true }))),
+        Err(crate::core::error::AppError::UserNotFound(_)) => {
+            Ok(Json(serde_json::json!({ "exists": false })))
+        }
+        Err(e) => Err(ApiError(e.to_string())),
+    }
+}
+
 async fn get_settings(
     AxumState(s): AxumState<ServerState>,
 ) -> ApiResult<crate::config::settings::Settings> {
@@ -330,7 +385,7 @@ async fn save_settings(
 
 async fn list_mouflon_keys(AxumState(s): AxumState<ServerState>) -> ApiResult<serde_json::Value> {
     Ok(Json(
-        serde_json::to_value(s.app_state.get_mouflon_keys()).unwrap(),
+        serde_json::to_value(s.app_state.get_mouflon_keys_store()).unwrap(),
     ))
 }
 
@@ -348,7 +403,7 @@ async fn add_mouflon_key(
         .add_mouflon_key(&body.pkey, &body.pdkey)
         .map_err(ApiError::from)?;
     s.emitter
-        .emit("mouflon-keys-updated", &s.app_state.get_mouflon_keys());
+        .emit("mouflon-keys-updated", &s.app_state.get_mouflon_keys_store());
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -360,8 +415,34 @@ async fn remove_mouflon_key(
         .remove_mouflon_key(&pkey)
         .map_err(ApiError::from)?;
     s.emitter
-        .emit("mouflon-keys-updated", &s.app_state.get_mouflon_keys());
+        .emit("mouflon-keys-updated", &s.app_state.get_mouflon_keys_store());
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// 手动触发一次 Mouflon Keys 从 Worker 同步（忽略时间间隔，强制比对 updated_at）。
+/// Manually trigger a Mouflon Keys sync from the Worker (bypasses interval, still compares updated_at).
+async fn sync_mouflon_keys(AxumState(s): AxumState<ServerState>) -> ApiResult<serde_json::Value> {
+    let settings = s.app_state.get_settings();
+    let url = settings
+        .mouflon_sync_url
+        .as_deref()
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| ApiError("未配置 mouflon_sync_url".into()))?
+        .to_string();
+    let token = settings.mouflon_sync_token.clone();
+
+    let updated = s
+        .app_state
+        .sync_mouflon_keys_from_worker(&url, token.as_deref())
+        .await
+        .map_err(ApiError::from)?;
+
+    if updated {
+        s.emitter
+            .emit("mouflon-keys-updated", &s.app_state.get_mouflon_keys_store());
+    }
+
+    Ok(Json(serde_json::json!({ "updated": updated })))
 }
 
 async fn get_startup_warnings_handler(
@@ -372,8 +453,8 @@ async fn get_startup_warnings_handler(
         let data = state.data.read();
         let missing_pp_results: Vec<String> = data
             .pp_results
-            .keys()
-            .filter(|path| !std::path::Path::new(path).exists())
+            .iter()
+            .filter(|path| !std::path::Path::new(path.as_str()).exists())
             .cloned()
             .collect();
         serde_json::json!({
@@ -396,9 +477,7 @@ async fn remove_missing_pp_results_handler(
     Json(body): Json<RemovePpResultsBody>,
 ) -> ApiResult<serde_json::Value> {
     let mut data = s.app_state.data.write();
-    for path in &body.paths {
-        data.pp_results.remove(path);
-    }
+    data.pp_results.retain(|p| !body.paths.contains(p));
     drop(data);
     s.app_state.save().map_err(ApiError::from)?;
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -599,9 +678,10 @@ async fn save_pipeline(
 }
 
 async fn list_modules() -> ApiResult<serde_json::Value> {
-    let modules: Vec<crate::postprocess::pipeline::ModuleInfo> = tokio::task::spawn_blocking(crate::postprocess::pipeline::discover_modules)
-        .await
-        .unwrap_or_default();
+    let modules: Vec<crate::postprocess::pipeline::ModuleInfo> =
+        tokio::task::spawn_blocking(crate::postprocess::pipeline::discover_modules)
+            .await
+            .unwrap_or_default();
     Ok(Json(serde_json::to_value(modules).unwrap()))
 }
 
@@ -703,10 +783,13 @@ pub async fn run_server(port: u16) {
 
     let app_state = AppState::new().expect("Failed to initialize app state");
     let recorder = RecorderManager::new(Arc::clone(&app_state));
-    let (tx, _) = broadcast::channel::<Event>(256);
+    let (tx, _) = broadcast::channel::<Event>(4096);
     let emitter: Arc<dyn crate::core::emitter::Emitter> = Arc::new(BroadcastEmitter(tx.clone()));
     let monitor = StatusMonitor::new(Arc::clone(&app_state), Arc::clone(&recorder));
-    crate::watcher::fs_watch::start_recordings_dir_watcher(Arc::clone(&app_state), Arc::clone(&emitter));
+    crate::watcher::fs_watch::start_recordings_dir_watcher(
+        Arc::clone(&app_state),
+        Arc::clone(&emitter),
+    );
     crate::watcher::fs_watch::start_modules_dir_watcher(Arc::clone(&emitter));
 
     if !crate::recording::recorder::ffmpeg_available() {
@@ -726,14 +809,24 @@ pub async fn run_server(port: u16) {
                 &recorder_clone,
             );
             crate::recording::recorder::startup_remove_empty_dirs(&output_dir);
+            // 扫描并补写缺失的 meta 文件
+            // Scan and write missing meta files
+            crate::recording::meta::startup_ensure_meta_files(&output_dir, &merge_format);
         });
     }
 
-    let monitor_clone = Arc::clone(&monitor);
-    let emitter_clone = Arc::clone(&emitter);
-    tokio::spawn(async move {
-        monitor_clone.start_with_emitter(emitter_clone).await;
-    });
+    // 提前创建 restart channel，确保 poll_interval_notify_tx 在 spawn 前就已注入
+    // Pre-create restart channel so poll_interval_notify_tx is available before spawning
+    {
+        let (restart_tx, restart_rx) = tokio::sync::mpsc::channel::<()>(1);
+        *app_state.poll_interval_notify_tx.write() = Some(restart_tx.clone());
+        *monitor.restart_tx.write() = Some(restart_tx);
+        let monitor_clone = Arc::clone(&monitor);
+        let emitter_clone = Arc::clone(&emitter);
+        tokio::spawn(async move {
+            monitor_clone.start_with_emitter_inner(emitter_clone, restart_rx).await;
+        });
+    }
 
     let app_state_clone = Arc::clone(&app_state);
     let emitter_clone2 = Arc::clone(&emitter);
@@ -741,19 +834,41 @@ pub async fn run_server(port: u16) {
         crate::config::settings::schedule_config_checks(app_state_clone, emitter_clone2).await;
     });
 
+    // 启动 Mouflon Keys 自动同步调度器（启动时立即同步一次，之后每小时一次）
+    // Start Mouflon Keys auto-sync scheduler (once on startup, then every hour)
+    {
+        let app_state_clone = Arc::clone(&app_state);
+        let emitter_clone = Arc::clone(&emitter);
+        let (mouflon_notify_tx, mouflon_notify_rx) = tokio::sync::mpsc::channel::<()>(1);
+        *app_state_clone.mouflon_sync_notify_tx.write() = Some(mouflon_notify_tx);
+        tokio::spawn(async move {
+            crate::config::settings::schedule_mouflon_sync(app_state_clone, emitter_clone, mouflon_notify_rx).await;
+        });
+    }
+
+    // 启动孤立 meta 文件清理调度器（启动时立即执行一次，之后每小时一次）
+    // Start orphaned meta cleanup scheduler (once on startup, then every hour)
+    {
+        let output_dir = std::path::PathBuf::from(&app_state.get_settings().output_dir);
+        tokio::spawn(async move {
+            crate::recording::meta::schedule_meta_cleanup(output_dir).await;
+        });
+    }
+
     let server_state = ServerState {
         app_state,
         recorder,
         monitor,
         emitter,
         broadcast_tx: tx,
+        relay_manager: RelayManager::new(),
     };
 
     let app = build_router(server_state);
     let addr = format!("0.0.0.0:{}", port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
-        .unwrap_or_else(|e| panic!("Failed to bind {}:{} — {}", addr, port, e));
+        .unwrap_or_else(|e| panic!("Failed to bind {} — {}", addr, e));
 
     println!("Server mode: listening on http://{}", addr);
     println!("API docs: GET /api/events → SSE stream");

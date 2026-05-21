@@ -21,10 +21,12 @@
 		DialogFooter,
 	} from "@/components/ui/dialog";
 	import { Button } from "@/components/ui/button";
+	import { useI18n } from "vue-i18n";
 
 	// 从 useNotify 获取对话框状态和解析函数
 	// Get dialog state and resolve function from useNotify
 	const { dialog, _resolveDialog } = useNotify();
+	const { t } = useI18n();
 </script>
 
 <template>
@@ -34,23 +36,25 @@
 		<DialogContent class="sm:max-w-95">
 			<DialogHeader>
 				<DialogTitle>{{ dialog?.title }}</DialogTitle>
+			</DialogHeader>
+			<div class="overflow-y-auto max-h-[50vh] pr-1">
 				<DialogDescription class="whitespace-pre-line">
 					{{ dialog?.message }}
 				</DialogDescription>
-			</DialogHeader>
+			</div>
 			<DialogFooter>
 				<Button
 					v-if="!dialog?.hideCancelButton"
 					variant="outline"
 					@click="_resolveDialog(false)"
 				>
-					{{ dialog?.cancelText ?? "取消" }}
+					{{ dialog?.cancelText ?? t("common.cancel") }}
 				</Button>
 				<Button
 					:variant="dialog?.danger ? 'destructive' : 'default'"
 					@click="_resolveDialog(true)"
 				>
-					{{ dialog?.confirmText ?? "确认" }}
+					{{ dialog?.confirmText ?? t("common.confirm") }}
 				</Button>
 			</DialogFooter>
 		</DialogContent>

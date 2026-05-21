@@ -24,7 +24,7 @@
 <script setup lang="ts">
 	import { onMounted, onUnmounted, reactive, ref, watch, nextTick } from "vue";
 	import { call, on } from "@/lib/api";
-	import { useSettingsStore, type Settings } from "../stores/settings";
+	import { useSettingsStore, type Settings, type MouflonKeysStore } from "../stores/settings";
 	import { useNotify } from "../composables/useNotify";
 	import { Button } from "@/components/ui/button";
 	import { Input } from "@/components/ui/input";
@@ -37,9 +37,16 @@
 		NumberFieldInput,
 	} from "@/components/ui/number-field";
 	import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+	import { useI18n } from "vue-i18n";
 
 	const store = useSettingsStore();
 	const { toast, confirm } = useNotify();
+	const { t, locale } = useI18n();
+
+	function setLocale(lang: string) {
+		locale.value = lang as "zh-CN" | "en-US";
+		localStorage.setItem("locale", lang);
+	}
 
 	/** 表单响应式数据（与 store.settings 保持同步）/ Reactive form data (synced with store.settings) */
 	const form = reactive<Settings>({
@@ -51,6 +58,9 @@
 		sc_mirror_url: null,
 		max_concurrent: 0,
 		merge_format: "mp4",
+		max_tmp_dir_gb: 50,
+		mouflon_sync_url: null,
+		mouflon_sync_token: null,
 	});
 
 	// 保存各代理字段的原始值，用于检测是否有实际变更
@@ -59,6 +69,8 @@
 	const originalApiProxy = ref<string | null>(null);
 	const originalCdnProxy = ref<string | null>(null);
 	const originalScMirror = ref<string | null>(null);
+	const originalMouflonSyncUrl = ref<string | null>(null);
+	const originalMouflonSyncToken = ref<string | null>(null);
 	/** 是否已完成初始化（防止初始化时触发自动保存）/ Whether initialization is complete (prevents auto-save during init) */
 	let initialized = false;
 
@@ -72,6 +84,8 @@
 		originalApiProxy.value = form.api_proxy_url;
 		originalCdnProxy.value = form.cdn_proxy_url;
 		originalScMirror.value = form.sc_mirror_url;
+		originalMouflonSyncUrl.value = form.mouflon_sync_url;
+		originalMouflonSyncToken.value = form.mouflon_sync_token;
 		await nextTick();
 		initialized = true;
 		await loadKeys();
@@ -79,8 +93,9 @@
 		// 监听其他客户端的 Mouflon 密钥更新 / Listen for Mouflon key updates from other clients
 		unlisteners.push(
 			await on("mouflon-keys-updated", (payload) => {
-				mouflonKeys.value = payload as Record<string, string>;
-				toast("Mouflon Keys 已由其他客户端更新", "info");
+				const store = payload as MouflonKeysStore;
+				mouflonStore.value = store;
+				toast(t("settings.mouflonUpdatedByOther"), "info");
 			}),
 		);
 	});
@@ -97,11 +112,12 @@
 			auto_record: form.auto_record,
 			max_concurrent: form.max_concurrent,
 			merge_format: form.merge_format,
+			max_tmp_dir_gb: form.max_tmp_dir_gb,
 		}),
 		async () => {
 			if (!initialized) return;
 			await store.saveSettings({ ...form });
-			toast("设置已保存", "success");
+			toast(t("settings.saved"), "success");
 		},
 		{ deep: true },
 	);
@@ -118,10 +134,12 @@
 			originalApiProxy.value = newSettings.api_proxy_url;
 			originalCdnProxy.value = newSettings.cdn_proxy_url;
 			originalScMirror.value = newSettings.sc_mirror_url;
+			originalMouflonSyncUrl.value = newSettings.mouflon_sync_url;
+			originalMouflonSyncToken.value = newSettings.mouflon_sync_token;
 			nextTick(() => {
 				initialized = true;
 			});
-			toast("设置已由其他客户端更新", "info");
+			toast(t("settings.updatedByOther"), "info");
 		},
 		{ deep: true },
 	);
@@ -133,19 +151,21 @@
 	 * @param field - 要保存的设置字段名 / Settings field name to save
 	 */
 	async function saveProxy(
-		field: "api_proxy_url" | "cdn_proxy_url" | "sc_mirror_url",
+		field: "api_proxy_url" | "cdn_proxy_url" | "sc_mirror_url" | "mouflon_sync_url" | "mouflon_sync_token",
 	) {
 		if (!initialized) return;
-		const original =
-			field === "api_proxy_url"
-				? originalApiProxy
-				: field === "cdn_proxy_url"
-					? originalCdnProxy
-					: originalScMirror;
+		const originalMap = {
+			api_proxy_url: originalApiProxy,
+			cdn_proxy_url: originalCdnProxy,
+			sc_mirror_url: originalScMirror,
+			mouflon_sync_url: originalMouflonSyncUrl,
+			mouflon_sync_token: originalMouflonSyncToken,
+		};
+		const original = originalMap[field];
 		if (form[field] === original.value) return;
 		await store.saveSettings({ ...form });
 		original.value = form[field];
-		toast("设置已保存", "success");
+		toast(t("settings.saved"), "success");
 	}
 
 	/**
@@ -156,14 +176,14 @@
 		if (!initialized) return;
 		if (form.output_dir === originalOutputDir.value) return;
 		const ok = await confirm({
-			title: "修改输出目录",
-			message: `将输出目录改为：\n${form.output_dir}\n\n此更改将在下次录制时生效。`,
-			confirmText: "确认",
+			title: t("settings.outputDir.changeTitle"),
+			message: t("settings.outputDir.changeMessage", { dir: form.output_dir }),
+			confirmText: t("settings.outputDir.changeConfirm"),
 		});
 		if (ok) {
 			await store.saveSettings({ ...form });
 			originalOutputDir.value = form.output_dir;
-			toast("输出目录已更新，将在下次录制时生效", "info");
+			toast(t("settings.outputDir.changeDone"), "info");
 		} else {
 			// 用户取消时恢复原始值 / Restore original value if user cancels
 			form.output_dir = originalOutputDir.value;
@@ -182,21 +202,23 @@
 		}
 	}
 
-	/** Mouflon 解密密钥列表（pkey -> pdkey）/ Mouflon decryption key list (pkey -> pdkey) */
-	const mouflonKeys = ref<Record<string, string>>({});
+	/** Mouflon 密钥存储（含时间戳）/ Mouflon key store (with timestamps) */
+	const mouflonStore = ref<MouflonKeysStore>({ keys: {}, auto_synced_at: null, manual_updated_at: null });
 	/** 新密钥表单：pkey 输入值 / New key form: pkey input value */
 	const newPkey = ref("");
 	/** 新密钥表单：pdkey 输入值 / New key form: pdkey input value */
 	const newPdkey = ref("");
 	/** 密钥添加错误信息 / Key addition error message */
 	const keyError = ref("");
+	/** 是否正在手动同步 / Whether manual sync is in progress */
+	const syncing = ref(false);
 
 	/**
 	 * 从后端加载 Mouflon 密钥列表。
 	 * Load the Mouflon key list from the backend.
 	 */
 	async function loadKeys() {
-		mouflonKeys.value = await call<Record<string, string>>("list_mouflon_keys");
+		mouflonStore.value = await call<MouflonKeysStore>("list_mouflon_keys");
 	}
 
 	/**
@@ -208,7 +230,7 @@
 		const pkey = newPkey.value.trim();
 		const pdkey = newPdkey.value.trim();
 		if (!pkey || !pdkey) {
-			keyError.value = "pkey 和 pdkey 均不能为空";
+			keyError.value = t("settings.keyError.empty");
 			return;
 		}
 		try {
@@ -231,28 +253,77 @@
 		await call("remove_mouflon_key", { pkey });
 		await loadKeys();
 	}
+
+	/**
+	 * 手动触发一次从同步 URL 拉取密钥。
+	 * Manually trigger a key sync from the configured URL.
+	 */
+	async function syncKeys() {
+		syncing.value = true;
+		try {
+			const updated = await call<boolean>("sync_mouflon_keys");
+			await loadKeys();
+			toast(updated ? t("settings.mouflonSyncDone") : t("settings.mouflonSyncUpToDate"), "success");
+		} catch (e: any) {
+			toast(t("settings.mouflonSyncFailed", { error: String(e) }), "error");
+		} finally {
+			syncing.value = false;
+		}
+	}
+
+	/** 格式化 RFC 3339 时间戳为本地时间字符串 / Format RFC 3339 timestamp to local time string */
+	function formatTs(ts: string | null): string {
+		if (!ts) return t("settings.mouflonNever");
+		return new Date(ts).toLocaleString();
+	}
 </script>
 
 <template>
 	<div class="flex flex-col gap-5 max-w-160">
-		<h1 class="text-xl font-bold">设置</h1>
+		<h1 class="text-xl font-bold">{{ t("settings.title") }}</h1>
 
-		<div v-if="store.loading" class="text-muted-foreground">加载中...</div>
+		<div v-if="store.loading" class="text-muted-foreground">{{ t("settings.loading") }}</div>
 
 		<form v-else class="flex flex-col gap-7">
 			<section class="flex flex-col gap-3.5">
 				<h2
 					class="text-xs font-bold uppercase tracking-widest text-muted-foreground pb-2 border-b"
 				>
-					录制
+					{{ t("settings.sections.language") }}
+				</h2>
+				<div class="flex flex-col gap-1.5">
+					<Label>{{ t("settings.language.label") }}</Label>
+					<RadioGroup
+						:model-value="String(locale)"
+						class="flex flex-row gap-4"
+						@update:model-value="(v) => v && setLocale(String(v))"
+					>
+						<div class="flex items-center gap-2">
+							<RadioGroupItem id="lang-zh" value="zh-CN" />
+							<Label for="lang-zh" class="cursor-pointer">{{ t("settings.language.zhCN") }}</Label>
+						</div>
+						<div class="flex items-center gap-2">
+							<RadioGroupItem id="lang-en" value="en-US" />
+							<Label for="lang-en" class="cursor-pointer">{{ t("settings.language.enUS") }}</Label>
+						</div>
+					</RadioGroup>
+				</div>
+			</section>
+
+			<section class="flex flex-col gap-3.5">
+				<h2
+					class="text-xs font-bold uppercase tracking-widest text-muted-foreground pb-2 border-b"
+				>
+					{{ t("settings.sections.recording") }}
 				</h2>
 
 				<div class="flex flex-col gap-1.5">
-					<Label>输出目录</Label>
+					<Label>{{ t("settings.outputDir.label") }}</Label>
 					<div class="flex gap-2">
 						<Input
 							v-model="form.output_dir"
-							placeholder="/path/to/recordings"
+							:placeholder="t('settings.outputDir.placeholder')"
+							autocomplete="off"
 							@keyup.enter="saveOutputDir"
 							@blur="saveOutputDir"
 						/>
@@ -262,16 +333,16 @@
 							class="shrink-0"
 							@click="pickDir"
 						>
-							选择
+							{{ t("settings.outputDir.pick") }}
 						</Button>
 					</div>
 					<p class="text-xs text-muted-foreground">
-						修改后按回车或点击其他区域确认
+						{{ t("settings.outputDir.hint") }}
 					</p>
 				</div>
 
 				<div class="flex flex-col gap-1.5">
-					<Label>最大并发录制数</Label>
+					<Label>{{ t("settings.maxConcurrent.label") }}</Label>
 					<NumberField
 						:model-value="form.max_concurrent"
 						:min="0"
@@ -287,11 +358,11 @@
 							<NumberFieldIncrement />
 						</NumberFieldContent>
 					</NumberField>
-					<p class="text-xs text-muted-foreground">0 表示不限制</p>
+					<p class="text-xs text-muted-foreground">{{ t("settings.maxConcurrent.hint") }}</p>
 				</div>
 
 				<div class="flex flex-col gap-1.5">
-					<Label>轮询间隔（秒）</Label>
+					<Label>{{ t("settings.pollInterval.label") }}</Label>
 					<NumberField
 						:model-value="form.poll_interval_secs"
 						:min="10"
@@ -310,7 +381,7 @@
 				</div>
 
 				<div class="flex flex-col gap-1.5">
-					<Label>合并格式</Label>
+					<Label>{{ t("settings.mergeFormat.label") }}</Label>
 					<RadioGroup
 						:model-value="form.merge_format"
 						class="flex flex-row gap-4"
@@ -328,8 +399,28 @@
 						</div>
 					</RadioGroup>
 					<p class="text-xs text-muted-foreground">
-						录制结束后自动合并分片为单一文件的格式
+						{{ t("settings.mergeFormat.hint") }}
 					</p>
+				</div>
+
+				<div class="flex flex-col gap-1.5">
+					<Label>{{ t("settings.maxTmpDirGb.label") }}</Label>
+					<NumberField
+						:model-value="form.max_tmp_dir_gb"
+						:min="0"
+						:step="0.5"
+						class="w-36"
+						@update:model-value="
+							(v) => v !== undefined && (form.max_tmp_dir_gb = v)
+						"
+					>
+						<NumberFieldContent>
+							<NumberFieldDecrement />
+							<NumberFieldInput />
+							<NumberFieldIncrement />
+						</NumberFieldContent>
+					</NumberField>
+					<p class="text-xs text-muted-foreground">{{ t("settings.maxTmpDirGb.hint") }}</p>
 				</div>
 			</section>
 
@@ -337,13 +428,14 @@
 				<h2
 					class="text-xs font-bold uppercase tracking-widest text-muted-foreground pb-2 border-b"
 				>
-					网络
+					{{ t("settings.sections.network") }}
 				</h2>
 				<div class="flex flex-col gap-1.5">
-					<Label>API 代理（访问 stripchat.com，留空不使用）</Label>
+					<Label>{{ t("settings.apiProxy.label") }}</Label>
 					<Input
 						:model-value="form.api_proxy_url ?? ''"
-						placeholder="socks5://127.0.0.1:10808"
+						:placeholder="t('settings.apiProxy.placeholder')"
+						autocomplete="url"
 						@update:model-value="
 							form.api_proxy_url = ($event as string) || null
 						"
@@ -351,17 +443,15 @@
 						@blur="saveProxy('api_proxy_url')"
 					/>
 					<p class="text-xs text-muted-foreground">
-						修改后按回车或点击其他区域确认
+						{{ t("settings.apiProxy.hint") }}
 					</p>
 				</div>
 				<div class="flex flex-col gap-1.5">
-					<Label
-						>Stripchat 镜像站（替换 API 中的 stripchat.com
-						域名，留空不使用）</Label
-					>
+					<Label>{{ t("settings.scMirror.label") }}</Label>
 					<Input
 						:model-value="form.sc_mirror_url ?? ''"
-						placeholder="stripchat.example.com"
+						:placeholder="t('settings.scMirror.placeholder')"
+						autocomplete="url"
 						@update:model-value="
 							form.sc_mirror_url = ($event as string) || null
 						"
@@ -369,14 +459,15 @@
 						@blur="saveProxy('sc_mirror_url')"
 					/>
 					<p class="text-xs text-muted-foreground">
-						同时填写 API 代理与镜像站时，将通过 API 代理访问镜像站
+						{{ t("settings.scMirror.hint") }}
 					</p>
 				</div>
 				<div class="flex flex-col gap-1.5">
-					<Label>CDN 代理（下载 HLS 分片，留空不使用）</Label>
+					<Label>{{ t("settings.cdnProxy.label") }}</Label>
 					<Input
 						:model-value="form.cdn_proxy_url ?? ''"
-						placeholder="socks5://127.0.0.1:10808"
+						:placeholder="t('settings.cdnProxy.placeholder')"
+						autocomplete="url"
 						@update:model-value="
 							form.cdn_proxy_url = ($event as string) || null
 						"
@@ -384,7 +475,7 @@
 						@blur="saveProxy('cdn_proxy_url')"
 					/>
 					<p class="text-xs text-muted-foreground">
-						修改后按回车或点击其他区域确认
+						{{ t("settings.cdnProxy.hint") }}
 					</p>
 				</div>
 			</section>
@@ -393,19 +484,59 @@
 				<h2
 					class="text-xs font-bold uppercase tracking-widest text-muted-foreground pb-2 border-b"
 				>
-					Mouflon 解密密钥
+					{{ t("settings.sections.mouflonKeys") }}
 				</h2>
 				<p class="text-xs text-muted-foreground leading-relaxed">
-					Stripchat 对 HLS 分片文件名进行了加密（Mouflon
-					系统）。录制前需在此填入对应的
+					{{ t("settings.mouflonKeysDesc") }}
 					<code class="bg-muted px-1 py-0.5 rounded text-xs font-mono"
 						>pkey → pdkey</code
 					>
-					密钥对，密钥可从社区渠道获取。
 				</p>
 
+				<!-- 同步配置 / Sync configuration -->
+				<div class="flex flex-col gap-1.5">
+					<Label>{{ t("settings.mouflonSyncUrl.label") }}</Label>
+					<Input
+						:model-value="form.mouflon_sync_url ?? ''"
+						:placeholder="t('settings.mouflonSyncUrl.placeholder')"
+						autocomplete="url"
+						@update:model-value="form.mouflon_sync_url = ($event as string) || null"
+						@keyup.enter="saveProxy('mouflon_sync_url')"
+						@blur="saveProxy('mouflon_sync_url')"
+					/>
+				</div>
+				<div class="flex flex-col gap-1.5">
+					<Label>{{ t("settings.mouflonSyncToken.label") }}</Label>
+					<Input
+						:model-value="form.mouflon_sync_token ?? ''"
+						:placeholder="t('settings.mouflonSyncToken.placeholder')"
+						type="password"
+						autocomplete="current-password"
+						@update:model-value="form.mouflon_sync_token = ($event as string) || null"
+						@keyup.enter="saveProxy('mouflon_sync_token')"
+						@blur="saveProxy('mouflon_sync_token')"
+					/>
+				</div>
+
+				<!-- 同步状态 + 手动同步按钮 / Sync status + manual sync button -->
+				<div class="flex items-center justify-between gap-4 text-xs text-muted-foreground">
+					<div class="flex flex-col gap-0.5">
+						<span>{{ t("settings.mouflonAutoSyncedAt") }}{{ formatTs(mouflonStore.auto_synced_at) }}</span>
+						<span>{{ t("settings.mouflonManualUpdatedAt") }}{{ formatTs(mouflonStore.manual_updated_at) }}</span>
+					</div>
+					<Button
+						type="button"
+						variant="outline"
+						size="sm"
+						:disabled="syncing || !form.mouflon_sync_url"
+						@click="syncKeys"
+					>
+						{{ syncing ? t("settings.mouflonSyncing") : t("settings.mouflonSync") }}
+					</Button>
+				</div>
+
 				<table
-					v-if="Object.keys(mouflonKeys).length"
+					v-if="Object.keys(mouflonStore.keys).length"
 					class="w-full text-xs border-collapse"
 				>
 					<thead>
@@ -413,18 +544,18 @@
 							<th
 								class="text-left px-2 py-1.5 border-b text-muted-foreground font-semibold"
 							>
-								pkey（密钥标识符）
+								{{ t("settings.mouflonTable.pkey") }}
 							</th>
 							<th
 								class="text-left px-2 py-1.5 border-b text-muted-foreground font-semibold"
 							>
-								pdkey（解密密钥）
+								{{ t("settings.mouflonTable.pdkey") }}
 							</th>
 							<th class="border-b"></th>
 						</tr>
 					</thead>
 					<tbody>
-						<tr v-for="(pdkey, pkey) in mouflonKeys" :key="pkey">
+						<tr v-for="(pdkey, pkey) in mouflonStore.keys" :key="pkey">
 							<td class="px-2 py-1.5 border-b font-mono">{{ pkey }}</td>
 							<td class="px-2 py-1.5 border-b font-mono max-w-60 truncate">
 								{{ pdkey }}
@@ -437,26 +568,28 @@
 									class="h-6 text-xs px-2"
 									@click="removeKey(pkey)"
 								>
-									删除
+									{{ t("common.delete") }}
 								</Button>
 							</td>
 						</tr>
 					</tbody>
 				</table>
-				<p v-else class="text-xs text-muted-foreground">暂无密钥</p>
+				<p v-else class="text-xs text-muted-foreground">{{ t("settings.noKeys") }}</p>
 
 				<div class="flex gap-2 items-center">
 					<Input
 						v-model="newPkey"
 						placeholder="pkey"
+						autocomplete="off"
 						class="flex-1 font-mono text-xs"
 					/>
 					<Input
 						v-model="newPdkey"
 						placeholder="pdkey"
+						autocomplete="off"
 						class="flex-2 font-mono text-xs"
 					/>
-					<Button type="button" variant="outline" @click="addKey">添加</Button>
+					<Button type="button" variant="outline" @click="addKey">{{ t("settings.addKey") }}</Button>
 				</div>
 				<p v-if="keyError" class="text-xs text-destructive">{{ keyError }}</p>
 			</section>

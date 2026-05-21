@@ -178,6 +178,10 @@ const COMMAND_MAP: Record<
 		method: "POST",
 		url: (a) => `/api/streamers/${a.username}/stop`,
 	},
+	verify_streamer: {
+		method: "GET",
+		url: (a) => `/api/streamers/${a.username}/verify`,
+	},
 	get_settings: { method: "GET", url: () => "/api/settings" },
 	save_settings_cmd: {
 		method: "POST",
@@ -193,6 +197,10 @@ const COMMAND_MAP: Record<
 	remove_mouflon_key: {
 		method: "DELETE",
 		url: (a) => `/api/mouflon-keys/${a.pkey}`,
+	},
+	sync_mouflon_keys: {
+		method: "POST",
+		url: () => "/api/mouflon-keys/sync",
 	},
 	remove_missing_pp_results: {
 		method: "POST",
@@ -210,6 +218,11 @@ const COMMAND_MAP: Record<
 	run_postprocess_cmd: {
 		method: "POST",
 		url: () => "/api/recordings/postprocess",
+		body: (a) => ({ path: a.path }),
+	},
+	cancel_postprocess: {
+		method: "POST",
+		url: () => "/api/recordings/postprocess-cancel",
 		body: (a) => ({ path: a.path }),
 	},
 	open_recording: {
@@ -234,6 +247,22 @@ const COMMAND_MAP: Record<
 	pick_output_dir: {
 		method: "GET",
 		url: () => "/api/settings/pick-output-dir",
+	},
+	start_relay: {
+		method: "POST",
+		url: (a) => `/relay/${a.username}/start`,
+	},
+	stop_relay: {
+		method: "POST",
+		url: (a) => `/relay/${a.username}/stop`,
+	},
+	get_relay_status: {
+		method: "GET",
+		url: (a) => `/relay/${a.username}/status`,
+	},
+	list_relay_sessions: {
+		method: "GET",
+		url: () => "/api/relay/sessions",
 	},
 };
 

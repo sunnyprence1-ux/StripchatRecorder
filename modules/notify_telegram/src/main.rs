@@ -17,22 +17,21 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use grammers_client::Client;
-use grammers_client::media::{Attribute, InputMedia};
+use grammers_client::client::{ClientConfiguration, AutoSleep};
+use grammers_client::media::{InputMedia, Uploaded};
 use grammers_client::message::InputMessage;
 use grammers_client::sender::{ConnectionParams, SenderPool};
 use grammers_client::tl;
 use grammers_session::storages::SqliteSession;
 use grammers_session::types::{PeerAuth, PeerId, PeerRef};
-use tokio::io::{AsyncRead, ReadBuf};
-use pp_utils::{param, param_bool, format_duration, format_bytes, format_speed, parse_stem, find_cover};
+use tokio::io::AsyncReadExt;
+use pp_utils::{param, param_bool, format_duration, format_bytes, format_speed, parse_stem, find_cover, tmp_dir, image_dimensions, video_meta};
 
 /// 进度上报的缩放基数 / Progress reporting scale base
 const PROGRESS_SCALE: usize = 10_000;
@@ -40,142 +39,68 @@ const PROGRESS_SCALE: usize = 10_000;
 /// 模块元数据 JSON，通过 `--describe` 参数输出。
 /// Module metadata JSON, output via `--describe` argument.
 const DESCRIBE: &str = r#"{
-  "id": "notify_telegram",
-  "name": "Telegram 通知 0.1.4",
-  "description": "将录制信息、封面图和视频通过 MTProto 发送到 Telegram（支持超过 50MB 的大文件，支持 HTTP/SOCKS5 代理）",
-  "params": [
-    {
-      "key": "api_id",
-      "label": "API ID（从 my.telegram.org 获取）",
-      "type": "string",
-      "default": ""
-    },
-    {
-      "key": "api_hash",
-      "label": "API Hash",
-      "type": "string",
-      "default": ""
-    },
-    {
-      "key": "bot_token",
-      "label": "Bot Token（从 @BotFather 获取）",
-      "type": "string",
-      "default": ""
-    },
-    {
-      "key": "chat_id",
-      "label": "Chat ID（超级群组填 -100xxxxxxxxxx 格式）",
-      "type": "string",
-      "default": ""
-    },
-    {
-      "key": "username",
-      "label": "群组 Username（超级群组必填，如 mygroupname，不含 @）",
-      "type": "string",
-      "default": ""
-    },
-    {
-      "key": "proxy",
-      "label": "代理地址（支持 http://、socks5://）",
-      "type": "string",
-      "default": ""
-    },
-    {
-      "key": "send_video",
-      "label": "同时发送视频文件",
-      "type": "boolean",
-      "default": true
-    }
-  ]
-}"#;
-
-/// 带进度上报的异步读取器，包装任意 `AsyncRead` 实现。
-/// 在上传文件时实时向标准输出发送进度和速度信息。
-///
-/// Async reader with progress reporting, wrapping any `AsyncRead` implementation.
-/// Reports progress and speed to stdout in real-time during file upload.
-struct ProgressReader<R: AsyncRead + Unpin> {
-    inner: R,
-    /// 已上传字节数（原子计数，跨任务共享）/ Uploaded bytes (atomic counter, shared across tasks)
-    done: Arc<AtomicUsize>,
-    /// 总字节数 / Total bytes
-    total: usize,
-    /// 上次上报的缩放进度值（避免重复上报）/ Last reported scaled progress (avoids duplicate reports)
-    last_reported: usize,
-    /// 速度计算窗口内的字节数 / Bytes in current speed calculation window
-    speed_bytes: usize,
-    /// 速度计算窗口开始时间 / Speed calculation window start time
-    speed_last: Instant,
-}
-
-impl<R: AsyncRead + Unpin> ProgressReader<R> {
-    fn new(inner: R, done: Arc<AtomicUsize>, total: usize) -> Self {
-        Self { inner, done, total, last_reported: usize::MAX, speed_bytes: 0, speed_last: Instant::now() }
-    }
-}
-
-impl<R: AsyncRead + Unpin> AsyncRead for ProgressReader<R> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        let before = buf.filled().len();
-        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
-        let delta = buf.filled().len() - before;
-        if delta > 0 && self.total > 0 {
-            // 原子累加已上传字节数 / Atomically accumulate uploaded bytes
-            let done = self.done.fetch_add(delta, Ordering::Relaxed) + delta;
-            self.speed_bytes += delta;
-            let scaled = ((done as u128) * (PROGRESS_SCALE as u128) / (self.total as u128))
-                .min(PROGRESS_SCALE as u128) as usize;
-            if scaled != self.last_reported {
-                self.last_reported = scaled;
-                print!("PROGRESS:{}/{}\n", scaled, PROGRESS_SCALE);
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
-            }
-            // 每秒上报一次上传速度 / Report upload speed once per second
-            let elapsed = self.speed_last.elapsed();
-            if elapsed >= Duration::from_secs(1) {
-                let bps = self.speed_bytes as f64 / elapsed.as_secs_f64();
-                print!("STATUS:{}\n", format_speed(bps));
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
-                self.speed_bytes = 0;
-                self.speed_last = Instant::now();
-            }
+    "id": "notify_telegram",
+    "name": "Telegram 通知 0.2.0",
+    "description": "将录制信息、封面图和视频通过 MTProto 发送到 Telegram（支持超过 50MB 的大文件，支持 HTTP/SOCKS5 代理）",
+    "params": [
+        {
+        "key": "api_id",
+        "label": "API ID（从 my.telegram.org 获取）",
+        "type": "string",
+        "default": ""
+        },
+        {
+        "key": "api_hash",
+        "label": "API Hash",
+        "type": "string",
+        "default": ""
+        },
+        {
+        "key": "bot_token",
+        "label": "Bot Token（从 @BotFather 获取）",
+        "type": "string",
+        "default": ""
+        },
+        {
+        "key": "chat_id",
+        "label": "Chat ID（超级群组填 -100xxxxxxxxxx 格式）",
+        "type": "string",
+        "default": ""
+        },
+        {
+        "key": "username",
+        "label": "群组 Username（超级群组必填，如 mygroupname，不含 @）",
+        "type": "string",
+        "default": ""
+        },
+        {
+        "key": "proxy",
+        "label": "代理地址（支持 http://、socks5://）",
+        "type": "string",
+        "default": ""
+        },
+        {
+        "key": "send_video",
+        "label": "同时发送视频文件",
+        "type": "boolean",
+        "default": true
         }
-        result
+    ],
+    "i18n": {
+        "en-US": {
+        "name": "Telegram Notification 0.2.0",
+        "description": "Send recording info, cover image and video to Telegram via MTProto (supports files over 50 MB and HTTP/SOCKS5 proxies)",
+        "params": {
+            "api_id": { "label": "API ID (from my.telegram.org)" },
+            "bot_token": { "label": "Bot Token (from @BotFather)" },
+            "chat_id": { "label": "Chat ID (supergroup format: -100xxxxxxxxxx)" },
+            "username": { "label": "Group username (required for supergroups, e.g. mygroupname, without @)" },
+            "proxy": { "label": "Proxy (http:// or socks5://)" },
+            "send_video": { "label": "Also send video file" }
+        }
+        }
     }
-}
-
-/// 获取临时文件目录（优先使用可执行文件同目录下的 tmp 子目录）。
-/// Get the temporary file directory (prefers a `tmp` subdirectory next to the executable).
-fn tmp_dir() -> PathBuf {
-    let base = env::var("PP_EXE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            env::current_exe().ok()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                .unwrap_or_else(|| PathBuf::from("."))
-        });
-    let tmp = base.join("tmp");
-    fs::create_dir_all(&tmp).ok();
-    tmp
-}
-
-/// 获取图片的宽度和高度（使用 ffprobe）。
-/// Get image width and height using ffprobe.
-fn image_dimensions(path: &Path) -> Option<(u32, u32)> {
-    let out = Command::new("ffprobe")
-        .args(["-v", "error", "-select_streams", "v:0",
-               "-show_entries", "stream=width,height", "-of", "csv=p=0"])
-        .arg(path)
-        .stdout(Stdio::piped()).stderr(Stdio::null())
-        .output().ok()?;
-    let s = String::from_utf8_lossy(&out.stdout);
-    let mut parts = s.trim().splitn(2, ',');
-    let w: u32 = parts.next()?.trim().parse().ok()?;
-    let h: u32 = parts.next()?.trim().parse().ok()?;
-    Some((w, h))
-}
+}"#;
 
 /// 若封面图不满足 Telegram 限制（宽+高 < 10000 且宽高比 < 20:1），则等比缩放。
 /// Resize cover image if it violates Telegram limits (w+h < 10000 and aspect ratio < 20:1).
@@ -257,36 +182,6 @@ fn resize_cover_for_telegram(img: &Path) -> Result<Option<PathBuf>, String> {
     Ok(Some(out_path))
 }
 
-/// 使用 ffprobe 获取视频的时长、宽度和高度。
-/// Get video duration, width, and height using ffprobe.
-///
-/// # 返回值 / Returns
-/// `(duration_secs, width, height)`，失败时返回 `None`。
-/// `(duration_secs, width, height)`, or `None` on failure.
-fn video_meta(input: &Path) -> Option<(f64, i32, i32)> {
-    let out = Command::new("ffprobe")
-        .args([
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "format=duration:stream=width,height",
-            "-of", "csv=p=0",
-        ])
-        .arg(input)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let s = String::from_utf8_lossy(&out.stdout);
-    let mut lines = s.lines().filter(|l| !l.trim().is_empty());
-    let dims_line = lines.next()?;
-    let dur_line  = lines.next()?;
-    let mut dims = dims_line.splitn(2, ',');
-    let w: i32 = dims.next()?.trim().parse().ok()?;
-    let h: i32 = dims.next()?.trim().parse().ok()?;
-    let dur: f64 = dur_line.trim().parse().ok()?;
-    Some((dur, w, h))
-}
-
 /// 使用 ffmpeg 从视频中提取第一帧作为缩略图（用于 Telegram 视频消息的预览图）。
 /// Extract the first frame from a video as a thumbnail using ffmpeg
 /// (used as preview image for Telegram video messages).
@@ -319,28 +214,52 @@ fn extract_video_thumbnail(input: &Path) -> Result<PathBuf, String> {
 /// # 参数 / Parameters
 /// - `input`: 输入视频路径 / Input video path
 /// - `max_bytes`: 每个片段的最大字节数 / Maximum bytes per segment
-fn split_video(input: &Path, max_bytes: u64) -> Result<Vec<PathBuf>, String> {
-    let file_size = fs::metadata(input).map_err(|e| format!("stat failed: {}", e))?.len();
-    if file_size <= max_bytes { return Ok(vec![input.to_path_buf()]); }
+///
+/// 用 ffprobe 获取视频的平均比特率（bps），失败时返回 None。
+///
+/// Get the average bitrate of a video via ffprobe (bps), returns None on failure.
+fn probe_bitrate(input: &Path) -> Option<u64> {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "format=bit_rate",
+               "-of", "default=noprint_wrappers=1:nokey=1"])
+        .arg(input)
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.trim().parse::<u64>().ok()
+}
 
+/// 将单个文件切分为不超过 max_bytes 的若干段，返回所有段的路径。
+/// Split a single file into segments not exceeding max_bytes, returns all segment paths.
+fn split_one(input: &Path, max_bytes: u64, dir: &Path, stem: &str, ext: &str, offset: usize) -> Result<Vec<PathBuf>, String> {
+    let file_size = fs::metadata(input).map_err(|e| format!("stat failed: {}", e))?.len();
     let duration = pp_utils::video_duration(input).unwrap_or(0.0);
     if duration <= 0.0 { return Err("cannot split: unable to determine video duration".to_string()); }
 
-    // 按文件大小比例计算每段时长，留 5% 余量防止超出
-    // Calculate segment duration proportionally with 5% margin to prevent overflow
-    let ratio = (max_bytes as f64) / (file_size as f64) * 0.95;
-    let seg_duration = (duration * ratio).floor().max(1.0);
+    // 优先用 ffprobe 比特率计算，回退到文件大小比例，均留 10% 余量
+    // Prefer ffprobe bitrate for calculation, fall back to file-size ratio; keep 10% margin
+    let seg_duration = if let Some(bps) = probe_bitrate(input).filter(|&b| b > 0) {
+        let max_bits = (max_bytes as f64 * 0.90) * 8.0;
+        (max_bits / bps as f64).floor().max(1.0)
+    } else {
+        let ratio = (max_bytes as f64) / (file_size as f64) * 0.90;
+        (duration * ratio).floor().max(1.0)
+    };
+
     let n_segs = (duration / seg_duration).ceil() as usize + 1;
 
-    let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("part");
-    let ext  = input.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
-    let dir  = tmp_dir();
-    let pattern = dir.join(format!("{}_part%03d.{}", stem, ext));
+    // ffmpeg segment 模式不支持任意起始编号，先生成临时名再重命名
+    // ffmpeg segment mode doesn't support arbitrary start numbers; generate then rename
+    let tmp_dir_path = dir.join(format!("_split_tmp_{}", offset));
+    fs::create_dir_all(&tmp_dir_path).map_err(|e| format!("mkdir failed: {}", e))?;
+    let tmp_pattern = tmp_dir_path.join(format!("seg%03d.{}", ext));
 
     let status = Command::new("ffmpeg")
         .args(["-y", "-i"]).arg(input)
-        .args(["-c", "copy", "-f", "segment", "-segment_time", &seg_duration.to_string(), "-reset_timestamps", "1"])
-        .arg(&pattern)
+        .args(["-c", "copy", "-f", "segment",
+               "-segment_time", &seg_duration.to_string(),
+               "-reset_timestamps", "1"])
+        .arg(&tmp_pattern)
         .stdout(Stdio::null()).stderr(Stdio::null())
         .status()
         .map_err(|e| format!("ffmpeg not found: {}", e))?;
@@ -348,19 +267,63 @@ fn split_video(input: &Path, max_bytes: u64) -> Result<Vec<PathBuf>, String> {
     if !status.success() { return Err("ffmpeg failed to split video".to_string()); }
 
     let mut segments: Vec<PathBuf> = (0..n_segs)
-        .map(|i| dir.join(format!("{}_part{:03}.{}", stem, i, ext)))
+        .map(|i| tmp_dir_path.join(format!("seg{:03}.{}", i, ext)))
         .filter(|p| p.exists())
         .collect();
+    segments.sort();
 
     if segments.is_empty() { return Err("ffmpeg produced no segment files".to_string()); }
 
-    let oversized = segments.iter().filter(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0) > max_bytes).count();
-    if oversized > 0 {
-        return Err(format!("{} segment(s) still exceed 2 GB after splitting", oversized));
+    // 重命名为最终路径，编号从 offset 开始
+    // Rename to final paths starting from offset
+    let mut result = Vec::new();
+    for (i, seg) in segments.iter().enumerate() {
+        let dest = dir.join(format!("{}_part{:03}.{}", stem, offset + i, ext));
+        fs::rename(seg, &dest).map_err(|e| format!("rename failed: {}", e))?;
+        result.push(dest);
+    }
+    let _ = fs::remove_dir(&tmp_dir_path);
+    Ok(result)
+}
+
+fn split_video(input: &Path, max_bytes: u64) -> Result<Vec<PathBuf>, String> {
+    let file_size = fs::metadata(input).map_err(|e| format!("stat failed: {}", e))?.len();
+    if file_size <= (max_bytes as f64 * 0.95) as u64 { return Ok(vec![input.to_path_buf()]); }
+
+    let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("part");
+    let ext  = input.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
+    let dir  = tmp_dir();
+    // 第一次切分
+    // Initial split
+    let initial = split_one(input, max_bytes, &dir, stem, ext, 0)?;
+
+    // 对仍然超大的分片递归再切，最多重试 2 次
+    // Recursively re-split any oversized segments, up to 2 retries
+    let mut final_segments: Vec<PathBuf> = Vec::new();
+    let mut counter = initial.len();
+    for seg in initial {
+        let seg_size = fs::metadata(&seg).map(|m| m.len()).unwrap_or(0);
+        if seg_size > max_bytes {
+            // 递归切分，编号从当前 counter 开始
+            let sub = split_one(&seg, max_bytes, &dir, stem, ext, counter)?;
+            counter += sub.len();
+            // 删除超大的中间文件
+            let _ = fs::remove_file(&seg);
+            final_segments.extend(sub);
+        } else {
+            final_segments.push(seg);
+        }
     }
 
-    segments.sort();
-    Ok(segments)
+    let still_oversized = final_segments.iter()
+        .filter(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0) > max_bytes)
+        .count();
+    if still_oversized > 0 {
+        return Err(format!("{} segment(s) still exceed the size limit after splitting", still_oversized));
+    }
+
+    final_segments.sort();
+    Ok(final_segments)
 }
 
 /// 获取 Telegram 会话文件路径（存储在系统配置目录下）。
@@ -471,63 +434,139 @@ async fn resolve_peer(client: &Client, chat_id: i64, username: &str) -> Result<P
     Ok(build_peer_ref(chat_id))
 }
 
-/// 上传文件到 Telegram，带进度上报和超时控制（30 分钟）。
-/// Upload a file to Telegram with progress reporting and timeout (30 minutes).
+/// 上传文件到 Telegram，支持断点续传、进度上报。
 ///
-/// # 参数 / Parameters
-/// - `client`: Telegram 客户端 / Telegram client
-/// - `path`: 要上传的文件路径 / File path to upload
-/// - `done`: 已上传字节数的原子计数器（跨多文件共享）/ Atomic counter of uploaded bytes (shared across files)
-/// - `total`: 所有文件的总字节数 / Total bytes across all files
+/// 直接调用底层 `SaveBigFilePart` TL 函数，保持同一 `file_id`，
+/// 网络中断后从上次成功的分块处继续，而不是从头重传。
+///
+/// Upload a file to Telegram with resumable upload and progress reporting.
+///
+/// Calls the underlying `SaveBigFilePart` TL function directly, keeping the same
+/// `file_id` across retries so that interrupted uploads resume from the last
+/// successfully uploaded part instead of restarting from the beginning.
 async fn upload_with_progress(
     client: &Client, path: &Path,
     done: Arc<AtomicUsize>, total: usize,
-) -> Result<grammers_client::media::Uploaded, String> {
-    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-    const MAX_INNER: u32 = 3;
-    const RETRY_DELAYS: [u64; 3] = [30, 60, 90];
+) -> Result<Uploaded, String> {
+    // 每个分块 512 KB（Telegram 最大分块大小）/ 512 KB per chunk (Telegram max chunk size)
+    const CHUNK_SIZE: usize = 512 * 1024;
+    // 单个分块的最大重试次数 / Max retries per chunk
+    const MAX_CHUNK_RETRIES: u32 = 20;
+    // 重试延迟序列（秒）/ Retry delay sequence (seconds)
+    const RETRY_DELAYS: [u64; 6] = [10, 20, 30, 40, 50, 60];
 
     let name = path.file_name().unwrap().to_string_lossy().to_string();
 
-    let mut inner_attempt = 0u32;
-    loop {
-        let before = done.load(Ordering::Relaxed);
+    let mut file = tokio::fs::File::open(path).await
+        .map_err(|e| format!("open {} failed: {}", path.display(), e))?;
+    let size = file.metadata().await
+        .map_err(|e| format!("metadata failed: {}", e))?.len() as usize;
 
-        let result = tokio::time::timeout(ATTEMPT_TIMEOUT, async {
-            let file = tokio::fs::File::open(path).await
-                .map_err(|e| format!("open {} failed: {}", path.display(), e))?;
-            let size = file.metadata().await
-                .map_err(|e| format!("metadata failed: {}", e))?.len() as usize;
-            let mut reader = ProgressReader::new(file, Arc::clone(&done), total);
-            client.upload_stream(&mut reader, size, name.clone()).await
-                .map_err(|e| format!("upload failed: {}", e))
-        }).await;
+    // 与 grammers 保持一致：> 10MB 用大文件接口，否则用小文件接口
+    // Match grammers behavior: use big-file API for >10MB, small-file API otherwise.
+    // InputMediaUploadedPhoto requires InputFile (small), not InputFileBig — using the wrong
+    // one causes PHOTO_SAVE_FILE_INVALID.
+    const BIG_FILE_THRESHOLD: usize = 10 * 1024 * 1024;
+    let is_big = size > BIG_FILE_THRESHOLD;
 
-        let err = match result {
-            Ok(Ok(uploaded)) => return Ok(uploaded),
-            Ok(Err(e)) => e,
-            Err(_) => {
-                // 超时时回滚已计入的字节数 / Roll back counted bytes on timeout
-                let after = done.load(Ordering::Relaxed);
-                done.fetch_sub(after.saturating_sub(before), Ordering::Relaxed);
-                format!("upload of {} timed out after {:?}", path.display(), ATTEMPT_TIMEOUT)
+    let total_parts = size.div_ceil(CHUNK_SIZE) as i32;
+    // 生成一次性 file_id，整个上传过程保持不变 / Generate file_id once; keep it for the entire upload
+    let file_id = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        (t.as_nanos() as i64) ^ (path.as_os_str().len() as i64 * 0x9e3779b97f4a7c15_u64 as i64)
+    };
+
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut speed_bytes: usize = 0;
+    let mut speed_last = Instant::now();
+    // md5 仅小文件需要 / md5 only needed for small files
+    let mut md5_ctx = md5::Context::new();
+
+    for part in 0..total_parts {
+        // 读取当前分块 / Read current chunk
+        let mut read = 0usize;
+        while read < CHUNK_SIZE {
+            match file.read(&mut buf[read..]).await {
+                Ok(0) => break,
+                Ok(n) => read += n,
+                Err(e) => return Err(format!("read chunk {} failed: {}", part, e)),
             }
-        };
-
-        inner_attempt += 1;
-        if inner_attempt >= MAX_INNER {
-            return Err(err);
         }
-        let delay_secs = RETRY_DELAYS[(inner_attempt as usize - 1).min(RETRY_DELAYS.len() - 1)];
-        eprintln!(
-            "upload attempt {}/{} failed: {}. retrying in {}s…",
-            inner_attempt, MAX_INNER, err, delay_secs
-        );
-        // 回滚已计入的字节数 / Roll back counted bytes before retry
-        let after = done.load(Ordering::Relaxed);
-        done.fetch_sub(after.saturating_sub(before), Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+        if read == 0 { break; }
+        let chunk = buf[..read].to_vec();
+        if !is_big { md5_ctx.consume(&chunk); }
+
+        // 带重试的分块上传 / Upload chunk with retry
+        let mut chunk_attempt = 0u32;
+        loop {
+            let result = if is_big {
+                client.invoke(&tl::functions::upload::SaveBigFilePart {
+                    file_id,
+                    file_part: part,
+                    file_total_parts: total_parts,
+                    bytes: chunk.clone(),
+                }).await
+            } else {
+                client.invoke(&tl::functions::upload::SaveFilePart {
+                    file_id,
+                    file_part: part,
+                    bytes: chunk.clone(),
+                }).await
+            };
+
+            match result {
+                Ok(true) => break,
+                Ok(false) => {
+                    let err = format!("server rejected part {}", part);
+                    chunk_attempt += 1;
+                    if chunk_attempt >= MAX_CHUNK_RETRIES { return Err(err); }
+                    let delay = RETRY_DELAYS[(chunk_attempt as usize - 1).min(RETRY_DELAYS.len() - 1)];
+                    eprintln!("chunk {}/{} attempt {}/{}: {}. retrying in {}s…",
+                        part + 1, total_parts, chunk_attempt, MAX_CHUNK_RETRIES, err, delay);
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                }
+                Err(e) => {
+                    let err = format!("part {} upload error: {}", part, e);
+                    chunk_attempt += 1;
+                    if chunk_attempt >= MAX_CHUNK_RETRIES { return Err(err); }
+                    let delay = RETRY_DELAYS[(chunk_attempt as usize - 1).min(RETRY_DELAYS.len() - 1)];
+                    eprintln!("chunk {}/{} attempt {}/{}: {}. retrying in {}s…",
+                        part + 1, total_parts, chunk_attempt, MAX_CHUNK_RETRIES, err, delay);
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                }
+            }
+        }
+
+        // 更新进度和速度 / Update progress and speed
+        if total > 0 {
+            let new_done = done.fetch_add(read, Ordering::Relaxed) + read;
+            speed_bytes += read;
+            let scaled = ((new_done as u128) * (PROGRESS_SCALE as u128) / (total as u128))
+                .min(PROGRESS_SCALE as u128) as usize;
+            println!("PROGRESS:{}/{}", scaled, PROGRESS_SCALE);
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+
+            let elapsed = speed_last.elapsed();
+            if elapsed >= Duration::from_secs(1) {
+                let bps = speed_bytes as f64 / elapsed.as_secs_f64();
+                println!("STATUS:{}", format_speed(bps));
+                let _ = std::io::stdout().flush();
+                speed_bytes = 0;
+                speed_last = Instant::now();
+            }
+        }
     }
+
+    Ok(Uploaded::from_raw(if is_big {
+        tl::types::InputFileBig { id: file_id, parts: total_parts, name }.into()
+    } else {
+        tl::types::InputFile {
+            id: file_id, parts: total_parts, name,
+            md5_checksum: format!("{:x}", md5_ctx.finalize()),
+        }.into()
+    }))
 }
 
 /// 核心异步函数：建立 Telegram 连接、上传文件并发送消息。
@@ -573,7 +612,15 @@ async fn upload_and_send(
     let pool = SenderPool::with_configuration(Arc::clone(&session), api_id, conn_params);
     let runner = pool.runner;
     tokio::spawn(async move { runner.run().await });
-    let client = Client::new(pool.handle);
+    // 配置激进的 retry policy：I/O 错误视为 5 秒 flood，flood wait 阈值提高到 5 分钟
+    // Aggressive retry policy: treat I/O errors as 5s flood, raise flood-wait threshold to 5 min
+    let client = Client::with_configuration(pool.handle, ClientConfiguration {
+        retry_policy: Box::new(AutoSleep {
+            threshold: Duration::from_secs(300),
+            io_errors_as_flood_of: Some(Duration::from_secs(5)),
+        }),
+        auto_cache_peers: true,
+    });
 
     // Bot 登录（会话已存在时跳过）/ Bot sign-in (skipped if session already exists)
     if !client.is_authorized().await.map_err(|e| format!("is_authorized failed: {}", e))? {
@@ -618,8 +665,7 @@ async fn upload_and_send(
     // 处理视频文件：非 mp4/mkv 格式需先重封装，重封装失败则转码
     // Handle video files: non-mp4/mkv formats need remuxing, falls back to transcoding
     let mut converted_parts: Vec<PathBuf> = Vec::new();
-    let effective_parts: Vec<PathBuf>;
-    if send_video {
+    let effective_parts: Vec<PathBuf> = if send_video {
         let mut parts_out: Vec<PathBuf> = Vec::new();
         for part in video_parts {
             let ext = part.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
@@ -650,10 +696,10 @@ async fn upload_and_send(
                 parts_out.push(tmp);
             }
         }
-        effective_parts = parts_out;
+        parts_out
     } else {
-        effective_parts = vec![input.to_path_buf()];
-    }
+        vec![input.to_path_buf()]
+    };
 
     // 提取每个视频片段的缩略图和元数据 / Extract thumbnail and metadata for each video part
     struct PartMeta { thumb_path: Option<PathBuf>, duration: f64, w: i32, h: i32 }
@@ -680,58 +726,137 @@ async fn upload_and_send(
     // 共享的已上传字节计数器 / Shared uploaded bytes counter
     let done = Arc::new(AtomicUsize::new(0));
 
-    // 上传封面图 / Upload cover image
-    let mut uploaded_cover = if let Some(img) = effective_cover {
-        Some(upload_with_progress(&client, img, Arc::clone(&done), upload_total).await?)
-    } else { None };
-
-    // 清理转换后的临时封面图 / Clean up converted temporary cover image
-    if let Some(ref tmp) = converted_cover { let _ = fs::remove_file(tmp); }
-    if let Some(ref tmp) = resized_cover { let _ = fs::remove_file(tmp); }
-
     if send_video {
-        // 用于保存上传结果以便发送失败时重建 InputMedia（Uploaded 实现了 Clone，InputMedia 没有）
-        // Store upload results to rebuild InputMedia on send retry (Uploaded is Clone, InputMedia is not)
-        struct UploadedPart {
-            video: grammers_client::media::Uploaded,
-            thumb: Option<grammers_client::media::Uploaded>,
-            duration: f64, w: i32, h: i32,
+        // 固化后的视频分片，包含服务端永久 Media 引用和元数据
+        // Committed video parts: server-side permanent Media reference + metadata
+        struct CommittedPart {
+            media: grammers_client::media::Media,  // 已通过 UploadMedia 固化 / committed via UploadMedia
         }
-        let mut uploaded_parts: Vec<UploadedPart> = Vec::new();
-        // 依次上传每个视频片段及其缩略图 / Upload each video part and its thumbnail sequentially
-        for (part_path, meta) in effective_parts.iter().zip(part_metas.iter()) {
-            let video = upload_with_progress(&client, part_path, Arc::clone(&done), upload_total).await?;
-            let thumb = if let Some(ref tp) = meta.thumb_path {
-                let t = upload_with_progress(&client, tp, Arc::clone(&done), upload_total).await;
-                let _ = fs::remove_file(tp);
-                Some(t?)
-            } else { None };
-            uploaded_parts.push(UploadedPart { video, thumb, duration: meta.duration, w: meta.w, h: meta.h });
+
+        // 上传单个文件后立即调用 messages.UploadMedia 固化到服务端，带重试。
+        // 固化后的 Media 不受上传 session TTL 限制（约 10 分钟），可安全地在之后发送。
+        //
+        // Upload a file then immediately commit it via messages.UploadMedia, with retry.
+        // Committed Media is not subject to the ~10-minute upload session TTL.
+        async fn commit_media(
+            client: &Client,
+            peer: &PeerRef,
+            raw_media: tl::enums::InputMedia,
+        ) -> Result<grammers_client::media::Media, String> {
+            const MAX_RETRIES: u32 = 10;
+            const DELAYS: [u64; 5] = [5, 10, 20, 40, 60];
+            let mut attempt = 0u32;
+            loop {
+                match client.invoke(&tl::functions::messages::UploadMedia {
+                    business_connection_id: None,
+                    peer: (*peer).into(),
+                    media: raw_media.clone(),
+                }).await {
+                    Ok(committed) => {
+                        return grammers_client::media::Media::from_raw(committed)
+                            .ok_or_else(|| "UploadMedia returned unrecognized media type".to_string());
+                    }
+                    Err(e) => {
+                        attempt += 1;
+                        if attempt >= MAX_RETRIES {
+                            return Err(format!("UploadMedia failed after {} attempts: {}", attempt, e));
+                        }
+                        let delay = DELAYS[(attempt as usize - 1).min(DELAYS.len() - 1)];
+                        eprintln!("UploadMedia attempt {}/{} failed: {}. retrying in {}s…",
+                            attempt, MAX_RETRIES, e, delay);
+                        tokio::time::sleep(Duration::from_secs(delay)).await;
+                    }
+                }
+            }
         }
-        // 清理转换后的临时视频文件 / Clean up converted temporary video files
+
+        // 上传封面图并立即固化 / Upload cover and commit immediately
+        let committed_cover: Option<grammers_client::media::Media> = if let Some(img) = effective_cover {
+            let uploaded = upload_with_progress(&client, img, Arc::clone(&done), upload_total).await?;
+            let raw: tl::enums::InputMedia = tl::types::InputMediaUploadedPhoto {
+                spoiler: false,
+                file: uploaded.raw,
+                stickers: None,
+                ttl_seconds: None,
+            }.into();
+            Some(commit_media(&client, &peer, raw).await?)
+        } else { None };
+        if let Some(ref tmp) = converted_cover { let _ = fs::remove_file(tmp); }
+        if let Some(ref tmp) = resized_cover { let _ = fs::remove_file(tmp); }
+
+        // 串行上传每个视频片段及其缩略图，上传后立即固化。
+        // Serial upload + immediate commit for each video part and its thumbnail.
+        let do_upload_and_commit = |done: Arc<AtomicUsize>| {
+            let client = &client;
+            let effective_parts = &effective_parts;
+            let part_metas = &part_metas;
+            let peer = &peer;
+            async move {
+                let mut parts: Vec<CommittedPart> = Vec::new();
+                for (part_path, meta) in effective_parts.iter().zip(part_metas.iter()) {
+                    let thumb_uploaded = if let Some(ref tp) = meta.thumb_path {
+                        let t = upload_with_progress(client, tp, Arc::clone(&done), upload_total).await;
+                        let _ = fs::remove_file(tp);
+                        Some(t?)
+                    } else { None };
+
+                    let video_uploaded = upload_with_progress(client, part_path, Arc::clone(&done), upload_total).await?;
+
+                    // 直接构建 InputMediaUploadedDocument，避免访问私有字段
+                    // Build InputMediaUploadedDocument directly to avoid accessing private fields
+                    let ext = part_path.extension().and_then(|e| e.to_str()).unwrap_or("mp4").to_lowercase();
+                    let mime = if ext == "mkv" { "video/x-matroska" } else { "video/mp4" };
+                    let raw_media: tl::enums::InputMedia = tl::types::InputMediaUploadedDocument {
+                        nosound_video: false,
+                        force_file: false,
+                        spoiler: false,
+                        file: video_uploaded.raw,
+                        thumb: thumb_uploaded.map(|t| t.raw),
+                        mime_type: mime.to_string(),
+                        attributes: vec![
+                            tl::types::DocumentAttributeFilename {
+                                file_name: part_path.file_name().unwrap().to_string_lossy().to_string()
+                            }.into(),
+                            tl::types::DocumentAttributeVideo {
+                                round_message: false,
+                                supports_streaming: true,
+                                nosound: false,
+                                duration: meta.duration,
+                                w: meta.w,
+                                h: meta.h,
+                                preload_prefix_size: None,
+                                video_start_ts: None,
+                                video_codec: None,
+                            }.into(),
+                        ],
+                        stickers: None,
+                        ttl_seconds: None,
+                        video_cover: None,
+                        video_timestamp: None,
+                    }.into();
+
+                    let committed = commit_media(client, peer, raw_media).await?;
+                    parts.push(CommittedPart { media: committed });
+                }
+                Ok::<_, String>(parts)
+            }
+        };
+
+        let mut committed_parts = do_upload_and_commit(Arc::clone(&done)).await?;
         for tmp in &converted_parts { let _ = fs::remove_file(tmp); }
 
-        // 保存封面图的 Uploaded（用于重试时重建）/ Save cover Uploaded for retry rebuilding
-        let uploaded_cover_saved = uploaded_cover.take();
-        let total_parts = uploaded_parts.len();
+        let total_parts = committed_parts.len();
 
-        // 辅助函数：从保存的 Uploaded 重建 InputMedia 列表
-        // Helper: rebuild InputMedia list from saved Uploaded values
-        let build_items = |cover: &Option<grammers_client::media::Uploaded>,
-                           parts: &Vec<UploadedPart>| -> Vec<InputMedia> {
+        // 辅助函数：从固化的 Media 重建 InputMedia 列表（用于发送重试）
+        // Helper: rebuild InputMedia list from committed Media (for send retry)
+        let build_items = |cover: &Option<grammers_client::media::Media>,
+                           parts: &Vec<CommittedPart>| -> Vec<InputMedia> {
             let mut items: Vec<InputMedia> = Vec::new();
             if let Some(c) = cover {
-                items.push(InputMedia::new().photo(c.clone()));
+                items.push(InputMedia::new().copy_media(c));
             }
             for (idx, part) in parts.iter().enumerate() {
-                let mut item = InputMedia::new().document(part.video.clone());
-                if let Some(ref t) = part.thumb { item = item.thumbnail(t.clone()); }
-                item = item.attribute(Attribute::Video {
-                    round_message: false, supports_streaming: true,
-                    duration: std::time::Duration::from_secs_f64(part.duration),
-                    w: part.w, h: part.h,
-                });
-                if idx == total_parts - 1 {
+                let mut item = InputMedia::new().copy_media(&part.media);                if idx == total_parts - 1 {
                     item = item.fmt_entities(base_caption_entities.clone()).caption(base_caption_text.clone());
                 }
                 items.push(item);
@@ -739,49 +864,71 @@ async fn upload_and_send(
             items
         };
 
-        // 每批最多 10 条发送相册，发送失败立即重试（不重新上传）
-        // Send album in batches of max 10; retry send on failure without re-uploading
+        // 每批最多 10 条发送相册。固化后的 InputMedia 不会有 FILE_PART_MISSING，
+        // 但仍保留重传逻辑以防万一。
+        // Send album in batches of max 10. Committed InputMedia won't get FILE_PART_MISSING,
+        // but keep re-upload logic as a safety net.
         const MAX_ALBUM: usize = 10;
-        const MAX_SEND: u32 = 3;
+        const MAX_SEND: u32 = 5;
+        const MAX_REUPLOAD: u32 = 3;
         const SEND_RETRY_DELAY: Duration = Duration::from_secs(30);
 
-        let all_items = build_items(&uploaded_cover_saved, &uploaded_parts);
-        let n_batches = all_items.len().div_ceil(MAX_ALBUM);
-        for batch_idx in 0..n_batches {
-            let start = batch_idx * MAX_ALBUM;
-            let mut send_attempt = 0u32;
-            loop {
-                // 每次重试都重建这一批的 InputMedia
-                // Rebuild this batch's InputMedia on each attempt
-                let batch: Vec<InputMedia> = build_items(&uploaded_cover_saved, &uploaded_parts)
-                    .into_iter().skip(start).take(MAX_ALBUM).collect();
-                match client.send_album(peer.clone(), batch).await {
-                    Ok(_) => break,
-                    Err(e) => {
-                        send_attempt += 1;
-                        let msg = format!("send_album (batch {}) failed: {}", batch_idx + 1, e);
-                        if send_attempt >= MAX_SEND {
-                            return Err(msg);
+        let mut reupload_count = 0u32;
+        loop {
+            let n_batches = build_items(&committed_cover, &committed_parts).len().div_ceil(MAX_ALBUM);
+            let mut need_reupload = false;
+            let mut send_err = String::new();
+
+            'batches: for batch_idx in 0..n_batches {
+                let start = batch_idx * MAX_ALBUM;
+                let mut send_attempt = 0u32;
+                loop {
+                    let batch: Vec<InputMedia> = build_items(&committed_cover, &committed_parts)
+                        .into_iter().skip(start).take(MAX_ALBUM).collect();
+                    match client.send_album(peer, batch).await {
+                        Ok(_) => break,
+                        Err(e) => {
+                            let msg = format!("send_album (batch {}) failed: {}", batch_idx + 1, e);
+                            if msg.contains("FILE_PART_MISSING") {
+                                need_reupload = true;
+                                send_err = msg;
+                                break 'batches;
+                            }
+                            send_attempt += 1;
+                            if send_attempt >= MAX_SEND { return Err(msg); }
+                            eprintln!("send failed (attempt {}/{}): {}. retrying in {:?}…",
+                                send_attempt, MAX_SEND, msg, SEND_RETRY_DELAY);
+                            tokio::time::sleep(SEND_RETRY_DELAY).await;
                         }
-                        eprintln!("send failed (attempt {}/{}): {}. retrying in {:?}…",
-                            send_attempt, MAX_SEND, msg, SEND_RETRY_DELAY);
-                        tokio::time::sleep(SEND_RETRY_DELAY).await;
                     }
                 }
             }
+
+            if !need_reupload { break; }
+
+            reupload_count += 1;
+            if reupload_count > MAX_REUPLOAD {
+                return Err(format!("{} (re-upload limit reached)", send_err));
+            }
+            eprintln!("FILE_PART_MISSING, re-uploading all files (attempt {}/{})…",
+                reupload_count, MAX_REUPLOAD);
+            done.store(0, Ordering::Relaxed);
+            committed_parts = do_upload_and_commit(Arc::clone(&done)).await?;
         }
-    } else if let Some(cover_file) = uploaded_cover {
-        // 仅发送封面图和说明文字，发送失败立即重试（不重新上传）
-        // Send cover image with caption only; retry send on failure without re-uploading
-        const MAX_SEND: u32 = 3;
+    } else if let Some(img) = effective_cover {
+        // 仅发送封面图和说明文字 / Send cover image with caption only
+        let uploaded = upload_with_progress(&client, img, Arc::clone(&done), upload_total).await?;
+        if let Some(ref tmp) = converted_cover { let _ = fs::remove_file(tmp); }
+        if let Some(ref tmp) = resized_cover { let _ = fs::remove_file(tmp); }
+        const MAX_SEND: u32 = 5;
         const SEND_RETRY_DELAY: Duration = Duration::from_secs(30);
         let mut send_attempt = 0u32;
         loop {
             let msg = InputMessage::new()
-                .photo(cover_file.clone())
+                .photo(uploaded.clone())
                 .fmt_entities(base_caption_entities.clone())
                 .text(base_caption_text.clone());
-            match client.send_message(peer.clone(), msg).await {
+            match client.send_message(peer, msg).await {
                 Ok(_) => break,
                 Err(e) => {
                     send_attempt += 1;
@@ -803,7 +950,7 @@ async fn upload_and_send(
             let msg = InputMessage::new()
                 .fmt_entities(base_caption_entities.clone())
                 .text(base_caption_text.clone());
-            match client.send_message(peer.clone(), msg).await {
+            match client.send_message(peer, msg).await {
                 Ok(_) => break,
                 Err(e) => {
                     send_attempt += 1;
@@ -858,7 +1005,8 @@ fn run() -> Result<(), String> {
 
     let cover = find_cover(&input);
 
-    // Telegram 单文件大小限制为 2GB / Telegram single file size limit is 2GB
+    // Telegram 单文件大小限制为 2GB
+    // Telegram single file size limit is 2GB
     const TG_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
     let video_parts: Vec<PathBuf> = if send_video { split_video(&input, TG_MAX_BYTES)? } else { vec![input.clone()] };
     let is_split = video_parts.len() > 1 || video_parts.first().map(|p| p != &input).unwrap_or(false);

@@ -12,6 +12,7 @@
 
 use crate::core::error::{AppError, Result};
 use reqwest::{Client, Response};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// 模拟浏览器的 User-Agent / Browser-mimicking User-Agent
@@ -33,17 +34,13 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client> {
     let mut builder = Client::builder()
         .user_agent(USER_AGENT)
         .timeout(std::time::Duration::from_secs(30))
-        .use_native_tls()
         .tcp_keepalive(std::time::Duration::from_secs(15))
         .connection_verbose(false);
 
-    if let Some(proxy) = proxy_url {
-        if !proxy.is_empty() {
-            builder = builder
-                .proxy(reqwest::Proxy::all(proxy).map_err(|e| AppError::Other(e.to_string()))?);
-        } else {
-            builder = builder.no_proxy();
-        }
+    if let Some(proxy) = proxy_url
+        && !proxy.is_empty() {
+        builder = builder
+            .proxy(reqwest::Proxy::all(proxy).map_err(|e| AppError::Other(e.to_string()))?);
     } else {
         builder = builder.no_proxy();
     }
@@ -58,12 +55,11 @@ fn build_api_client(proxy_url: Option<&str>) -> Result<Client> {
         .user_agent(USER_AGENT)
         .timeout(std::time::Duration::from_secs(30));
 
-    if let Some(proxy) = proxy_url {
-        if !proxy.is_empty() {
-            builder = builder
-                .proxy(reqwest::Proxy::all(proxy).map_err(|e| AppError::Other(e.to_string()))?);
-            return Ok(builder.build()?);
-        }
+    if let Some(proxy) = proxy_url
+        && !proxy.is_empty() {
+        builder = builder
+            .proxy(reqwest::Proxy::all(proxy).map_err(|e| AppError::Other(e.to_string()))?);
+        return Ok(builder.build()?);
     }
     builder = builder.no_proxy();
     Ok(builder.build()?)
@@ -98,6 +94,8 @@ pub struct StripchatApi {
     sc_mirror: Option<String>,
     /// 各 CDN 节点的首选 TLD 缓存（节点 ID -> TLD）/ Preferred TLD cache per CDN node (node ID -> TLD)
     preferred_tld_by_node: Arc<parking_lot::Mutex<std::collections::HashMap<String, String>>>,
+    /// Mouflon 解密密钥（pkey -> pdkey），用于 playlist URL 匹配 / Mouflon decryption keys (pkey -> pdkey) for playlist URL matching
+    mouflon_keys: HashMap<String, String>,
 }
 
 impl StripchatApi {
@@ -114,6 +112,7 @@ impl StripchatApi {
             cdn_client: build_client(cdn_proxy)?,
             sc_mirror: sc_mirror.filter(|s| !s.is_empty()).map(|s| s.to_string()),
             preferred_tld_by_node,
+            mouflon_keys: HashMap::new(),
         })
     }
 
@@ -130,6 +129,19 @@ impl StripchatApi {
             sc_mirror,
             Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         )
+    }
+
+    /// 设置 Mouflon 解密密钥，返回 self 以支持链式调用。
+    /// Set Mouflon decryption keys, returns self for method chaining.
+    pub fn with_mouflon_keys(mut self, keys: HashMap<String, String>) -> Self {
+        self.mouflon_keys = keys;
+        self
+    }
+
+    /// 获取当前 Mouflon 解密密钥的引用。
+    /// Get a reference to the current Mouflon decryption keys.
+    pub fn mouflon_keys(&self) -> &HashMap<String, String> {
+        &self.mouflon_keys
     }
 
     /// 将 stripchat.com 域名替换为镜像站域名（若已配置）。
@@ -368,62 +380,154 @@ impl StripchatApi {
         })
     }
 
-    /// 获取主播的 HLS 播放列表 URL（需要先获取 models 列表以确定 HLS 前缀）。
-    /// Get the HLS playlist URL for a streamer (requires fetching the models list to determine the HLS prefix).
+    /// 对所有 CDN TLD 竞速请求 `_auto.m3u8` master playlist，返回最先成功的响应文本。
+    /// Race all CDN TLDs for the `_auto.m3u8` master playlist and return the first successful response text.
+    async fn fetch_auto_playlist(&self, model_id: i64) -> Result<String> {
+        let client = &self.cdn_client;
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for &tld in CDN_TLDS {
+            // 使用固定路径模板：edge-hls.{tld}/hls/{model_id}/master/{model_id}_auto.m3u8
+            let url = format!(
+                "https://edge-hls.{}/hls/{}/master/{}_auto.m3u8",
+                tld, model_id, model_id
+            );
+            let client = client.clone();
+            tasks.spawn(async move {
+                let resp = client.get(&url).header("Referer", REFERER).send().await;
+                (tld, url, resp)
+            });
+        }
+
+        let mut errors: Vec<(String, String)> = Vec::new();
+
+        while let Some(join_result) = tasks.join_next().await {
+            let (tld, url, result) = match join_result {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            match result {
+                Ok(resp) if resp.status().is_success() => {
+                    tasks.abort_all();
+                    tracing::debug!("auto.m3u8 via CDN TLD: {}", tld);
+                    return Ok(resp.text().await?);
+                }
+                Ok(resp) => {
+                    errors.push((url, format!("HTTP {}", resp.status())));
+                }
+                Err(e) => {
+                    errors.push((url, e.to_string()));
+                }
+            }
+        }
+
+        for (url, err) in &errors {
+            tracing::error!("auto.m3u8 fetch failed [{}]: {}", url, err);
+        }
+        Err(AppError::Other(format!(
+            "All CDN TLDs failed for model {} _auto.m3u8",
+            model_id
+        )))
+    }
+
+    /// 从 master playlist 文本中解析出 BANDWIDTH 最高的流 URL，以及所有 Mouflon PSCH 参数对。
+    /// Parse the stream URL with the highest BANDWIDTH from the master playlist text,
+    /// along with all Mouflon PSCH parameter pairs.
+    fn parse_best_stream(playlist: &str) -> Option<(String, Vec<(String, String)>)> {
+        // 先把 \r\n 统一成 \n，再按 \n 分割
+        let normalized = playlist.replace("\r\n", "\n").replace('\r', "\n");
+        let lines: Vec<&str> = normalized.split('\n').map(|l| l.trim()).collect();
+
+        // 收集所有 Mouflon PSCH 参数对 (psch, pkey)
+        let mut mouflon_pairs: Vec<(String, String)> = Vec::new();
+        for &line in &lines {
+            if let Some(rest) = line.strip_prefix("#EXT-X-MOUFLON:PSCH:")
+                && let Some((scheme, key)) = rest.split_once(':') {
+                mouflon_pairs.push((scheme.to_string(), key.to_string()));
+            }
+        }
+
+        // 解析 BANDWIDTH 最高的流
+        let mut best_bandwidth: u64 = 0;
+        let mut best_url: Option<String> = None;
+        let mut pending_bandwidth: Option<u64> = None;
+
+        for &line in &lines {
+            if let Some(attrs) = line.strip_prefix("#EXT-X-STREAM-INF:") {
+                // 去掉标签前缀后再按逗号分割，避免标签名干扰 BANDWIDTH= 匹配
+                pending_bandwidth = attrs
+                    .split(',')
+                    .find(|seg| seg.trim_start().starts_with("BANDWIDTH="))
+                    .and_then(|seg| seg.trim_start().strip_prefix("BANDWIDTH="))
+                    .and_then(|v| v.parse::<u64>().ok());
+            } else if !line.is_empty() && !line.starts_with('#') {
+                if let Some(bw) = pending_bandwidth.take()
+                    && bw > best_bandwidth {
+                    best_bandwidth = bw;
+                    best_url = Some(line.to_string());
+                }
+            } else {
+                pending_bandwidth = None;
+            }
+        }
+
+        best_url.map(|url| (url, mouflon_pairs))
+    }
+
+    /// 获取主播的 HLS 播放列表 URL。
+    /// 直接对所有 CDN TLD 竞速请求 `{model_id}_auto.m3u8`，解析最高清晰度流。
+    /// 若 playlist 包含 Mouflon 加密参数，则按用户配置的 Mouflon Keys 顺序逐一比对，
+    /// 取第一个匹配的 pkey 对应的 psch 拼入 URL。
+    ///
+    /// Get the HLS playlist URL for a streamer.
+    /// Races all CDN TLDs for `{model_id}_auto.m3u8` and picks the highest-quality stream.
+    /// If the playlist contains Mouflon encryption parameters, iterates through the user-configured
+    /// Mouflon Keys in order and uses the first matching pkey's psch in the URL.
     async fn get_playlist_url(
         &self,
         username: &str,
         model_json: &serde_json::Value,
     ) -> Result<String> {
-        let models_url = self.api_url("https://stripchat.com/api/front/models?primaryTag=girls");
-        let resp = self
-            .api_client
-            .get(models_url)
-            .header("Referer", format!("{}{}", self.referer(), username))
-            .send()
-            .await?;
-
-        let models_json: serde_json::Value = resp.json().await?;
-        let ref_hls = models_json["models"]
-            .as_array()
-            .and_then(|arr| arr.first())
-            .and_then(|m| m["hlsPlaylist"].as_str())
-            .ok_or_else(|| AppError::Other("Cannot get HLS prefix".to_string()))?;
-
-        let hls_prefix: String = ref_hls.split('/').take(3).collect::<Vec<_>>().join("/");
-
         let model_id = model_json["user"]["user"]["id"]
             .as_i64()
             .ok_or_else(|| AppError::Other("Cannot get model ID".to_string()))?;
 
-        let master_url = format!("{}/hls/{}/master/{}.m3u8", hls_prefix, model_id, model_id);
+        let playlist_text = self.fetch_auto_playlist(model_id).await?;
 
-        let resp = self.cdn_get(&master_url).await?;
-        let playlist = resp.text().await?;
-        let mut playlist_url: Option<String> = None;
-        let mut psch: Option<String> = None;
-        let mut pkey: Option<String> = None;
+        let parsed = Self::parse_best_stream(&playlist_text);
 
-        for line in playlist.lines() {
-            if line.contains("EXT-X-MOUFLON") {
-                let parts: Vec<&str> = line.split(':').collect();
-                if parts.len() >= 4 {
-                    psch = Some(parts[2].to_string());
-                    pkey = Some(parts[3].to_string());
+        let (url, mouflon_pairs) =
+            parsed.ok_or_else(|| AppError::StreamOffline(username.to_string()))?;
+
+        // 若存在 Mouflon 加密参数，则遍历用户配置的 keys，取第一个匹配的
+        // If Mouflon encryption parameters exist, iterate user-configured keys and use the first match
+        let final_url = if mouflon_pairs.is_empty() {
+            url
+        } else {
+            // 按 mouflon_pairs 顺序遍历，找到第一个在用户 keys 中存在的 pkey
+            // Iterate mouflon_pairs in order, find the first pkey present in user keys
+            let matched = mouflon_pairs
+                .iter()
+                .find(|(_, pkey)| self.mouflon_keys.contains_key(pkey.as_str()));
+
+            match matched {
+                Some((psch, pkey)) => {
+                    let sep = if url.contains('?') { "&" } else { "?" };
+                    format!("{}{}psch={}&pkey={}", url, sep, psch, pkey)
+                }
+                None => {
+                    // 没有匹配的 key，回退到第一个 pair（无解密密钥）
+                    // No matching key found, fall back to the first pair (no decryption key)
+                    let (psch, pkey) = &mouflon_pairs[0];
+                    let sep = if url.contains('?') { "&" } else { "?" };
+                    format!("{}{}psch={}&pkey={}", url, sep, psch, pkey)
                 }
             }
-            if !line.is_empty() && !line.starts_with('#') {
-                playlist_url = Some(line.to_string());
-            }
-        }
+        };
 
-        let mut url = playlist_url.ok_or_else(|| AppError::StreamOffline(username.to_string()))?;
+        tracing::info!("Using the URL: {}", final_url);
 
-        if let (Some(psch), Some(pkey)) = (psch, pkey) {
-            url = format!("{}?&psch={}&pkey={}", url, psch, pkey);
-        }
-
-        Ok(url)
+        Ok(final_url)
     }
 
     /// 下载 HLS 播放列表文本内容。

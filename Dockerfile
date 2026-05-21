@@ -1,7 +1,7 @@
 FROM debian:latest AS builder
 
 LABEL maintainer="chantrail@chantrail.com" \
-      version="0.1.5" \
+      version="0.2.0" \
       description="Stripchat Recorder Docker builder for Debian"
 
 RUN sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources
@@ -96,20 +96,44 @@ COPY --from=builder /build/modules_dist/ /app/stripchat-recorder/modules.default
 
 
 RUN chmod +x /app/stripchat-recorder/stripchat-recorder
-RUN echo "server:3030" > /app/stripchat-recorder/config.default/run_mode.txt
+RUN printf '%s\n' \
+    '{' \
+    '  "output_dir": "/app/stripchat-recorder/recordings",' \
+    '  "poll_interval_secs": 30,' \
+    '  "auto_record": true,' \
+    '  "api_proxy_url": null,' \
+    '  "cdn_proxy_url": null,' \
+    '  "sc_mirror_url": null,' \
+    '  "max_concurrent": 0,' \
+    '  "merge_format": "mp4",' \
+    '  "language": "zh-CN",' \
+    '  "run_mode": "server",' \
+    '  "server_port": 3030' \
+    '}' \
+    > /app/stripchat-recorder/config.default/settings.json
 
 RUN printf '%s\n' \
     '#!/bin/sh' \
     'set -eu' \
     '' \
     'cp -an /app/stripchat-recorder/modules.default/. /app/stripchat-recorder/modules/' \
-    'cp -af /app/stripchat-recorder/config.default/run_mode.txt /app/stripchat-recorder/config/run_mode.txt' \
+    'cp -an /app/stripchat-recorder/config.default/settings.json /app/stripchat-recorder/config/settings.json' \
+    '' \
+    '# Override language from LANGUAGE env var if set (e.g. LANGUAGE=en-US)' \
+    'if [ -n "${LANGUAGE:-}" ]; then' \
+    '    sed -i "s/\"language\": \"[^\"]*\"/\"language\": \"${LANGUAGE}\"/" /app/stripchat-recorder/config/settings.json' \
+    'fi' \
+    '' \
+    '# Override server port from PORT env var if set (e.g. PORT=8080)' \
+    'if [ -n "${PORT:-}" ]; then' \
+    '    sed -i "s/\"server_port\": [0-9]*/\"server_port\": ${PORT}/" /app/stripchat-recorder/config/settings.json' \
+    'fi' \
     '' \
     'exec /app/stripchat-recorder/stripchat-recorder "$@"' \
     > /entrypoint.sh && chmod +x /entrypoint.sh
 
 VOLUME ["/app/stripchat-recorder/logs", "/app/stripchat-recorder/recordings", "/app/stripchat-recorder/modules.default", "/app/stripchat-recorder/modules" , "/app/stripchat-recorder/config"]
 
-EXPOSE 3030
+EXPOSE ${PORT:-3030}
 
 ENTRYPOINT ["/entrypoint.sh"]

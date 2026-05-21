@@ -6,8 +6,7 @@
 
 use crate::core::error::Result;
 use crate::streaming::monitor::StatusMonitor;
-use crate::config::settings::{AppState, Settings};
-use std::collections::HashMap;
+use crate::config::settings::{AppState, MouflonKeysStore, Settings};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_dialog::DialogExt;
@@ -69,29 +68,67 @@ pub async fn pick_output_dir(app_handle: AppHandle) -> Result<Option<String>> {
     }
 }
 
-/// 列出所有 Mouflon HLS 解密密钥（pkey -> pdkey 映射）。
-/// List all Mouflon HLS decryption keys (pkey -> pdkey map).
+/// 列出所有 Mouflon HLS 解密密钥（含时间戳的完整存储结构）。
+/// List all Mouflon HLS decryption keys (full store including timestamps).
 #[tauri::command]
-pub async fn list_mouflon_keys(state: State<'_, Arc<AppState>>) -> Result<HashMap<String, String>> {
-    Ok(state.get_mouflon_keys())
+pub async fn list_mouflon_keys(state: State<'_, Arc<AppState>>) -> Result<MouflonKeysStore> {
+    Ok(state.get_mouflon_keys_store())
 }
 
-/// 添加或更新一个 Mouflon 密钥对。
-/// Add or update a Mouflon key pair.
+/// 添加或更新一个 Mouflon 密钥对，并广播 mouflon-keys-updated 事件。
+/// Add or update a Mouflon key pair and broadcast mouflon-keys-updated event.
 #[tauri::command]
 pub async fn add_mouflon_key(
     pkey: String,
     pdkey: String,
+    app_handle: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<()> {
-    state.add_mouflon_key(&pkey, &pdkey)
+    state.add_mouflon_key(&pkey, &pdkey)?;
+    let _ = app_handle.emit("mouflon-keys-updated", state.get_mouflon_keys_store());
+    Ok(())
 }
 
-/// 删除指定 pkey 的 Mouflon 密钥。
-/// Remove the Mouflon key with the given pkey.
+/// 删除指定 pkey 的 Mouflon 密钥，并广播 mouflon-keys-updated 事件。
+/// Remove the Mouflon key with the given pkey and broadcast mouflon-keys-updated event.
 #[tauri::command]
-pub async fn remove_mouflon_key(pkey: String, state: State<'_, Arc<AppState>>) -> Result<()> {
-    state.remove_mouflon_key(&pkey)
+pub async fn remove_mouflon_key(
+    pkey: String,
+    app_handle: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<()> {
+    state.remove_mouflon_key(&pkey)?;
+    let _ = app_handle.emit("mouflon-keys-updated", state.get_mouflon_keys_store());
+    Ok(())
+}
+
+/// 手动触发一次 Mouflon Keys 从 Worker 同步（仍比对 updated_at，相同则跳过）。
+/// 返回 true 表示密钥已更新，false 表示无需更新。
+///
+/// Manually trigger a Mouflon Keys sync from the Worker (still compares updated_at; skips if equal).
+/// Returns true if keys were updated, false if already up-to-date.
+#[tauri::command]
+pub async fn sync_mouflon_keys(
+    app_handle: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<bool> {
+    let settings = state.get_settings();
+    let url = settings
+        .mouflon_sync_url
+        .as_deref()
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| crate::core::error::AppError::Other("未配置 mouflon_sync_url".into()))?
+        .to_string();
+    let token = settings.mouflon_sync_token.clone();
+
+    let updated = state
+        .sync_mouflon_keys_from_worker(&url, token.as_deref())
+        .await?;
+
+    if updated {
+        let _ = app_handle.emit("mouflon-keys-updated", state.get_mouflon_keys_store());
+    }
+    Ok(updated)
 }
 
 /// 启动警告数据结构（序列化后返回给前端）/ Startup warnings data structure (serialized and returned to the frontend)
@@ -113,8 +150,8 @@ pub async fn get_startup_warnings(state: State<'_, Arc<AppState>>) -> Result<Sta
 
         let missing_pp_results: Vec<String> = data
             .pp_results
-            .keys()
-            .filter(|path| !std::path::Path::new(path).exists())
+            .iter()
+            .filter(|path| !std::path::Path::new(path.as_str()).exists())
             .cloned()
             .collect();
 
@@ -135,9 +172,7 @@ pub async fn remove_missing_pp_results(
     state: State<'_, Arc<AppState>>,
 ) -> Result<()> {
     let mut data = state.data.write();
-    for path in &paths {
-        data.pp_results.remove(path);
-    }
+    data.pp_results.retain(|p| !paths.contains(p));
     drop(data);
     state.save()
 }
@@ -214,9 +249,9 @@ pub fn get_disk_space_inner(output_dir: &str) -> Result<DiskSpace> {
         let ret = unsafe { libc::statvfs(path_cstr.as_ptr(), stat.as_mut_ptr()) };
         if ret == 0 {
             let stat = unsafe { stat.assume_init() };
-            let block = stat.f_frsize as u64;
-            let total = stat.f_blocks as u64 * block;
-            let avail = stat.f_bavail as u64 * block;
+            let block = stat.f_frsize;
+            let total = stat.f_blocks * block;
+            let avail = stat.f_bavail * block;
             return Ok(DiskSpace {
                 total_bytes: total,
                 available_bytes: avail,

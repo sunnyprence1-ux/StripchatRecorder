@@ -16,6 +16,24 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+/// Mouflon 密钥存储结构，持久化到 mouflon_keys.json。
+/// Mouflon key store, persisted to mouflon_keys.json.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MouflonKeysStore {
+    /// pkey -> pdkey 密钥对 / pkey -> pdkey key pairs
+    #[serde(default)]
+    pub keys: HashMap<String, String>,
+    /// 数据源（Worker）的密钥更新时间（RFC 3339），同步时与 Worker 返回的 updated_at 比对，相同则跳过写入。
+    /// Key update timestamp from the data source (Worker, RFC 3339).
+    /// Compared against the Worker's `updated_at`; skip write if equal.
+    #[serde(default)]
+    pub auto_synced_at: Option<String>,
+    /// 最近一次手动添加/删除密钥的时间（RFC 3339）。
+    /// Timestamp of the last manual key add/remove (RFC 3339).
+    #[serde(default)]
+    pub manual_updated_at: Option<String>,
+}
+
 /// 后处理任务状态快照（序列化后发送给前端）。
 /// Post-processing task status snapshot (serialized and sent to the frontend).
 #[derive(Debug, Clone, Serialize)]
@@ -61,11 +79,57 @@ pub struct Settings {
     /// 录制片段合并格式（默认 "mp4"）/ Recording segment merge format (default "mp4")
     #[serde(default = "default_merge_format")]
     pub merge_format: String,
+    /// 后处理临时目录最大占用（GB，0 = 不限制，默认 50 GB）
+    /// Max size of the post-processing tmp directory in GB (0 = unlimited, default 50 GB)
+    #[serde(default = "default_max_tmp_dir_gb")]
+    pub max_tmp_dir_gb: f64,
+    /// 界面语言（"zh-CN" 或 "en-US"）/ UI language ("zh-CN" or "en-US")
+    #[serde(default = "default_language")]
+    pub language: String,
+    /// 运行模式（"desktop" 或 "server"）/ Run mode ("desktop" or "server")
+    #[serde(default = "default_run_mode")]
+    pub run_mode: String,
+    /// Server 模式监听端口 / Server mode listen port
+    #[serde(default = "default_server_port")]
+    pub server_port: u16,
+    /// Mouflon Keys 同步 Worker URL（为空则不启用自动同步）
+    /// Mouflon Keys sync Worker URL (empty = auto-sync disabled)
+    #[serde(default = "default_mouflon_sync_url")]
+    pub mouflon_sync_url: Option<String>,
+    /// Mouflon Keys 同步 Worker 鉴权 Token（对应 Worker 的 AUTH_TOKEN 环境变量）
+    /// Mouflon Keys sync Worker auth token (corresponds to Worker's AUTH_TOKEN env var)
+    #[serde(default)]
+    pub mouflon_sync_token: Option<String>,
+}
+
+/// Mouflon 同步地址的默认值 / Default value for Mouflon sync URL
+fn default_mouflon_sync_url() -> Option<String> {
+    Some("https://mouflon.chantrail.com".to_string())
 }
 
 /// 合并格式的默认值 / Default value for merge format
 fn default_merge_format() -> String {
     "mp4".to_string()
+}
+
+/// tmp 目录最大占用的默认值（50 GB）/ Default value for max tmp dir size (50 GB)
+fn default_max_tmp_dir_gb() -> f64 {
+    50.0
+}
+
+/// 语言的默认值 / Default value for language
+fn default_language() -> String {
+    "zh-CN".to_string()
+}
+
+/// 运行模式的默认值 / Default value for run mode
+fn default_run_mode() -> String {
+    String::new()
+}
+
+/// Server 端口的默认值 / Default value for server port
+fn default_server_port() -> u16 {
+    3030
 }
 
 /// 返回可执行文件所在目录，用于定位配置文件和模块目录。
@@ -92,6 +156,12 @@ impl Default for Settings {
             sc_mirror_url: None,
             max_concurrent: 0,
             merge_format: default_merge_format(),
+            max_tmp_dir_gb: default_max_tmp_dir_gb(),
+            language: default_language(),
+            run_mode: default_run_mode(),
+            server_port: default_server_port(),
+            mouflon_sync_url: default_mouflon_sync_url(),
+            mouflon_sync_token: None,
         }
     }
 }
@@ -103,15 +173,16 @@ pub struct AppData {
     pub settings: Settings,
     /// 追踪的主播列表 / List of tracked streamers
     pub streamers: Vec<StreamerData>,
-    /// Mouflon HLS 解密密钥（pkey -> pdkey）/ Mouflon HLS decryption keys (pkey -> pdkey)
+    /// Mouflon HLS 解密密钥存储（含密钥对和时间戳）/ Mouflon HLS decryption key store (keys + timestamps)
     #[serde(default)]
-    pub mouflon_keys: HashMap<String, String>,
+    pub mouflon_keys: MouflonKeysStore,
     /// 后处理流水线配置 / Post-processing pipeline configuration
     #[serde(default)]
     pub pipeline: PipelineConfig,
-    /// 后处理结果记录（文件路径 -> 是否成功）/ Post-processing results (file path -> success)
+    /// 已执行过后处理的视频路径列表（目录文件，true/false 由对应 meta JSON 确认）
+    /// List of video paths that have been post-processed (directory file; success/failure confirmed by reading the corresponding meta JSON)
     #[serde(default)]
-    pub pp_results: HashMap<String, bool>,
+    pub pp_results: Vec<String>,
 }
 
 /// 单个主播的持久化数据 / Persisted data for a single streamer
@@ -125,10 +196,6 @@ pub struct StreamerData {
     pub added_at: String,
 }
 
-/// 视频时长缓存的键：(文件路径, 文件大小, 修改时间戳)
-/// Cache key for video duration: (file path, file size, modification timestamp)
-type DurationCacheKey = (String, u64, u64);
-
 /// 应用运行时全局状态，通过 `Arc<AppState>` 在各模块间共享。
 /// Global application runtime state, shared across modules via `Arc<AppState>`.
 pub struct AppState {
@@ -140,12 +207,16 @@ pub struct AppState {
     pub pp_tasks: RwLock<HashMap<String, PpTaskStatus>>,
     /// 后处理取消标志（文件路径 -> 原子布尔）/ Post-processing cancel flags (file path -> atomic bool)
     pub pp_cancel_flags: RwLock<HashMap<String, Arc<AtomicBool>>>,
-    /// 视频时长缓存，避免重复调用 ffprobe / Video duration cache to avoid repeated ffprobe calls
-    pub duration_cache: RwLock<HashMap<DurationCacheKey, Option<u64>>>,
     /// 后处理串行锁，确保同一时刻只有一个后处理任务运行 / Serial lock ensuring only one post-processing task runs at a time
     pub pp_lock: std::sync::Mutex<()>,
     /// 启动合并锁，防止启动时的合并与正常录制并发 / Startup merge lock preventing concurrent startup merge and normal recording
     pub startup_lock: std::sync::Mutex<()>,
+    /// 通知监控器 poll_interval_secs 已变更的发送端（可选，启动后注入）
+    /// Sender to notify the monitor that poll_interval_secs has changed (optional, injected after startup)
+    pub poll_interval_notify_tx: RwLock<Option<tokio::sync::mpsc::Sender<()>>>,
+    /// 通知 Mouflon 同步调度器立即触发同步的发送端（可选，启动后注入）
+    /// Sender to notify the Mouflon sync scheduler to trigger an immediate sync (optional, injected after startup)
+    pub mouflon_sync_notify_tx: RwLock<Option<tokio::sync::mpsc::Sender<()>>>,
 }
 
 impl AppState {
@@ -172,14 +243,24 @@ impl AppState {
         let streamers: Vec<StreamerData> = load_json("streamers.json")
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        let mouflon_keys: HashMap<String, String> = load_json("mouflon_keys.json")
+        let mouflon_keys: MouflonKeysStore = load_json("mouflon_keys.json")
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         let pipeline: PipelineConfig = load_json("pipeline.json")
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        let pp_results: HashMap<String, bool> = load_json("pp_results.json")
-            .and_then(|s| serde_json::from_str(&s).ok())
+        // pp_results.json 存储已执行过后处理的视频路径列表（Vec<String>）
+        // 兼容旧格式（HashMap<String, bool>）：若解析为 Vec 失败，尝试解析为旧格式并提取 keys
+        // pp_results.json stores a list of video paths that have been post-processed (Vec<String>)
+        // Compatibility with old format (HashMap<String, bool>): if Vec parse fails, try old format and extract keys
+        let pp_results: Vec<String> = load_json("pp_results.json")
+            .and_then(|s| {
+                serde_json::from_str::<Vec<String>>(&s).ok().or_else(|| {
+                    serde_json::from_str::<HashMap<String, bool>>(&s)
+                        .ok()
+                        .map(|m| m.into_keys().collect())
+                })
+            })
             .unwrap_or_default();
 
         let data = AppData { settings, streamers, mouflon_keys, pipeline, pp_results };
@@ -191,9 +272,10 @@ impl AppState {
             config_dir,
             pp_tasks: RwLock::new(HashMap::new()),
             pp_cancel_flags: RwLock::new(HashMap::new()),
-            duration_cache: RwLock::new(HashMap::new()),
             pp_lock: std::sync::Mutex::new(()),
             startup_lock: std::sync::Mutex::new(()),
+            poll_interval_notify_tx: RwLock::new(None),
+            mouflon_sync_notify_tx: RwLock::new(None),
         }))
     }
 
@@ -223,11 +305,29 @@ impl AppState {
     }
 
     /// 更新设置并保存到磁盘，同时确保新输出目录存在。
+    /// 若 poll_interval_secs 发生变化，通知监控器立即以新间隔重新计时。
+    /// 若 mouflon_sync_url 或 mouflon_sync_token 发生变化，通知同步调度器立即触发一次同步。
+    ///
     /// Update settings and save to disk, also ensuring the new output directory exists.
+    /// If poll_interval_secs changed, notify the monitor to restart its timer with the new interval.
+    /// If mouflon_sync_url or mouflon_sync_token changed, notify the sync scheduler to trigger immediately.
     pub fn update_settings(&self, settings: Settings) -> Result<()> {
         fs::create_dir_all(&settings.output_dir)?;
+        let old = self.data.read().settings.clone();
+        let poll_interval_changed = old.poll_interval_secs != settings.poll_interval_secs;
+        let mouflon_sync_changed = old.mouflon_sync_url != settings.mouflon_sync_url
+            || old.mouflon_sync_token != settings.mouflon_sync_token;
         self.data.write().settings = settings;
-        self.save()
+        self.save()?;
+        if poll_interval_changed
+            && let Some(tx) = self.poll_interval_notify_tx.read().as_ref() {
+            let _ = tx.try_send(());
+        }
+        if mouflon_sync_changed
+            && let Some(tx) = self.mouflon_sync_notify_tx.read().as_ref() {
+            let _ = tx.try_send(());
+        }
+        Ok(())
     }
 
     /// 获取所有追踪主播的克隆列表。
@@ -273,29 +373,142 @@ impl AppState {
         self.save()
     }
 
-    /// 获取所有 Mouflon 解密密钥的克隆副本。
-    /// Get a cloned copy of all Mouflon decryption keys.
+    /// 获取所有 Mouflon 解密密钥的克隆副本（仅 keys 部分，供录制/转发使用）。
+    /// Get a cloned copy of all Mouflon decryption keys (keys map only, for recording/relay use).
     pub fn get_mouflon_keys(&self) -> HashMap<String, String> {
+        self.data.read().mouflon_keys.keys.clone()
+    }
+
+    /// 获取完整的 Mouflon 密钥存储（含时间戳），供前端展示。
+    /// Get the full Mouflon key store (including timestamps), for frontend display.
+    pub fn get_mouflon_keys_store(&self) -> MouflonKeysStore {
         self.data.read().mouflon_keys.clone()
     }
 
-    /// 添加或更新一个 Mouflon 密钥对并保存。
-    /// Add or update a Mouflon key pair and save.
+    /// 添加或更新一个 Mouflon 密钥对，更新 manual_updated_at 并保存。
+    /// Add or update a Mouflon key pair, update manual_updated_at, and save.
     pub fn add_mouflon_key(&self, pkey: &str, pdkey: &str) -> Result<()> {
         let mut data = self.data.write();
-        data.mouflon_keys
-            .insert(pkey.to_string(), pdkey.to_string());
+        data.mouflon_keys.keys.insert(pkey.to_string(), pdkey.to_string());
+        data.mouflon_keys.manual_updated_at = Some(chrono::Utc::now().to_rfc3339());
         drop(data);
         self.save()
     }
 
-    /// 删除指定 pkey 的 Mouflon 密钥并保存。
-    /// Remove the Mouflon key with the given pkey and save.
+    /// 删除指定 pkey 的 Mouflon 密钥，更新 manual_updated_at 并保存。
+    /// Remove the Mouflon key with the given pkey, update manual_updated_at, and save.
     pub fn remove_mouflon_key(&self, pkey: &str) -> Result<()> {
         let mut data = self.data.write();
-        data.mouflon_keys.remove(pkey);
+        data.mouflon_keys.keys.remove(pkey);
+        data.mouflon_keys.manual_updated_at = Some(chrono::Utc::now().to_rfc3339());
         drop(data);
         self.save()
+    }
+
+    /// 从 Cloudflare Worker 同步 Mouflon 密钥。
+    /// 比对 Worker 返回的 updated_at 与本地 auto_synced_at：
+    ///   - 相同 → 跳过，返回 false（无需更新）
+    ///   - 不同 → 覆盖 keys、更新 auto_synced_at，返回 true（已更新）
+    ///
+    /// Sync Mouflon keys from the Cloudflare Worker.
+    /// Compares Worker's `updated_at` against local `auto_synced_at`:
+    ///   - Equal   → skip, return false (no update needed)
+    ///   - Different → overwrite keys, update auto_synced_at, return true (updated)
+    pub async fn sync_mouflon_keys_from_worker(
+        &self,
+        worker_url: &str,
+        auth_token: Option<&str>,
+    ) -> Result<bool> {
+        #[derive(Deserialize)]
+        struct WorkerResponse {
+            keys: HashMap<String, String>,
+            updated_at: String,
+        }
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|e| AppError::Other(e.to_string()))?;
+
+        let mut req = client.get(worker_url);
+        if let Some(token) = auth_token {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AppError::Other(format!("Worker 请求失败: {}", e)))?;
+
+        if !resp.status().is_success() {
+            return Err(AppError::Other(format!(
+                "Worker 返回错误状态: {}",
+                resp.status()
+            )));
+        }
+
+        let body: WorkerResponse = resp
+            .json()
+            .await
+            .map_err(|e| AppError::Other(format!("Worker 响应解析失败: {}", e)))?;
+
+        // 比对 updated_at：解析为时间点后比较，避免格式差异导致误判
+        // Compare updated_at by parsing to a time point, avoiding false mismatches due to format differences
+        let worker_ts = chrono::DateTime::parse_from_rfc3339(&body.updated_at)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .ok();
+
+        let same_timestamp = {
+            let data = self.data.read();
+            match (&worker_ts, &data.mouflon_keys.auto_synced_at) {
+                (Some(wt), Some(local)) => {
+                    chrono::DateTime::parse_from_rfc3339(local)
+                        .map(|lt| lt.with_timezone(&chrono::Utc) == *wt)
+                        .unwrap_or(false)
+                }
+                _ => false,
+            }
+        };
+
+        if same_timestamp {
+            // 时间戳相同，检查是否有本地缺失的 key / Same timestamp, check for locally missing keys
+            let missing: Vec<(String, String)> = {
+                let data = self.data.read();
+                body.keys
+                    .iter()
+                    .filter(|(pkey, _)| !data.mouflon_keys.keys.contains_key(pkey.as_str()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            };
+            if missing.is_empty() {
+                return Ok(false);
+            }
+            // 补充缺失的 key / Insert missing keys
+            let mut data = self.data.write();
+            for (pkey, pdkey) in missing {
+                data.mouflon_keys.keys.insert(pkey, pdkey);
+            }
+            drop(data);
+            self.save()?;
+            return Ok(true);
+        }
+
+        // 时间戳不同，插入本地不存在的键对，更新 auto_synced_at
+        // Different timestamp: insert missing key pairs, update auto_synced_at
+        {
+            // 将 Worker 返回的时间戳规范化为 chrono RFC 3339 格式，与 manual_updated_at 保持一致
+            // Normalize Worker timestamp to chrono RFC 3339 format, consistent with manual_updated_at
+            let normalized_at = chrono::DateTime::parse_from_rfc3339(&body.updated_at)
+                .map(|dt| dt.with_timezone(&chrono::Utc).to_rfc3339())
+                .unwrap_or(body.updated_at);
+            let mut data = self.data.write();
+            for (pkey, pdkey) in body.keys {
+                data.mouflon_keys.keys.entry(pkey).or_insert(pdkey);
+            }
+            data.mouflon_keys.auto_synced_at = Some(normalized_at);
+        }
+        self.save()?;
+        Ok(true)
     }
 
     /// 获取当前流水线配置的克隆副本。
@@ -382,6 +595,7 @@ impl AppState {
 
     /// 更新指定文件路径的后处理进度信息。
     /// Update the post-processing progress for the given file path.
+    #[allow(clippy::too_many_arguments)]
     pub fn pp_task_progress(
         &self,
         path: &str,
@@ -402,37 +616,54 @@ impl AppState {
         }
     }
 
-    /// 将后处理任务标记为完成或失败，并将结果持久化到 pp_results.json。
-    /// Mark the post-processing task as done or failed, and persist the result to pp_results.json.
+    /// 将后处理任务标记为完成或失败。成功/失败状态由对应 meta JSON 的 status 字段确认，
+    /// 此处仅将路径记录到 pp_results 目录文件中（用于快速判断是否已执行过后处理）。
+    ///
+    /// Mark the post-processing task as done or failed. Success/failure is confirmed by the
+    /// corresponding meta JSON's status field; here we only record the path in the pp_results
+    /// directory file (for quick lookup of whether post-processing has been run).
     pub fn pp_task_finish(&self, path: &str, success: bool) {
         if let Some(t) = self.pp_tasks.write().get_mut(path) {
             t.status = if success { "done" } else { "error" }.to_string();
             t.pct = if success { 100.0 } else { t.pct };
         }
-        self.data
-            .write()
-            .pp_results
-            .insert(path.to_string(), success);
+        // 将路径加入目录列表（去重）/ Add path to directory list (deduplicated)
+        {
+            let mut data = self.data.write();
+            if !data.pp_results.contains(&path.to_string()) {
+                data.pp_results.push(path.to_string());
+            }
+        }
         let _ = self.save();
     }
 
     /// 获取所有后处理任务状态的列表，合并内存中的运行时状态和持久化的历史结果。
+    /// 历史结果通过读取对应 meta JSON 的 status 字段确认成功/失败。
+    ///
     /// Get a list of all post-processing task statuses, merging in-memory runtime state with persisted historical results.
+    /// Historical results are confirmed by reading the status field from the corresponding meta JSON.
     pub fn get_pp_tasks(&self) -> Vec<PpTaskStatus> {
         let mut tasks: HashMap<String, PpTaskStatus> = self.pp_tasks.read().clone();
 
-        // 将持久化结果中不在内存任务表里的条目补充进来
-        // Add persisted results that are not already in the in-memory task map
-        for (path, success) in self.data.read().pp_results.iter() {
-            tasks.entry(path.clone()).or_insert_with(|| PpTaskStatus {
+        // 从 pp_results 目录文件补充历史任务，通过 meta 确认 success/failure
+        // Supplement historical tasks from pp_results directory, confirming success/failure via meta
+        for path in self.data.read().pp_results.iter() {
+            if tasks.contains_key(path) {
+                continue;
+            }
+            let video_path = std::path::Path::new(path);
+            let success = crate::recording::meta::read_meta(video_path)
+                .map(|m| m.status == "finish")
+                .unwrap_or(false);
+            tasks.insert(path.clone(), PpTaskStatus {
                 path: path.clone(),
-                pct: if *success { 100.0 } else { 0.0 },
+                pct: if success { 100.0 } else { 0.0 },
                 mod_done: 0,
                 mod_total: 0,
                 module_name: String::new(),
                 done: 0,
                 total: 0,
-                status: if *success { "done" } else { "error" }.to_string(),
+                status: if success { "done" } else { "error" }.to_string(),
                 from_memory: false,
             });
         }
@@ -501,8 +732,8 @@ pub async fn run_config_check(state: &Arc<AppState>, emitter: &Arc<dyn crate::co
         .data
         .read()
         .pp_results
-        .keys()
-        .filter(|p| !std::path::Path::new(p).exists())
+        .iter()
+        .filter(|p| !std::path::Path::new(p.as_str()).exists())
         .cloned()
         .collect();
 
@@ -536,5 +767,49 @@ pub async fn schedule_config_checks(state: Arc<AppState>, emitter: Arc<dyn crate
         };
         tokio::time::sleep(tokio::time::Duration::from_secs(secs_until)).await;
         run_config_check(&state, &emitter).await;
+    }
+}
+
+/// 启动 Mouflon Keys 自动同步调度器：启动时立即同步一次，之后每小时同步一次。
+/// 若 Settings 中未配置 mouflon_sync_url，则静默跳过。
+///
+/// Start the Mouflon Keys auto-sync scheduler: sync once on startup, then every hour.
+/// Silently skips if mouflon_sync_url is not configured in Settings.
+pub async fn schedule_mouflon_sync(
+    state: Arc<AppState>,
+    emitter: Arc<dyn crate::core::emitter::Emitter>,
+    mut notify_rx: tokio::sync::mpsc::Receiver<()>,
+) {
+    use crate::core::emitter::EmitterExt;
+    const INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(3600);
+
+    loop {
+        let settings = state.get_settings();
+        if let Some(url) = settings.mouflon_sync_url.as_deref().filter(|u| !u.is_empty()) {
+            let token = settings.mouflon_sync_token.as_deref();
+            match state.sync_mouflon_keys_from_worker(url, token).await {
+                Ok(true) => {
+                    tracing::info!("Mouflon keys synced from {}", url);
+                    emitter.emit(
+                        "mouflon-keys-updated",
+                        &state.get_mouflon_keys_store(),
+                    );
+                }
+                Ok(false) => {
+                    tracing::debug!("Mouflon keys up-to-date, skipped");
+                }
+                Err(e) => {
+                    tracing::warn!("Mouflon keys sync failed: {}", e);
+                }
+            }
+        }
+        // 等待 1 小时，或收到立即同步通知
+        // Wait 1 hour, or until an immediate sync notification arrives
+        tokio::select! {
+            _ = tokio::time::sleep(INTERVAL) => {}
+            _ = notify_rx.recv() => {
+                tracing::info!("Mouflon sync: settings changed, triggering immediate sync");
+            }
+        }
     }
 }

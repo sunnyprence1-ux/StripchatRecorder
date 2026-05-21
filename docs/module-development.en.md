@@ -1,6 +1,6 @@
 # Post-processing Module Development Guide
 
-> 🌐 [中文](module-development.md)
+[简体中文](module-development.md) | [English](module-development.en.md)
 
 This document describes how to write custom post-processing modules for StripchatRecorder.
 
@@ -12,14 +12,14 @@ This document describes how to write custom post-processing modules for Stripcha
 2. [Module Protocol](#module-protocol)
 3. [Metadata Descriptor](#metadata-descriptor)
 4. [Parameter Types](#parameter-types)
-5. [Pipeline Mechanics](#pipeline-mechanics)
-6. [Progress Reporting](#progress-reporting)
-7. [pp_utils Library](#pp_utils-library)
-8. [Full Example](#full-example)
-9. [Deploying a Module](#deploying-a-module)
-10. [Notes](#notes)
-
----
+5. [Internationalization (i18n)](#internationalization-i18n)
+6. [Pipeline Mechanics](#pipeline-mechanics)
+7. [Progress Reporting](#progress-reporting)
+8. [pp_utils Library](#pp_utils-library)
+9. [Full Example](#full-example)
+10. [Deploying a Module](#deploying-a-module)
+11. [Built-in Modules](#built-in-modules)
+12. [Notes](#notes)
 
 ## Overview
 
@@ -39,29 +39,30 @@ PP_INPUT=<path>  PP_PARAM_<KEY>=<value> ...  ./<module_binary>
 
 A module must support two invocation modes:
 
-| Mode | Command | Description |
-|------|---------|-------------|
+| Mode     | Command                 | Description                                        |
+| -------- | ----------------------- | -------------------------------------------------- |
 | Describe | `./<module> --describe` | Output module metadata JSON, perform no processing |
-| Execute | `./<module>` | Read env vars and execute processing logic |
+| Execute  | `./<module>`            | Read env vars and execute processing logic         |
 
 ### Environment Variables
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `PP_INPUT` | Yes | Absolute path to the input video file |
-| `PP_PARAM_<KEY>` | No | Module parameter; `<KEY>` is the uppercased parameter key |
-| `PP_EXE_DIR` | No | Directory containing the module binary, useful for temp files |
+| Variable         | Required | Description                                                   |
+| ---------------- | -------- | ------------------------------------------------------------- |
+| `PP_INPUT`       | Yes      | Absolute path to the input video file                         |
+| `PP_PARAM_<KEY>` | No       | Module parameter; `<KEY>` is the uppercased parameter key     |
+| `PP_EXE_DIR`     | No       | Directory containing the module binary, useful for temp files |
 
 ### Stdout Protocol
 
 The module communicates with the host by writing lines with specific prefixes to stdout:
 
-| Output line | Description |
-|-------------|-------------|
-| `OUTPUT:<path>` | **Must be emitted once.** Passes `<path>` as input to the next module. If the module deletes the file (e.g. `filter_short`), omit this line and subsequent modules will be skipped. |
-| `PROGRESS:<done>/<total>` | Progress report; both values are integers, `total` is always `10000` (i.e. `done=5000` means 50%). |
-| `STATUS:<text>` | Optional status text (e.g. upload speed), shown next to the progress bar in the UI. |
-| `SKIP:<reason>` | Optional. Notifies the host that processing was skipped (e.g. output already exists). Still requires an `OUTPUT:` line. |
+| Output line               | Description                                                                                                                                                                         |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `OUTPUT:<path>`           | **Must be emitted once.** Passes `<path>` as input to the next module. If the module deletes the file (e.g. `filter_short`), omit this line and subsequent modules will be skipped. |
+| `DELETE_INPUT`            | Requests the host to delete the `PP_INPUT` file. The module must **not** emit `OUTPUT:` after this line; the pipeline will be aborted.                                              |
+| `PROGRESS:<done>/<total>` | Progress report; both values are integers, `total` is always `10000` (i.e. `done=5000` means 50%).                                                                                  |
+| `STATUS:<text>`           | Optional status text (e.g. upload speed), shown next to the progress bar in the UI.                                                                                                 |
+| `SKIP:<reason>`           | Optional. Notifies the host that processing was skipped (e.g. output already exists). Still requires an `OUTPUT:` line.                                                             |
 
 Lines not starting with one of the above prefixes are ignored by the host.
 
@@ -71,10 +72,10 @@ All diagnostic messages, warnings, and errors should be written to stderr. The h
 
 ### Exit Code
 
-| Exit code | Meaning |
-|-----------|---------|
-| `0` | Success |
-| Non-zero | Failure; pipeline is aborted, subsequent modules are not executed |
+| Exit code | Meaning                                                           |
+| --------- | ----------------------------------------------------------------- |
+| `0`       | Success                                                           |
+| Non-zero  | Failure; pipeline is aborted, subsequent modules are not executed |
 
 ---
 
@@ -86,28 +87,29 @@ When invoked with `--describe`, the module must print a JSON object to stdout an
 
 ```jsonc
 {
-  "id": "my_module",          // Unique identifier, lowercase letters, digits, underscores only
-  "name": "My Module",        // Display name shown in the UI
-  "description": "Does X",    // Short description shown in the UI
-  "params": [                 // Parameter list, may be empty array
-    {
-      "key": "param_key",     // Parameter key, maps to env var PP_PARAM_PARAM_KEY
-      "label": "Param Label", // Label shown in the UI
-      "type": "string",       // Parameter type, see below
-      "default": ""           // Default value
-    }
-  ]
+	"id": "my_module", // Unique identifier, lowercase letters, digits, underscores only
+	"name": "My Module", // Display name shown in the UI
+	"description": "Does X", // Short description shown in the UI
+	"params": [
+		// Parameter list, may be empty array
+		{
+			"key": "param_key", // Parameter key, maps to env var PP_PARAM_PARAM_KEY
+			"label": "Param Label", // Label shown in the UI
+			"type": "string", // Parameter type, see below
+			"default": "", // Default value
+		},
+	],
 }
 ```
 
 ### Field Reference
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `id` | string | Yes | Unique module ID, must not conflict within the same instance |
-| `name` | string | Yes | Display name in the UI |
-| `description` | string | Yes | Description in the UI |
-| `params` | array | Yes | Parameter definitions; pass empty array if none |
+| Field         | Type   | Required | Description                                                  |
+| ------------- | ------ | -------- | ------------------------------------------------------------ |
+| `id`          | string | Yes      | Unique module ID, must not conflict within the same instance |
+| `name`        | string | Yes      | Display name in the UI                                       |
+| `description` | string | Yes      | Description in the UI                                        |
+| `params`      | array  | Yes      | Parameter definitions; pass empty array if none              |
 
 ---
 
@@ -115,24 +117,70 @@ When invoked with `--describe`, the module must print a JSON object to stdout an
 
 The `type` field of each param object determines how the UI renders it and the format of the env var value.
 
-| Type | UI Control | Env var value format |
-|------|-----------|----------------------|
-| `string` | Text input | Any string |
-| `number` | Number input | Decimal integer or float string |
-| `boolean` | Toggle switch | `"true"` or `"false"` |
-| `select` | Dropdown select | One of the option value strings |
+| Type      | UI Control      | Env var value format            |
+| --------- | --------------- | ------------------------------- |
+| `string`  | Text input      | Any string                      |
+| `number`  | Number input    | Decimal integer or float string |
+| `boolean` | Toggle switch   | `"true"` or `"false"`           |
+| `select`  | Dropdown select | One of the option value strings |
 
 `select` type requires an additional `options` field:
 
 ```jsonc
 {
-  "key": "format",
-  "label": "Output Format",
-  "type": "select",
-  "default": "webp",
-  "options": ["webp", "jpg", "png"]
+	"key": "format",
+	"label": "Output Format",
+	"type": "select",
+	"default": "webp",
+	"options": ["webp", "jpg", "png"],
 }
 ```
+
+---
+
+## Internationalization (i18n)
+
+Modules can declare an optional `i18n` field in their DESCRIBE JSON to provide translations for `name`, `description`, and parameter `label` values. The host automatically selects the translation matching the user's current UI language, falling back to the original field values when no translation is found.
+
+### JSON Schema
+
+```jsonc
+{
+	"id": "my_module",
+	"name": "我的模块", // default language (Chinese)
+	"description": "模块功能描述",
+	"params": [
+		{
+			"key": "dest_dir",
+			"label": "目标目录路径",
+			"type": "string",
+			"default": ""
+		}
+	],
+	"i18n": {
+		"en-US": {
+			"name": "My Module",
+			"description": "Module description",
+			"params": {
+				"dest_dir": { "label": "Destination Directory" }
+			}
+		}
+		// additional locales can be added, e.g. "ja-JP": { ... }
+	}
+}
+```
+
+### Field Reference
+
+Keys in the `i18n` object are BCP 47 language tags (e.g. `"en-US"`, `"ja-JP"`). Each value is a translation object:
+
+| Field         | Type   | Required | Description                                                                                    |
+| ------------- | ------ | -------- | ---------------------------------------------------------------------------------------------- |
+| `name`        | string | No       | Module name in this locale; falls back to top-level `name` if omitted                         |
+| `description` | string | No       | Module description in this locale; falls back to top-level `description` if omitted            |
+| `params`      | object | No       | Keys are parameter `key` values, values are `{ "label": "..." }`; falls back to original label |
+
+All translation fields are optional. Any omitted field automatically falls back to its original value, so partial translations are fully supported.
 
 ---
 
@@ -257,10 +305,39 @@ let cover: Option<PathBuf> = find_cover(Path::new("/recordings/alice_20240101_12
 // Returns e.g. /recordings/alice_20240101_120000.webp if it exists
 ```
 
+### Image and Video Metadata
+
+```rust
+use pp_utils::{image_dimensions, video_meta};
+use std::path::Path;
+
+// Get image width and height via ffprobe
+let dims: Option<(u32, u32)> = image_dimensions(Path::new("/recordings/cover.webp"));
+// Returns Some((1280, 720)) or None
+
+// Get video duration, width, and height in one call
+let meta: Option<(f64, i32, i32)> = video_meta(Path::new("/recordings/alice_20240101_120000.ts"));
+// Returns Some((duration_secs, width, height)) or None
+```
+
+### Temporary Directory
+
+Returns a writable `tmp/` subdirectory under `PP_EXE_DIR` (or next to the module binary if `PP_EXE_DIR` is not set). The directory is created automatically.
+
+```rust
+use pp_utils::tmp_dir;
+
+let tmp: PathBuf = tmp_dir();
+// e.g. /app/stripchat-recorder/modules/tmp/
+```
+
 ### Progress Reporting
 
 ```rust
-use pp_utils::{emit_progress, emit_progress_step};
+use pp_utils::{emit_progress, emit_progress_step, PROGRESS_SCALE};
+
+// PROGRESS_SCALE = 10_000, can be used to manually construct progress output
+println!("PROGRESS:0/{}", PROGRESS_SCALE);
 
 // Report by done/total (auto-scaled to 10000)
 emit_progress(0, 100);   // PROGRESS:0/10000
@@ -286,7 +363,7 @@ A complete Rust module that copies the video file to a specified directory.
 [package]
 name = "copy_to_dir"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [[bin]]
 name = "copy_to_dir"
@@ -314,7 +391,16 @@ const DESCRIBE: &str = r#"{
       "type": "string",
       "default": ""
     }
-  ]
+  ],
+  "i18n": {
+    "zh-CN": {
+      "name": "复制到目录",
+      "description": "将录制文件复制到指定目录",
+      "params": {
+        "dest_dir": { "label": "目标目录路径" }
+      }
+    }
+  }
 }"#;
 
 fn run() -> Result<(), String> {
@@ -382,7 +468,60 @@ chmod +x ./data/modules/copy_to_dir
 
 After copying, the new module will appear in the Web UI under Settings → Post-processing Pipeline.
 
-> **Note:** On every container start, files from `modules_default` that do not yet exist in `modules` are copied in. Existing files are never overwritten, so custom modules and manually replaced built-in modules are preserved across restarts.
+> **Note:** On every container start, files from `modules.default` that do not yet exist in `modules` are copied in. Existing files are never overwritten, so custom modules and manually replaced built-in modules are preserved across restarts.
+
+---
+
+## Built-in Modules
+
+The project ships four modules under `modules/`, which are automatically copied to `modules.default/` on container start.
+
+| Module ID         | Description                                                                              |
+| ----------------- | ---------------------------------------------------------------------------------------- |
+| `filter_short`    | Requests the host to delete videos shorter than a threshold; supports `dry_run` preview mode |
+| `contact_sheet`   | Extracts frames at a set interval and tiles them into a timestamped preview image        |
+| `notify_discord`  | Sends recording info and cover image to Discord via Webhook; supports HTTP/SOCKS5 proxy  |
+| `notify_telegram` | Sends recording info, cover image, and video to Telegram via MTProto; auto-splits files over 2 GB |
+
+### filter_short parameters
+
+| Parameter      | Type    | Default | Description                                    |
+| -------------- | ------- | ------- | ---------------------------------------------- |
+| `min_duration` | number  | `60`    | Minimum duration in seconds; shorter files are deleted |
+| `dry_run`      | boolean | `false` | Preview only, no actual deletion               |
+
+### contact_sheet parameters
+
+| Parameter    | Type   | Default | Description                                      |
+| ------------ | ------ | ------- | ------------------------------------------------ |
+| `interval`   | number | `30`    | Frame extraction interval (seconds)              |
+| `thumb_width`| number | `320`   | Thumbnail width (px)                             |
+| `format`     | select | `webp`  | Image format: `webp`, `jpg`, or `png`            |
+| `quality`    | number | `100`   | Image quality (1–100, applies to jpg/webp)       |
+| `cols`       | number | `0`     | Number of columns; `0` = auto                   |
+| `rows`       | number | `0`     | Number of rows; `0` = auto                      |
+| `fontfile`   | string | `""`    | Font file path; leave empty for auto-detection  |
+| `fontsize`   | number | `18`    | Timestamp font size                              |
+
+### notify_discord parameters
+
+| Parameter     | Type   | Default        | Description                                      |
+| ------------- | ------ | -------------- | ------------------------------------------------ |
+| `webhook_url` | string | `""`           | Discord Webhook URL (required)                   |
+| `proxy`       | string | `""`           | Proxy address; supports `http://` and `socks5://`|
+| `username`    | string | `Recorder Bot` | Bot display name                                 |
+
+### notify_telegram parameters
+
+| Parameter    | Type    | Default | Description                                                    |
+| ------------ | ------- | ------- | -------------------------------------------------------------- |
+| `api_id`     | string  | `""`    | Telegram API ID from my.telegram.org (required)                |
+| `api_hash`   | string  | `""`    | Telegram API Hash (required)                                   |
+| `bot_token`  | string  | `""`    | Bot Token from @BotFather (required)                           |
+| `chat_id`    | string  | `""`    | Chat ID; supergroup format: `-100xxxxxxxxxx` (required)        |
+| `username`   | string  | `""`    | Group username, required for supergroups (without `@`)         |
+| `proxy`      | string  | `""`    | Proxy address; supports `http://` and `socks5://`              |
+| `send_video` | boolean | `true`  | Also send the video file                                       |
 
 ---
 

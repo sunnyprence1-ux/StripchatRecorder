@@ -24,18 +24,22 @@
 	import { useNotify } from "@/composables/useNotify";
 	import { toast as sonnerToast } from "vue-sonner";
 	import { useStreamersStore } from "@/stores/streamers";
+	import { useI18n } from "vue-i18n";
 
 	const router = useRouter();
 	const route = useRoute();
 	const { toast, confirm } = useNotify();
 	const streamersStore = useStreamersStore();
+	const { t, locale } = useI18n();
 
 	/** 侧边栏导航项配置 / Sidebar navigation items configuration */
 	const navItems = [
-		{ to: "/", label: "主播列表" },
-		{ to: "/recordings", label: "录制文件" },
-		{ to: "/postprocess", label: "后处理" },
-		{ to: "/settings", label: "设置" },
+		{ to: "/", labelKey: "nav.streamers" },
+		{ to: "/recordings", labelKey: "nav.recordings" },
+		{ to: "/postprocess", labelKey: "nav.postprocess" },
+		{ to: "/relay", labelKey: "nav.relay" },
+		{ to: "/finder", labelKey: "nav.finder" },
+		{ to: "/settings", labelKey: "nav.settings" },
 	];
 
 	/**
@@ -76,30 +80,34 @@
 		};
 
 		if (w.missing_streamers.length > 0) {
-			await confirm({
-				title: "发现不存在的主播",
-				message: `以下主播账号不存在，将从列表中删除\n\n${w.missing_streamers.join("\n")}`,
-				confirmText: "已知晓并删除",
+			const ok = await confirm({
+				title: t("notify.missingStreamers.title"),
+				message: t("notify.missingStreamers.message", { list: w.missing_streamers.join("\n") }),
+				confirmText: t("notify.missingStreamers.confirm"),
+				cancelText: t("notify.missingStreamers.ignore"),
 				danger: true,
-				hideCancelButton: true,
 			});
-			for (const username of w.missing_streamers) {
-				await streamersStore.removeStreamer(username).catch(() => {});
+			if (ok) {
+				for (const username of w.missing_streamers) {
+					await streamersStore.removeStreamer(username).catch(() => {});
+				}
+				toast(t("notify.missingStreamers.done", { count: w.missing_streamers.length }), "success");
 			}
-			toast(`已删除 ${w.missing_streamers.length} 个不存在的主播`, "success");
 		}
 
 		if (w.missing_pp_results.length > 0) {
-			await confirm({
-				title: "发现已删除文件的后处理记录",
-				message: `以下文件已不存在，但仍有后处理记录，将进行清理\n\n${w.missing_pp_results.map((p) => p.split(/[\\/]/).pop()).join("\n")}`,
-				confirmText: "已知晓并清理",
-				hideCancelButton: true,
+			const ok = await confirm({
+				title: t("notify.missingPpResults.title"),
+				message: t("notify.missingPpResults.message", { list: w.missing_pp_results.map((p) => p.split(/[\\/]/).pop()).join("\n") }),
+				confirmText: t("notify.missingPpResults.confirm"),
+				cancelText: t("notify.missingPpResults.ignore"),
 			});
-			await call("remove_missing_pp_results", {
-				paths: w.missing_pp_results,
-			}).catch(() => {});
-			toast(`已清理 ${w.missing_pp_results.length} 条后处理记录`, "success");
+			if (ok) {
+				await call("remove_missing_pp_results", {
+					paths: w.missing_pp_results,
+				}).catch(() => {});
+				toast(t("notify.missingPpResults.done", { count: w.missing_pp_results.length }), "success");
+			}
 		}
 	}
 
@@ -107,6 +115,15 @@
 		// 初始化主题并监听系统主题变化 / Initialize theme and listen for system theme changes
 		applyTheme(mq.matches);
 		mq.addEventListener("change", onThemeChange);
+
+		// 从后端同步语言设置 / Sync language from backend settings
+		try {
+			const settings = await call<{ language?: string }>("get_settings");
+			if (settings?.language) {
+				locale.value = settings.language as "zh-CN" | "en-US";
+				localStorage.setItem("locale", settings.language);
+			}
+		} catch {}
 
 		// 监听 ffmpeg 缺失警告 / Listen for ffmpeg missing warning
 		unlistenFfmpeg = await on("ffmpeg-missing", (payload) => {
@@ -120,14 +137,14 @@
 			const COUNTDOWN = 3;
 			let remaining = COUNTDOWN;
 			const id = "reconnect-reload";
-			sonnerToast.info(`已重新连接到服务器，${remaining} 秒后刷新页面…`, {
+			sonnerToast.info(t("notify.reconnected", { n: remaining }), {
 				id,
 				duration: (COUNTDOWN + 1) * 1000,
 			});
 			const timer = setInterval(() => {
 				remaining--;
 				if (remaining > 0) {
-					sonnerToast.info(`已重新连接到服务器，${remaining} 秒后刷新页面…`, {
+					sonnerToast.info(t("notify.reconnected", { n: remaining }), {
 						id,
 						duration: (remaining + 1) * 1000,
 					});
@@ -140,7 +157,7 @@
 
 		// 监听 SSE 断开连接 / Listen for SSE disconnect
 		unlistenDisconnect = onSseDisconnect(() => {
-			toast("与服务器的连接已断开，正在尝试重连…", "warning");
+			toast(t("notify.disconnected"), "warning");
 		});
 
 		// 监听启动警告 / Listen for startup warnings
@@ -183,7 +200,7 @@
 					"
 					@click="router.push(item.to)"
 				>
-					{{ item.label }}
+					{{ t(item.labelKey) }}
 				</Button>
 			</nav>
 		</aside>

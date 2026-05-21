@@ -1,6 +1,6 @@
 # 后处理模块开发文档
 
-> 🌐 [English](module-development.en.md)
+[简体中文](module-development.md) | [English](module-development.en.md)
 
 本文档描述如何为 StripchatRecorder 编写自定义后处理模块。
 
@@ -12,12 +12,14 @@
 2. [模块协议](#模块协议)
 3. [元数据描述](#元数据描述)
 4. [参数类型](#参数类型)
-5. [流水线机制](#流水线机制)
-6. [进度上报](#进度上报)
-7. [pp_utils 工具库](#pp_utils-工具库)
-8. [完整示例](#完整示例)
-9. [部署模块](#部署模块)
-10. [注意事项](#注意事项)
+5. [多语言支持](#多语言支持)
+6. [流水线机制](#流水线机制)
+7. [进度上报](#进度上报)
+8. [pp_utils 工具库](#pp_utils-工具库)
+9. [完整示例](#完整示例)
+10. [部署模块](#部署模块)
+11. [内置模块](#内置模块)
+12. [注意事项](#注意事项)
 
 ---
 
@@ -39,29 +41,30 @@ PP_INPUT=<path>  PP_PARAM_<KEY>=<value> ...  ./<module_binary>
 
 模块必须支持两种调用模式：
 
-| 模式 | 命令 | 说明 |
-|------|------|------|
+| 模式     | 命令                    | 说明                                |
+| -------- | ----------------------- | ----------------------------------- |
 | 描述模式 | `./<module> --describe` | 输出模块元数据 JSON，不执行任何处理 |
-| 执行模式 | `./<module>` | 读取环境变量并执行处理逻辑 |
+| 执行模式 | `./<module>`            | 读取环境变量并执行处理逻辑          |
 
 ### 环境变量
 
-| 变量 | 必填 | 说明 |
-|------|------|------|
-| `PP_INPUT` | 是 | 输入视频文件的绝对路径 |
-| `PP_PARAM_<KEY>` | 否 | 模块参数，`<KEY>` 为参数键名的大写形式 |
-| `PP_EXE_DIR` | 否 | 模块二进制文件所在目录，可用于存放临时文件 |
+| 变量             | 必填 | 说明                                       |
+| ---------------- | ---- | ------------------------------------------ |
+| `PP_INPUT`       | 是   | 输入视频文件的绝对路径                     |
+| `PP_PARAM_<KEY>` | 否   | 模块参数，`<KEY>` 为参数键名的大写形式     |
+| `PP_EXE_DIR`     | 否   | 模块二进制文件所在目录，可用于存放临时文件 |
 
 ### 标准输出协议
 
 模块通过向标准输出写入特定前缀的行与主程序通信：
 
-| 输出行 | 说明 |
-|--------|------|
-| `OUTPUT:<path>` | **必须输出一次**。将 `<path>` 作为下一个模块的输入传递。若模块删除了文件（如 `filter_short`），则不输出此行，流水线后续模块将被跳过。 |
-| `PROGRESS:<done>/<total>` | 进度上报，`done` 和 `total` 均为整数，`total` 固定为 `10000`（即 `done=5000` 表示 50%）。 |
-| `STATUS:<text>` | 可选的状态文字（如上传速度），显示在 UI 的进度条旁。 |
-| `SKIP:<reason>` | 可选。通知主程序本模块已跳过处理（如输出文件已存在），仍需输出 `OUTPUT:` 行。 |
+| 输出行                    | 说明                                                                                                                                  |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `OUTPUT:<path>`           | **必须输出一次**。将 `<path>` 作为下一个模块的输入传递。若模块删除了文件（如 `filter_short`），则不输出此行，流水线后续模块将被跳过。 |
+| `DELETE_INPUT`            | 请求主程序删除 `PP_INPUT` 文件。输出此行后**不得**再输出 `OUTPUT:` 行，流水线将被中止。                                               |
+| `PROGRESS:<done>/<total>` | 进度上报，`done` 和 `total` 均为整数，`total` 固定为 `10000`（即 `done=5000` 表示 50%）。                                             |
+| `STATUS:<text>`           | 可选的状态文字（如上传速度），显示在 UI 的进度条旁。                                                                                  |
+| `SKIP:<reason>`           | 可选。通知主程序本模块已跳过处理（如输出文件已存在），仍需输出 `OUTPUT:` 行。                                                         |
 
 非协议行（不以上述前缀开头的行）会被主程序忽略。
 
@@ -71,10 +74,10 @@ PP_INPUT=<path>  PP_PARAM_<KEY>=<value> ...  ./<module_binary>
 
 ### 退出码
 
-| 退出码 | 含义 |
-|--------|------|
-| `0` | 成功 |
-| 非零 | 失败，流水线中止，后续模块不再执行 |
+| 退出码 | 含义                               |
+| ------ | ---------------------------------- |
+| `0`    | 成功                               |
+| 非零   | 失败，流水线中止，后续模块不再执行 |
 
 ---
 
@@ -86,28 +89,29 @@ PP_INPUT=<path>  PP_PARAM_<KEY>=<value> ...  ./<module_binary>
 
 ```jsonc
 {
-  "id": "my_module",           // 模块唯一标识符，仅含小写字母、数字和下划线
-  "name": "我的模块",           // UI 中显示的名称
-  "description": "模块功能描述", // UI 中显示的简短描述
-  "params": [                  // 参数列表，可为空数组
-    {
-      "key": "param_key",      // 参数键名，对应环境变量 PP_PARAM_PARAM_KEY
-      "label": "参数标签",      // UI 中显示的标签
-      "type": "string",        // 参数类型，见下文
-      "default": ""            // 默认值
-    }
-  ]
+	"id": "my_module", // 模块唯一标识符，仅含小写字母、数字和下划线
+	"name": "我的模块", // UI 中显示的名称
+	"description": "模块功能描述", // UI 中显示的简短描述
+	"params": [
+		// 参数列表，可为空数组
+		{
+			"key": "param_key", // 参数键名，对应环境变量 PP_PARAM_PARAM_KEY
+			"label": "参数标签", // UI 中显示的标签
+			"type": "string", // 参数类型，见下文
+			"default": "", // 默认值
+		},
+	],
 }
 ```
 
 ### 字段说明
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `id` | string | 是 | 模块唯一 ID，在同一实例中不可重复 |
-| `name` | string | 是 | UI 显示名称 |
-| `description` | string | 是 | UI 显示描述 |
-| `params` | array | 是 | 参数定义列表，无参数时传空数组 |
+| 字段          | 类型   | 必填 | 说明                              |
+| ------------- | ------ | ---- | --------------------------------- |
+| `id`          | string | 是   | 模块唯一 ID，在同一实例中不可重复 |
+| `name`        | string | 是   | UI 显示名称                       |
+| `description` | string | 是   | UI 显示描述                       |
+| `params`      | array  | 是   | 参数定义列表，无参数时传空数组    |
 
 ---
 
@@ -115,24 +119,70 @@ PP_INPUT=<path>  PP_PARAM_<KEY>=<value> ...  ./<module_binary>
 
 `params` 数组中每个对象的 `type` 字段决定 UI 渲染方式和环境变量的值格式。
 
-| 类型 | UI 控件 | 环境变量值格式 |
-|------|---------|--------------|
-| `string` | 文本输入框 | 任意字符串 |
-| `number` | 数字输入框 | 十进制整数或浮点数字符串 |
-| `boolean` | 开关 | `"true"` 或 `"false"` |
-| `select` | 下拉选择框 | 选项值字符串 |
+| 类型      | UI 控件    | 环境变量值格式           |
+| --------- | ---------- | ------------------------ |
+| `string`  | 文本输入框 | 任意字符串               |
+| `number`  | 数字输入框 | 十进制整数或浮点数字符串 |
+| `boolean` | 开关       | `"true"` 或 `"false"`    |
+| `select`  | 下拉选择框 | 选项值字符串             |
 
 `select` 类型需额外提供 `options` 字段：
 
 ```jsonc
 {
-  "key": "format",
-  "label": "输出格式",
-  "type": "select",
-  "default": "webp",
-  "options": ["webp", "jpg", "png"]
+	"key": "format",
+	"label": "输出格式",
+	"type": "select",
+	"default": "webp",
+	"options": ["webp", "jpg", "png"],
 }
 ```
+
+---
+
+## 多语言支持
+
+模块可以在 DESCRIBE JSON 中声明可选的 `i18n` 字段，为 `name`、`description` 和参数 `label` 提供多语言翻译。主程序会根据用户当前的界面语言自动选择对应翻译，找不到时回退到原始字段值。
+
+### JSON 结构
+
+```jsonc
+{
+	"id": "my_module",
+	"name": "我的模块", // 默认语言（中文）
+	"description": "模块功能描述",
+	"params": [
+		{
+			"key": "dest_dir",
+			"label": "目标目录路径",
+			"type": "string",
+			"default": ""
+		}
+	],
+	"i18n": {
+		"en-US": {
+			"name": "My Module",
+			"description": "Module description",
+			"params": {
+				"dest_dir": { "label": "Destination Directory" }
+			}
+		}
+		// 可继续添加其他语言，如 "ja-JP": { ... }
+	}
+}
+```
+
+### 字段说明
+
+`i18n` 对象的键为 BCP 47 语言标签（如 `"en-US"`、`"ja-JP"`），值为该语言的翻译对象：
+
+| 字段          | 类型   | 必填 | 说明                                                   |
+| ------------- | ------ | ---- | ------------------------------------------------------ |
+| `name`        | string | 否   | 该语言下的模块名称，省略时使用顶层 `name`              |
+| `description` | string | 否   | 该语言下的模块描述，省略时使用顶层 `description`       |
+| `params`      | object | 否   | 键为参数 `key`，值为 `{ "label": "..." }`，省略时使用参数原始 `label` |
+
+所有翻译字段均为可选，未提供的字段自动回退到原始值，因此可以只翻译部分字段。
 
 ---
 
@@ -202,10 +252,10 @@ pp_utils = { path = "../pp_utils" }
 ```rust
 use pp_utils::{param, param_u32, param_f64, param_bool};
 
-let url: String  = param("webhook_url", "");       // 字符串参数
-let interval: u32 = param_u32("interval", 30);     // u32 参数
+let url: String   = param("webhook_url", "");        // 字符串参数
+let interval: u32 = param_u32("interval", 30);       // u32 参数
 let min_dur: f64  = param_f64("min_duration", 60.0); // f64 参数
-let dry_run: bool = param_bool("dry_run", false);  // 布尔参数（"true"/"1"/"yes" 均视为 true）
+let dry_run: bool = param_bool("dry_run", false);    // 布尔参数（"true"/"1"/"yes" 均视为 true）
 ```
 
 参数键名不区分大小写，`param("interval", ...)` 对应环境变量 `PP_PARAM_INTERVAL`。
@@ -257,10 +307,39 @@ let cover: Option<PathBuf> = find_cover(Path::new("/recordings/alice_20240101_12
 // 若存在则返回 /recordings/alice_20240101_120000.webp 等
 ```
 
+### 图片与视频元数据
+
+```rust
+use pp_utils::{image_dimensions, video_meta};
+use std::path::Path;
+
+// 通过 ffprobe 获取图片宽高
+let dims: Option<(u32, u32)> = image_dimensions(Path::new("/recordings/cover.webp"));
+// 返回 Some((1280, 720)) 或 None
+
+// 一次调用获取视频时长、宽度和高度
+let meta: Option<(f64, i32, i32)> = video_meta(Path::new("/recordings/alice_20240101_120000.ts"));
+// 返回 Some((时长秒数, 宽度, 高度)) 或 None
+```
+
+### 临时目录
+
+返回 `PP_EXE_DIR` 下的 `tmp/` 子目录（若未设置 `PP_EXE_DIR` 则使用模块二进制文件所在目录）。目录会自动创建。
+
+```rust
+use pp_utils::tmp_dir;
+
+let tmp: PathBuf = tmp_dir();
+// 例如 /app/stripchat-recorder/modules/tmp/
+```
+
 ### 进度上报
 
 ```rust
-use pp_utils::{emit_progress, emit_progress_step};
+use pp_utils::{emit_progress, emit_progress_step, PROGRESS_SCALE};
+
+// PROGRESS_SCALE = 10_000，可用于手动构造进度输出
+println!("PROGRESS:0/{}", PROGRESS_SCALE);
 
 // 按已完成量/总量上报（自动缩放到 10000）
 emit_progress(0, 100);   // PROGRESS:0/10000
@@ -286,7 +365,7 @@ emit_progress_step(3, 3); // PROGRESS:10000/10000
 [package]
 name = "copy_to_dir"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [[bin]]
 name = "copy_to_dir"
@@ -314,7 +393,16 @@ const DESCRIBE: &str = r#"{
       "type": "string",
       "default": ""
     }
-  ]
+  ],
+  "i18n": {
+    "en-US": {
+      "name": "Copy to Directory",
+      "description": "Copies the recording to a specified directory",
+      "params": {
+        "dest_dir": { "label": "Destination Directory" }
+      }
+    }
+  }
 }"#;
 
 fn run() -> Result<(), String> {
@@ -364,7 +452,7 @@ fn main() {
 ### 构建
 
 ```bash
-cargo build --release
+cargo build --release --bins
 # 产物位于 target/release/copy_to_dir
 ```
 
@@ -382,7 +470,60 @@ chmod +x ./data/modules/copy_to_dir
 
 完成后在 Web UI 的「设置 → 后处理流水线」中即可看到并启用新模块。
 
-> **注意：** 每次容器启动时，`modules_default` 中在 `modules` 里尚不存在的文件会被补充复制进来，已存在的文件不会被覆盖。因此自定义模块和手动替换的内置模块在重启后均会保留。
+> **注意：** 每次容器启动时，`modules.default` 中在 `modules` 里尚不存在的文件会被补充复制进来，已存在的文件不会被覆盖。因此自定义模块和手动替换的内置模块在重启后均会保留。
+
+---
+
+## 内置模块
+
+项目自带以下四个模块，位于 `modules/` 目录，容器启动时会自动复制到 `modules.default/`。
+
+| 模块 ID           | 说明                                                                 |
+| ----------------- | -------------------------------------------------------------------- |
+| `filter_short`    | 请求主程序删除时长低于阈值的视频，支持 `dry_run` 预览模式            |
+| `contact_sheet`   | 按指定间隔截帧，拼合成带时间戳水印的预览图，保存到视频同目录         |
+| `notify_discord`  | 将录制信息和封面图通过 Webhook 发送到 Discord，支持 HTTP/SOCKS5 代理 |
+| `notify_telegram` | 通过 MTProto 将录制信息、封面图和视频发送到 Telegram，支持超过 2GB 的大文件自动分割 |
+
+### filter_short 参数
+
+| 参数           | 类型    | 默认值 | 说明                         |
+| -------------- | ------- | ------ | ---------------------------- |
+| `min_duration` | number  | `60`   | 最短时长（秒），低于此值删除 |
+| `dry_run`      | boolean | `false`| 仅预览，不实际删除           |
+
+### contact_sheet 参数
+
+| 参数         | 类型   | 默认值  | 说明                                   |
+| ------------ | ------ | ------- | -------------------------------------- |
+| `interval`   | number | `30`    | 截帧间隔（秒）                         |
+| `thumb_width`| number | `320`   | 单帧宽度（px）                         |
+| `format`     | select | `webp`  | 图片格式：`webp`、`jpg`、`png`         |
+| `quality`    | number | `100`   | 图片质量（1-100，jpg/webp 有效）       |
+| `cols`       | number | `0`     | 列数，`0` 为自动                       |
+| `rows`       | number | `0`     | 行数，`0` 为自动                       |
+| `fontfile`   | string | `""`    | 字体文件路径，留空自动检测             |
+| `fontsize`   | number | `18`    | 时间戳字号                             |
+
+### notify_discord 参数
+
+| 参数          | 类型   | 默认值          | 说明                              |
+| ------------- | ------ | --------------- | --------------------------------- |
+| `webhook_url` | string | `""`            | Discord Webhook URL（必填）       |
+| `proxy`       | string | `""`            | 代理地址，支持 `http://`、`socks5://` |
+| `username`    | string | `Recorder Bot`  | Bot 显示名称                      |
+
+### notify_telegram 参数
+
+| 参数          | 类型    | 默认值  | 说明                                              |
+| ------------- | ------- | ------- | ------------------------------------------------- |
+| `api_id`      | string  | `""`    | Telegram API ID（从 my.telegram.org 获取，必填）  |
+| `api_hash`    | string  | `""`    | Telegram API Hash（必填）                         |
+| `bot_token`   | string  | `""`    | Bot Token（从 @BotFather 获取，必填）             |
+| `chat_id`     | string  | `""`    | Chat ID，超级群组格式为 `-100xxxxxxxxxx`（必填）  |
+| `username`    | string  | `""`    | 群组 Username，超级群组必填（不含 `@`）           |
+| `proxy`       | string  | `""`    | 代理地址，支持 `http://`、`socks5://`             |
+| `send_video`  | boolean | `true`  | 是否同时发送视频文件                              |
 
 ---
 
