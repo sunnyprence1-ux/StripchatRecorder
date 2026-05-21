@@ -4,9 +4,9 @@
 //! Provides commands for reading/saving app settings, directory picker, Mouflon key management,
 //! startup warning queries, and disk space queries.
 
+use crate::config::settings::{AppState, MouflonKeysStore, Settings};
 use crate::core::error::Result;
 use crate::streaming::monitor::StatusMonitor;
-use crate::config::settings::{AppState, MouflonKeysStore, Settings};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_dialog::DialogExt;
@@ -249,12 +249,9 @@ pub fn get_disk_space_inner(output_dir: &str) -> Result<DiskSpace> {
         let ret = unsafe { libc::statvfs(path_cstr.as_ptr(), stat.as_mut_ptr()) };
         if ret == 0 {
             let stat = unsafe { stat.assume_init() };
-            #[allow(clippy::unnecessary_cast)]
-            let block = stat.f_frsize as u64;
-            #[allow(clippy::unnecessary_cast)]
-            let total = stat.f_blocks as u64 * block;
-            #[allow(clippy::unnecessary_cast)]
-            let avail = stat.f_bavail as u64 * block;
+            let block = stat.f_frsize;
+            let total = stat.f_blocks * block;
+            let avail = stat.f_bavail * block;
             return Ok(DiskSpace {
                 total_bytes: total,
                 available_bytes: avail,
