@@ -391,12 +391,20 @@ pub fn run_postprocess_for_path_inner(
             && let Some(prev_outputs) = prev_meta.module_outputs {
             module_outputs.extend(prev_outputs);
         }
-        // 本次执行结果覆盖（优先级更高）：使用 NodeResult.output 字段（已从 OUTPUT: 行解析）
-        // Override with results from this run (higher priority): use NodeResult.output field
-        // (already parsed from the OUTPUT: protocol line, not from message)
+        // 本次执行结果覆盖（优先级更高）：仅写入输出路径与原始视频路径不同的模块。
+        // 输出路径与输入相同的模块（如 notify_*）只是把视频传递给下一个节点，
+        // 不产生额外附属文件，不应写入 meta；只有产生新文件的模块（如 contact_sheet）才写入。
+        //
+        // Override with results from this run (higher priority): only store module outputs
+        // whose path differs from the original video path.
+        // Modules that echo the video path as output (e.g. notify_*) are just passing it
+        // to the next node and produce no sidecar file — they should not be stored in meta.
+        // Only modules that produce a new file (e.g. contact_sheet) are stored.
         for r in &results {
             if r.success
-                && let Some(ref out_path) = r.output {
+                && let Some(ref out_path) = r.output
+                && out_path != video_path
+            {
                 module_outputs.insert(
                     r.module_id.clone(),
                     out_path.to_string_lossy().to_string(),

@@ -198,6 +198,7 @@ impl RecorderManager {
                 local.to_rfc3339()
             };
             let meta = crate::recording::meta::VideoMeta {
+                meta_version: crate::recording::meta::META_VERSION,
                 status: "recording".to_string(),
                 started_at,
                 size_bytes: 0,

@@ -856,6 +856,17 @@ pub async fn run_server(port: u16) {
         });
     }
 
+    // 启动 meta 版本检查轮询调度器（启动时立即执行一次，之后每 5 分钟一次）
+    // Start meta version-check polling scheduler (once on startup, then every 5 minutes)
+    {
+        let settings = app_state.get_settings();
+        let output_dir = std::path::PathBuf::from(&settings.output_dir);
+        let merge_format = settings.merge_format.clone();
+        tokio::spawn(async move {
+            crate::recording::meta::schedule_meta_version_check(output_dir, merge_format, 300).await;
+        });
+    }
+
     let server_state = ServerState {
         app_state,
         recorder,

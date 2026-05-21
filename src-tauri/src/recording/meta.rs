@@ -17,6 +17,15 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// 当前 meta 文件格式版本。
+/// 每次对 `VideoMeta` 结构做不向后兼容的变更时递增此值，
+/// 轮询扫描器会对版本不匹配的 meta 文件执行重建。
+///
+/// Current meta file format version.
+/// Increment this whenever a breaking change is made to `VideoMeta`;
+/// the periodic scanner will rebuild any meta file whose version doesn't match.
+pub const META_VERSION: u32 = 2;
+
 /// 从文件名 stem（格式：`{name}_{YYYYMMDD}_{HHmmss}`）中解析录制开始时间。
 /// Parse the recording start time from a filename stem (format: `{name}_{YYYYMMDD}_{HHmmss}`).
 pub fn parse_timestamp_from_stem(stem: &str) -> Option<String> {
@@ -61,6 +70,14 @@ pub struct PpModuleResult {
 /// - `"finish"`          — 全部完成
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoMeta {
+    /// meta 格式版本，用于检测结构变更后的重建需求。
+    /// 缺失时反序列化为 0，触发重建。
+    ///
+    /// Meta format version, used to detect when a rebuild is needed after structural changes.
+    /// Deserializes to 0 when absent, triggering a rebuild.
+    #[serde(default)]
+    pub meta_version: u32,
+
     /// 当前处理状态 / Current processing status
     pub status: String,
 
@@ -100,12 +117,17 @@ pub fn read_meta(video_path: &Path) -> Option<VideoMeta> {
 }
 
 /// 将元数据写入视频文件对应的 `.{stem}.json` 文件。
+/// 写入前自动将 `meta_version` 设置为当前版本常量。
+///
 /// Write metadata to the `.{stem}.json` file for a video file.
+/// Automatically sets `meta_version` to the current version constant before writing.
 pub fn write_meta(video_path: &Path, meta: &VideoMeta) {
     let Some(meta_path) = meta_path_for(video_path) else {
         return;
     };
-    match serde_json::to_string_pretty(meta) {
+    let mut meta = meta.clone();
+    meta.meta_version = META_VERSION;
+    match serde_json::to_string_pretty(&meta) {
         Ok(json) => {
             if let Err(e) = std::fs::write(&meta_path, json) {
                 tracing::warn!("Failed to write meta {:?}: {}", meta_path, e);
@@ -148,6 +170,7 @@ pub fn set_status(video_path: &Path, status: &str) {
                     .unwrap_or_default()
             });
             VideoMeta {
+                meta_version: META_VERSION,
                 status: status.to_string(),
                 started_at,
                 size_bytes,
@@ -185,6 +208,7 @@ pub fn set_pp_done(
                     .unwrap_or_default()
             });
             VideoMeta {
+                meta_version: META_VERSION,
                 status: status.to_string(),
                 started_at,
                 size_bytes,
@@ -212,6 +236,7 @@ pub fn ensure_meta(video_path: &Path, started_at: &str) {
     }
     let size_bytes = std::fs::metadata(video_path).map(|m| m.len()).unwrap_or(0);
     let meta = VideoMeta {
+        meta_version: META_VERSION,
         status: "merging_waiting".to_string(),
         started_at: started_at.to_string(),
         size_bytes,
@@ -229,6 +254,18 @@ pub fn startup_ensure_meta_files(
     output_dir: &Path,
     merge_format: &str,
 ) {
+    ensure_meta_files(output_dir, merge_format);
+}
+
+/// 扫描输出目录，为所有缺少或版本过旧的 meta 文件执行创建/重建，
+/// 并补全缺失的 `video_duration_secs`。
+/// 跳过仍处于活跃状态（录制中/合并中/后处理中）的 meta，避免干扰正在进行的任务。
+///
+/// Scan the output directory and create/rebuild meta files that are missing or have an
+/// outdated version, also filling in missing `video_duration_secs` via ffprobe.
+/// Skips meta files in active states (recording/merging/post-processing) to avoid
+/// interfering with ongoing tasks.
+pub fn ensure_meta_files(output_dir: &Path, merge_format: &str) {
     if !output_dir.exists() {
         return;
     }
@@ -242,7 +279,7 @@ pub fn startup_ensure_meta_files(
     );
     if count_created > 0 || count_updated > 0 {
         tracing::info!(
-            "Startup meta scan: created {} new, updated {} existing meta files",
+            "Meta scan: created {} new, rebuilt/updated {} existing meta files",
             count_created,
             count_updated
         );
@@ -275,9 +312,10 @@ fn scan_and_ensure_meta(
                 continue;
             }
 
-
             match read_meta(&path) {
                 None => {
+                    // meta 不存在：新建
+                    // Meta missing: create it
                     let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                     let started_at = parse_timestamp_from_stem(stem).unwrap_or_else(|| {
@@ -291,13 +329,9 @@ fn scan_and_ensure_meta(
                             .unwrap_or_default()
                     });
                     let video_duration_secs = crate::recording::recorder::get_video_duration(&path);
-                    // pp_results 中有路径说明执行过后处理，status 由 meta 确认；
-                    // 无论是否在 pp_results 中，缺失 meta 的视频一律标记为 finish（兜底）
-                    // If path is in pp_results, post-processing was run; status is confirmed by meta.
-                    // For videos missing meta, always mark as finish (fallback).
-                    let status = "finish"; // 执行过后处理或无后处理记录，均视为已完成
                     let meta = VideoMeta {
-                        status: status.to_string(),
+                        meta_version: META_VERSION,
+                        status: "finish".to_string(),
                         started_at,
                         size_bytes,
                         video_duration_secs,
@@ -308,18 +342,51 @@ fn scan_and_ensure_meta(
                     *count_created += 1;
                 }
                 Some(mut meta) => {
-                    let mut changed = false;
-                    if meta.video_duration_secs.is_none() {
-                        meta.video_duration_secs = crate::recording::recorder::get_video_duration(&path);
-                        changed = true;
-                    }
-                    // 若 status 仍是过渡态（程序崩溃遗留），修正为 finish
-                    // If status is still a transient state (left by a crash), correct to finish
+                    // 活跃状态的 meta 跳过，避免干扰正在进行的任务
+                    // Skip active meta to avoid interfering with ongoing tasks
                     if matches!(
                         meta.status.as_str(),
                         "recording" | "merging_waiting" | "merging" | "pp_waiting" | "pp_running"
                     ) {
-                        meta.status = "finish".to_string();
+                        continue;
+                    }
+
+                    let mut changed = false;
+
+                    // 版本不匹配：重建 meta，保留可复用的字段
+                    // Version mismatch: rebuild meta, preserving reusable fields
+                    if meta.meta_version != META_VERSION {
+                        tracing::info!(
+                            "Meta version mismatch for {:?}: found {}, expected {} — rebuilding",
+                            path,
+                            meta.meta_version,
+                            META_VERSION
+                        );
+                        // 重新从磁盘读取 size_bytes 和 video_duration_secs
+                        // Re-read size_bytes and video_duration_secs from disk
+                        meta.size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(meta.size_bytes);
+                        if meta.video_duration_secs.is_none() {
+                            meta.video_duration_secs = crate::recording::recorder::get_video_duration(&path);
+                        }
+                        // 过渡态修正为 finish（版本升级时崩溃遗留）
+                        // Correct transient status to finish (crash remnant during version upgrade)
+                        if matches!(
+                            meta.status.as_str(),
+                            "recording" | "merging_waiting" | "merging" | "pp_waiting" | "pp_running"
+                        ) {
+                            meta.status = "finish".to_string();
+                        }
+                        // meta_version 由 write_meta 自动设置为 META_VERSION
+                        // meta_version is set to META_VERSION automatically by write_meta
+                        write_meta(&path, &meta);
+                        *count_updated += 1;
+                        continue;
+                    }
+
+                    // 版本匹配：仅补全缺失字段
+                    // Version matches: only fill in missing fields
+                    if meta.video_duration_secs.is_none() {
+                        meta.video_duration_secs = crate::recording::recorder::get_video_duration(&path);
                         changed = true;
                     }
                     if changed {
@@ -407,6 +474,26 @@ fn cleanup_orphaned_meta_recursive(dir: &Path, count: &mut usize) {
             });
 
         if !video_exists {
+            // 跳过仍处于活跃状态的 meta（录制中/合并中/后处理中），
+            // 此时视频文件尚未生成，不应视为孤立文件。
+            // Skip meta files that are still in an active state (recording / merging / post-processing).
+            // The video file doesn't exist yet at these stages, so they are not truly orphaned.
+            let is_active = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|c| serde_json::from_str::<VideoMeta>(&c).ok())
+                .map(|m| {
+                    matches!(
+                        m.status.as_str(),
+                        "recording" | "merging_waiting" | "merging" | "pp_waiting" | "pp_running"
+                    )
+                })
+                .unwrap_or(false);
+
+            if is_active {
+                tracing::debug!("Meta cleanup: skipping active meta {:?}", path);
+                continue;
+            }
+
             if let Err(e) = std::fs::remove_file(&path) {
                 tracing::warn!("Meta cleanup: failed to delete {:?}: {}", path, e);
             } else {
@@ -434,6 +521,41 @@ pub async fn schedule_meta_cleanup(output_dir: std::path::PathBuf) {
         let dir = output_dir.clone();
         tokio::task::spawn_blocking(move || {
             cleanup_orphaned_meta_files(&dir);
+        })
+        .await
+        .ok();
+    }
+}
+
+/// 启动 meta 版本检查轮询调度器：立即执行一次，之后每隔指定秒数执行一次。
+/// 对版本不匹配或缺失的 meta 文件执行重建，跳过活跃状态的录制。
+///
+/// Start the meta version-check polling scheduler: run once immediately, then at the
+/// specified interval. Rebuilds meta files with missing or mismatched versions,
+/// skipping active recordings.
+pub async fn schedule_meta_version_check(
+    output_dir: std::path::PathBuf,
+    merge_format: String,
+    interval_secs: u64,
+) {
+    // 立即执行一次 / Run once immediately
+    {
+        let dir = output_dir.clone();
+        let fmt = merge_format.clone();
+        tokio::task::spawn_blocking(move || {
+            ensure_meta_files(&dir, &fmt);
+        })
+        .await
+        .ok();
+    }
+
+    // 之后按间隔循环执行 / Then run at the specified interval
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
+        let dir = output_dir.clone();
+        let fmt = merge_format.clone();
+        tokio::task::spawn_blocking(move || {
+            ensure_meta_files(&dir, &fmt);
         })
         .await
         .ok();

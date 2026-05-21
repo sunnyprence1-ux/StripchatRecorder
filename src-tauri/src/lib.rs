@@ -349,6 +349,17 @@ fn run_desktop() {
                 });
             }
 
+            // 启动 meta 版本检查轮询调度器（启动时立即执行一次，之后每 5 分钟一次）
+            // Start meta version-check polling scheduler (once on startup, then every 5 minutes)
+            {
+                let settings = state.get_settings();
+                let output_dir = std::path::PathBuf::from(&settings.output_dir);
+                let merge_format = settings.merge_format.clone();
+                tauri::async_runtime::spawn(async move {
+                    recording::meta::schedule_meta_version_check(output_dir, merge_format, 300).await;
+                });
+            }
+
             // 启动模块目录文件监控（检测模块可执行文件的增删）
             // Start modules directory file watcher (detects module executable additions/removals)
             let emitter_for_modules: Arc<dyn crate::core::emitter::Emitter> =
