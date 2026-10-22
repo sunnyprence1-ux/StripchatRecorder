@@ -1,10 +1,17 @@
 //! Contact Sheet 后处理模块 / Contact Sheet Post-processing Module
 //!
 //! 每隔指定秒数从视频中截取一帧，为每帧叠加时间戳水印，
-//! 然后将所有帧拼合成一张网格预览图（contact sheet）保存到视频同目录。
+//! 然后将所有帧拼合成一张网格预览图（contact sheet）。
+//!
+//! 保存位置：环境变量 `PP_SIDECAR_DIR` 指定的目录（后端传入输出目录，
+//! 使最终视频目录只保留成片）；未设置时回退到视频同目录。
 //!
 //! Extracts frames from the video at specified intervals, overlays timestamp watermarks,
-//! then tiles all frames into a grid preview image (contact sheet) saved in the video's directory.
+//! then tiles all frames into a grid preview image (contact sheet).
+//!
+//! Save location: the directory named by the `PP_SIDECAR_DIR` env var (the backend passes
+//! the output directory so the final video directory only keeps merged videos);
+//! falls back to the video's own directory when unset.
 //!
 //! # 协议 / Protocol
 //! - `--describe`: 输出 JSON 格式的模块元数据 / Output module metadata as JSON
@@ -21,7 +28,7 @@ use std::process::{Command, Stdio};
 /// Module metadata JSON, output via `--describe` argument.
 const DESCRIBE: &str = r#"{
     "id": "contact_sheet",
-    "name": "Contact Sheet 0.2.0",
+    "name": "Contact Sheet 0.3.2",
     "description": "每隔指定秒数截帧，拼合成一张带时间戳的预览图保存到视频同目录",
     "params": [
         {
@@ -122,6 +129,18 @@ fn find_font() -> Option<String> {
         .map(|p| ffmpeg_escape_path(p))
 }
 
+/// 检测当前 ffmpeg 是否支持 `-fps_mode`（ffmpeg 7 起取代了 `-vsync`）。
+/// Check whether the installed ffmpeg supports `-fps_mode` (replaced `-vsync` in ffmpeg 7).
+fn ffmpeg_supports_fps_mode() -> bool {
+    Command::new("ffmpeg")
+        .args(["-hide_banner", "-h", "full"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("-fps_mode"))
+        .unwrap_or(false)
+}
+
 /// 将文件路径转换为 ffmpeg drawtext 过滤器可接受的格式。
 /// 在 Windows 上需要将反斜杠转为正斜杠，并对驱动器号后的冒号进行转义。
 ///
@@ -172,11 +191,31 @@ fn run() -> Result<(), String> {
         eprintln!("Warning: no font file found, timestamp overlay will be skipped");
     }
 
-    // 输出文件路径：与视频同目录，同名，扩展名为图片格式
-    // Output path: same directory as video, same name, image format extension
-    let output_path = input
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
+    // 输出目录：优先使用后端指定的副产物目录（PP_SIDECAR_DIR），否则与视频同目录
+    // Output dir: the backend-provided sidecar dir (PP_SIDECAR_DIR) when set,
+    // otherwise the video's own directory
+    let output_dir: PathBuf = env::var("PP_SIDECAR_DIR")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            input
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        });
+    if let Err(e) = std::fs::create_dir_all(&output_dir) {
+        eprintln!(
+            "Warning: cannot create output dir {}: {}",
+            output_dir.display(),
+            e
+        );
+    }
+
+    // 输出文件路径：输出目录 + 视频同名 + 图片格式扩展名
+    // Output path: output dir + video name + image format extension
+    let output_path = output_dir
         .join(format!(
             "{}.{}",
             input
@@ -266,11 +305,18 @@ fn run() -> Result<(), String> {
 
     // 第一步：使用 ffmpeg 截取帧并实时上报进度
     // Step 1: Extract frames with ffmpeg and report progress in real-time
+    // ffmpeg 7+ 移除了 `-vsync`，改用等价的 `-fps_mode`；老版本仍回退到 `-vsync`
+    // ffmpeg 7+ removed `-vsync` in favour of the equivalent `-fps_mode`; older builds still use `-vsync`
+    let vsync_args: [&str; 2] = if ffmpeg_supports_fps_mode() {
+        ["-fps_mode", "vfr"]
+    } else {
+        ["-vsync", "vfr"]
+    };
     let mut child = Command::new("ffmpeg")
         .args(["-y", "-i"])
         .arg(&input)
         .args(["-vf", &vf])
-        .args(["-vsync", "vfr"])
+        .args(vsync_args)
         .args(["-frames:v", &frame_count.to_string()])
         .arg(&frame_pattern)
         .args(["-progress", "pipe:1"])
