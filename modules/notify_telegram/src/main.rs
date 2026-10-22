@@ -3,16 +3,58 @@
 //! 通过 MTProto 协议将录制信息、封面图和视频文件发送到 Telegram 频道或群组。
 //! 支持超过 2GB 的大文件（自动分割）、HTTP/SOCKS5 代理，以及多次重连重试。
 //!
+//! 支持三种登录方式（参数 `account`，默认 `auto`）：
+//! - `auto`：**已登录的用户会话优先**，没有用户会话时才用机器人账号。
+//! - `bot`：机器人账号（Bot Token）。机器人**无法**调用 `messages.getForumTopics`
+//!   （会返回 `BOT_METHOD_INVALID`），因此话题只能依赖本地缓存。
+//! - `user`：用户账号（通过 `--login` 交互式登录生成会话文件）。可以列出群组话题，
+//!   因此能可靠复用同名话题；高级会员还可上传 4GB 单文件。
+//!
+//! 话题（Topic）只存在于**已开启话题的超级群组**，机器人还需要「管理话题」管理员权限：
+//! - 普通群没有话题：在群设置里开启「话题」后 Telegram 会把群升级为超级群组，
+//!   群 ID 也从 `-1234567890` 变成 `-100…`，需要把新 ID 填到 `chat_id`。
+//! - 私有群组没有 username：`username` 留空，只填 `chat_id`。
+//! - 关闭 `topic_per_model` 即可直接发到群的主聊天（普通群同样可用）。
+//!
 //! Sends recording info, cover image, and video files to a Telegram channel or group
 //! via the MTProto protocol. Supports files over 2GB (auto-split), HTTP/SOCKS5 proxy,
 //! and multiple reconnect retries.
 //!
+//! Three login modes (the `account` parameter, default `auto`):
+//! - `auto`: **a signed-in user session wins**; the bot account is used only when no user
+//!   session exists.
+//! - `bot`: bot account (Bot Token). Bots **cannot** call `messages.getForumTopics`
+//!   (it fails with `BOT_METHOD_INVALID`), so topics rely on the local cache.
+//! - `user`: user account (session file created by the interactive `--login` mode).
+//!   Can list group topics, so existing topics are reliably reused; premium accounts
+//!   can also upload single files up to 4GB.
+//!
+//! Forum topics only exist in **supergroups with Topics enabled**, and the bot needs the
+//! "Manage Topics" admin right:
+//! - A basic group has no topics. Enabling Topics upgrades the group to a supergroup and its
+//!   id changes from `-1234567890` to a `-100…` form — use that new id as `chat_id`.
+//! - Private groups have no username: leave `username` empty and use `chat_id`.
+//! - Turning `topic_per_model` off posts straight into the group's main chat (works for basic
+//!   groups too).
+//!
 //! # 协议 / Protocol
 //! - `--describe`: 输出 JSON 格式的模块元数据 / Output module metadata as JSON
+//! - `--login`: 交互式登录（stdin/stdout 行协议），生成用户会话文件
+//!   Interactive login (line protocol over stdin/stdout) that writes the user session file
 //! - 环境变量 `PP_INPUT`: 输入视频文件路径 / Input video file path via env var
+//! - 环境变量 `PP_TEST=1`: 自检模式（无需 `PP_INPUT`）/ Self-test mode (no `PP_INPUT` required)
 //! - 标准输出 `OUTPUT:{path}`: 成功后输出视频路径 / Output video path on success
 //! - 标准输出 `PROGRESS:{done}/{total}`: 进度上报 / Progress reporting
 //! - 标准输出 `STATUS:{speed}`: 上传速度上报 / Upload speed reporting
+//!
+//! # 登录行协议 / Login line protocol
+//! stdin 每行 `命令:值`（`phone:` / `code:` / `password:` / `quit`），
+//! stdout 以 `LOGIN_STATE:` 开头的行表示状态：
+//! `ready`、`code_sent`、`password_required:{hint}`、`invalid_code`、
+//! `invalid_password`、`done:{name}:{premium}`、`already:{name}:{premium}`、`error:{msg}`。
+//!
+//! Each stdin line is `command:value` (`phone:` / `code:` / `password:` / `quit`);
+//! stdout lines starting with `LOGIN_STATE:` report the state.
 
 use std::env;
 use std::fs;
@@ -26,10 +68,11 @@ use grammers_client::Client;
 use grammers_client::client::{ClientConfiguration, AutoSleep};
 use grammers_client::media::{InputMedia, Uploaded};
 use grammers_client::message::InputMessage;
+use grammers_client::peer::Peer;
 use grammers_client::sender::{ConnectionParams, SenderPool};
 use grammers_client::tl;
 use grammers_session::storages::SqliteSession;
-use grammers_session::types::{PeerAuth, PeerId, PeerRef};
+use grammers_session::types::{PeerAuth, PeerId, PeerKind, PeerRef};
 use tokio::io::AsyncReadExt;
 use pp_utils::{param, param_bool, format_duration, format_bytes, format_speed, parse_stem, find_cover, tmp_dir, image_dimensions, video_meta};
 
@@ -40,9 +83,18 @@ const PROGRESS_SCALE: usize = 10_000;
 /// Module metadata JSON, output via `--describe` argument.
 const DESCRIBE: &str = r#"{
     "id": "notify_telegram",
-    "name": "Telegram 通知 0.2.0",
-    "description": "将录制信息、封面图和视频通过 MTProto 发送到 Telegram（支持超过 50MB 的大文件，支持 HTTP/SOCKS5 代理）",
+    "name": "Telegram 通知 0.4.1",
+    "description": "将录制信息、封面图和视频通过 MTProto 发送到 Telegram（支持超过 50MB 的大文件，支持 HTTP/SOCKS5 代理）。可按模特自动创建/复用群组话题（Topic）并把视频发送到对应话题。默认使用已登录的真实账号：可列出话题、避免重复创建，高级会员还能上传 4GB 单文件",
+    "testable": true,
+    "loginable": true,
     "params": [
+        {
+        "key": "account",
+        "label": "登录方式（auto = 已登录的真实账号优先 / user = 只用用户账号 / bot = 只用机器人）",
+        "type": "select",
+        "default": "auto",
+        "options": ["auto", "user", "bot"]
+        },
         {
         "key": "api_id",
         "label": "API ID（从 my.telegram.org 获取）",
@@ -51,25 +103,25 @@ const DESCRIBE: &str = r#"{
         },
         {
         "key": "api_hash",
-        "label": "API Hash",
+        "label": "API Hash（仅机器人账号需要，用户账号可留空）",
         "type": "string",
         "default": ""
         },
         {
         "key": "bot_token",
-        "label": "Bot Token（从 @BotFather 获取）",
+        "label": "Bot Token（从 @BotFather 获取，仅机器人账号需要）",
         "type": "string",
         "default": ""
         },
         {
         "key": "chat_id",
-        "label": "Chat ID（超级群组填 -100xxxxxxxxxx 格式）",
+        "label": "Chat ID（群组/超级群组填 -100xxxxxxxxxx 格式；私有群组没有 username，只能填 ID）",
         "type": "string",
         "default": ""
         },
         {
         "key": "username",
-        "label": "群组 Username（超级群组必填，如 mygroupname，不含 @）",
+        "label": "群组 Username（可选：公开群组才填，如 mygroupname，不含 @；私有群组留空，改用 Chat ID）",
         "type": "string",
         "default": ""
         },
@@ -82,6 +134,12 @@ const DESCRIBE: &str = r#"{
         {
         "key": "send_video",
         "label": "同时发送视频文件",
+        "type": "boolean",
+        "default": true
+        },
+        {
+        "key": "topic_per_model",
+        "label": "为每个模特创建/复用群组话题（Topic），视频发送到对应话题",
         "type": "boolean",
         "default": true
         }
@@ -312,32 +370,885 @@ fn split_video(input: &Path, max_bytes: u64) -> Result<Vec<PathBuf>, String> {
     Ok(final_segments)
 }
 
-/// 获取 Telegram 会话文件路径（存储在系统配置目录下）。
-/// Get the Telegram session file path (stored in the system config directory).
-fn session_path(api_id: i32) -> PathBuf {
+/// 话题标题的最大长度（Telegram 限制 128 字符）。
+/// Maximum forum topic title length (Telegram limit is 128 characters).
+const MAX_TOPIC_TITLE_LEN: usize = 128;
+
+/// 返回模块配置目录（系统配置目录下的 notify_telegram/）。
+/// Return the module config directory (notify_telegram/ under the system config dir).
+fn config_dir_path() -> PathBuf {
     let base = dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("notify_telegram");
     fs::create_dir_all(&base).ok();
-    base.join(format!("{}.db", api_id))
+    base
+}
+
+/// 话题缓存文件路径：记录「群组 + 模特 → 话题 ID」，避免重复创建同名话题。
+/// Forum topic cache path: maps "chat + model → topic id" to avoid creating duplicate topics.
+fn topic_cache_path() -> PathBuf {
+    config_dir_path().join("topics.tsv")
+}
+
+/// 生成用于话题缓存的主播名键（统一小写，忽略首尾空格）。
+/// Build the streamer key used by the topic cache (lowercased, trimmed).
+fn topic_model_key(model_name: &str) -> String {
+    model_name.trim().to_lowercase()
+}
+
+/// 读取话题缓存（键为 `(chat_id, 小写模特名)`）。
+/// Load the topic cache (keyed by `(chat_id, lowercased model name)`).
+fn load_topic_cache() -> std::collections::HashMap<(i64, String), i32> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(content) = fs::read_to_string(topic_cache_path()) else {
+        return map;
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        let (Some(chat), Some(model), Some(topic)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let (Ok(chat), Ok(topic)) = (
+            chat.trim().parse::<i64>(),
+            topic.trim().parse::<i32>(),
+        ) else {
+            continue;
+        };
+        map.insert((chat, topic_model_key(model)), topic);
+    }
+    map
+}
+
+/// 写入或删除一条话题缓存记录（`topic_id = None` 表示删除）。
+/// Insert or remove one topic cache entry (`topic_id = None` removes it).
+fn update_topic_cache(chat_id: i64, model_name: &str, topic_id: Option<i32>) {
+    let mut map = load_topic_cache();
+    let key = (chat_id, topic_model_key(model_name));
+    match topic_id {
+        Some(id) => {
+            map.insert(key, id);
+        }
+        None => {
+            map.remove(&key);
+        }
+    }
+    save_topic_cache(&map);
+}
+
+/// 用「服务端实际存在的话题」替换某个群组的全部缓存记录（保留其他群组的记录）。
+/// Replace all cached entries of one chat with the topics that actually exist on the server
+/// (entries of other chats are preserved).
+fn replace_chat_topics(chat_id: i64, topics: &[(String, i32)]) {
+    let mut map = load_topic_cache();
+    map.retain(|(chat, _), _| *chat != chat_id);
+    for (title, id) in topics {
+        map.insert((chat_id, topic_model_key(title)), *id);
+    }
+    save_topic_cache(&map);
+}
+
+/// 把话题缓存整体写回磁盘。
+/// Persist the whole topic cache to disk.
+fn save_topic_cache(map: &std::collections::HashMap<(i64, String), i32>) {
+    let mut entries: Vec<((i64, String), i32)> = map.clone().into_iter().collect();
+    entries.sort();
+    let mut out = String::from("# chat_id\tmodel\ttopic_id\n");
+    for ((chat, model), id) in entries {
+        out.push_str(&format!("{}\t{}\t{}\n", chat, model, id));
+    }
+    if let Err(e) = fs::write(topic_cache_path(), out) {
+        eprintln!("failed to write topic cache: {}", e);
+    }
+}
+
+/// 规范化话题标题（模特名，超长截断）。
+/// Normalize the forum topic title (model name, truncated when too long).
+fn topic_title(model_name: &str) -> String {
+    let trimmed = model_name.trim();
+    let title = if trimmed.is_empty() { "unknown" } else { trimmed };
+    title.chars().take(MAX_TOPIC_TITLE_LEN).collect()
+}
+
+/// 生成一个随机的 TL `random_id`（用于创建话题、发送相册）。
+/// Generate a random TL `random_id` (used for creating topics and sending albums).
+fn random_i64() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let nanos = t.as_nanos() as i64;
+    // 混合进程内计数器，避免同一纳秒内重复
+    // Mix in an in-process counter to avoid collisions within the same nanosecond
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static COUNTER: AtomicI64 = AtomicI64::new(0x5deece66d);
+    let c = COUNTER.fetch_add(0x9e3779b97f4a7c15_u64 as i64, Ordering::Relaxed);
+    nanos.wrapping_mul(0x2545F4914F6CDD1D_u64 as i64) ^ c
+}
+
+/// 从 `Updates` 中解析新建话题的 ID（即创建话题的服务消息 ID）。
+/// Extract the new topic id from `Updates` (the id of the topic-creation service message).
+fn topic_id_from_updates(updates: &tl::enums::Updates) -> Option<i32> {
+    let tl::enums::Updates::Updates(raw) = updates else {
+        return None;
+    };
+    let mut first_id: Option<i32> = None;
+    for update in &raw.updates {
+        let message = match update {
+            tl::enums::Update::NewChannelMessage(u) => Some(&u.message),
+            tl::enums::Update::NewMessage(u) => Some(&u.message),
+            _ => None,
+        };
+        match message {
+            // 优先匹配「创建话题」服务消息，其 ID 即话题 ID
+            // Prefer the topic-creation service message: its id is the topic id
+            Some(tl::enums::Message::Service(m)) => {
+                if matches!(m.action, tl::enums::MessageAction::TopicCreate(_)) {
+                    return Some(m.id);
+                }
+                first_id = first_id.or(Some(m.id));
+            }
+            Some(tl::enums::Message::Message(m)) => first_id = first_id.or(Some(m.id)),
+            _ => continue,
+        }
+    }
+    first_id
+}
+
+/// 列出群组中的全部论坛话题（分页遍历），返回 `(标题, 话题 ID)`。
+///
+/// **仅用户账号可用**：机器人调用 `messages.getForumTopics` 会返回
+/// `BOT_METHOD_INVALID`（Bot API 也没有对应的方法），所以机器人模式下必须跳过。
+///
+/// List every forum topic of the group (paginated) as `(title, topic id)`.
+///
+/// **User accounts only**: calling `messages.getForumTopics` from a bot session fails with
+/// `BOT_METHOD_INVALID` (the Bot API has no equivalent), so bot mode must skip this.
+async fn list_all_topics(client: &Client, peer: &PeerRef) -> Result<Vec<(String, i32)>, String> {
+    const PAGE: i32 = 100;
+    let mut offset_date = 0i32;
+    let mut offset_id = 0i32;
+    let mut offset_topic = 0i32;
+    let mut found: Vec<(String, i32)> = Vec::new();
+
+    // 最多翻 20 页（2000 个话题），避免异常情况下无限循环
+    // Up to 20 pages (2000 topics) to avoid an unbounded loop in abnormal cases
+    for _ in 0..20 {
+        let result = client
+            .invoke(&tl::functions::messages::GetForumTopics {
+                peer: (*peer).into(),
+                q: None,
+                offset_date,
+                offset_id,
+                offset_topic,
+                limit: PAGE,
+            })
+            .await
+            .map_err(|e| format!("getForumTopics failed: {}", e))?;
+
+        let tl::enums::messages::ForumTopics::Topics(topics) = result;
+
+        let mut last_id = 0i32;
+        let mut last_date = 0i32;
+        for topic in &topics.topics {
+            let tl::enums::ForumTopic::Topic(t) = topic else {
+                continue;
+            };
+            found.push((t.title.trim().to_string(), t.id));
+            last_id = t.id;
+            last_date = t.date;
+        }
+
+        if topics.topics.len() < PAGE as usize || last_id == 0 {
+            break;
+        }
+        offset_topic = last_id;
+        offset_date = last_date;
+        offset_id = 0;
+    }
+    Ok(found)
+}
+
+/// 在群组中创建论坛话题，返回新话题 ID。
+/// Create a forum topic in the group and return its id.
+async fn create_topic(
+    client: &Client,
+    peer: &PeerRef,
+    title: &str,
+    can_list: bool,
+    chat_id: i64,
+) -> Result<i32, String> {
+    let updates = client
+        .invoke(&tl::functions::messages::CreateForumTopic {
+            title_missing: false,
+            peer: (*peer).into(),
+            title: title.to_string(),
+            icon_color: None,
+            icon_emoji_id: None,
+            random_id: random_i64(),
+            send_as: None,
+        })
+        .await
+        .map_err(|e| topic_error_hint(&e.to_string(), chat_id))?;
+
+    if let Some(id) = topic_id_from_updates(&updates) {
+        return Ok(id);
+    }
+
+    // 回退：创建成功但无法从 updates 解析 ID 时，按标题重新查找
+    // （机器人无法列出话题，此时只能报错）
+    // Fallback: when the id cannot be parsed from updates, look the topic up by title again
+    // (bots cannot list topics, so they can only report the failure)
+    if !can_list {
+        return Err(
+            "created forum topic but could not determine its id (bot sessions cannot list topics)"
+                .to_string(),
+        );
+    }
+    list_all_topics(client, peer)
+        .await?
+        .into_iter()
+        .find(|(t, _)| t.eq_ignore_ascii_case(title))
+        .map(|(_, id)| id)
+        .ok_or_else(|| "created forum topic but could not determine its id".to_string())
+}
+
+/// 解析模特对应的群组话题：优先使用缓存，其次（用户账号）从服务端刷新，最后新建。
+///
+/// Resolve the forum topic for a model: cache first, then (user accounts only) refresh
+/// from the server, and finally create it.
+///
+/// # 参数 / Parameters
+/// - `can_list`: 当前会话能否列出话题（用户账号为 `true`，机器人为 `false`）
+///   Whether the current session may list topics (`true` for user accounts, `false` for bots)
+async fn ensure_topic(
+    client: &Client,
+    target: &Target,
+    chat_id: i64,
+    model_name: &str,
+    can_list: bool,
+) -> Result<i32, String> {
+    // 不是论坛超级群组时直接给出可操作的错误，不必等 Telegram 回 CHANNEL_INVALID
+    // Fail fast with an actionable message instead of waiting for CHANNEL_INVALID.
+    if let Some(problem) = target.topic_problem(chat_id) {
+        return Err(problem);
+    }
+
+    let key = (chat_id, topic_model_key(model_name));
+    if let Some(id) = load_topic_cache().get(&key).copied() {
+        return Ok(id);
+    }
+
+    let title = topic_title(model_name);
+
+    if can_list {
+        // 用户账号可以列出全部话题：用服务端结果刷新缓存后再查找，避免重复创建
+        // User accounts can list every topic: refresh the cache from the server before
+        // looking the topic up, so no duplicate is created
+        match list_all_topics(client, &target.peer).await {
+            Ok(all) => {
+                replace_chat_topics(chat_id, &all);
+                if let Some(id) = load_topic_cache().get(&key).copied() {
+                    println!("topic: reusing \"{}\" (id {})", title, id);
+                    return Ok(id);
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "topic: could not list existing topics ({}), creating without lookup",
+                    e
+                );
+            }
+        }
+    } else {
+        eprintln!(
+            "topic: bot sessions cannot list forum topics (BOT_METHOD_INVALID); \
+             using the local cache and creating \"{}\" when unknown",
+            title
+        );
+    }
+
+    let id = create_topic(client, &target.peer, &title, can_list, chat_id).await?;
+    update_topic_cache(chat_id, model_name, Some(id));
+    println!("topic: created \"{}\" (id {})", title, id);
+    Ok(id)
+}
+
+/// 若错误与话题失效相关（话题被删除/关闭），清除缓存以便下次重建。
+/// Clear the cached topic when the error suggests the topic is gone, so it gets recreated.
+fn invalidate_topic_on_error(chat_id: i64, model_name: &str, err: &str) {
+    let upper = err.to_uppercase();
+    if upper.contains("TOPIC") {
+        eprintln!("topic error detected, clearing cached topic: {}", err);
+        update_topic_cache(chat_id, model_name, None);
+    }
+}
+
+/// Telegram 登录方式 / Telegram login mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionMode {
+    /// 机器人账号（Bot Token）/ Bot account (Bot Token)
+    Bot,
+    /// 用户账号（`--login` 生成的会话文件）/ User account (session file created by `--login`)
+    User,
+    /// 自动：已登录的用户会话优先，没有时回退到机器人
+    /// Automatic: prefer the signed-in user session, fall back to the bot account
+    Auto,
+}
+
+impl SessionMode {
+    /// 解析 `account` 参数（默认 `auto`：优先使用已登录的真实账号）。
+    /// Parse the `account` parameter (defaults to `auto`: the signed-in real account wins).
+    fn from_param(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "user" => SessionMode::User,
+            "bot" => SessionMode::Bot,
+            _ => SessionMode::Auto,
+        }
+    }
+
+    /// 把 `auto` 解析成具体方式：只要用户会话文件存在，就使用真实账号。
+    ///
+    /// 用户会话比机器人会话能力强：能列出群组话题（避免重复创建）、高级会员还能上传
+    /// 4GB 单文件，所以「已经登录过」时没有任何理由再用机器人。
+    ///
+    /// Resolve `auto` into a concrete mode: as soon as a user session file exists, the real
+    /// account is used.
+    ///
+    /// A user session is strictly more capable than a bot session — it can list forum topics
+    /// (so topics are reused instead of duplicated) and premium accounts may upload 4GB in a
+    /// single file — so once a login exists there is no reason to keep using the bot.
+    fn resolve(self, api_id: i32) -> Self {
+        match self {
+            SessionMode::Auto => {
+                if session_path(api_id, SessionMode::User).exists() {
+                    SessionMode::User
+                } else {
+                    SessionMode::Bot
+                }
+            }
+            concrete => concrete,
+        }
+    }
+
+    /// 当前登录方式能否列出群组话题 / Whether this login mode may list group topics.
+    ///
+    /// 机器人调用 `messages.getForumTopics` 会返回 `BOT_METHOD_INVALID`。
+    /// Bots get `BOT_METHOD_INVALID` from `messages.getForumTopics`.
+    fn can_list_topics(self) -> bool {
+        matches!(self, SessionMode::User | SessionMode::Auto)
+    }
+
+    /// 用于日志的简短名称 / Short name used in logs.
+    fn label(self) -> &'static str {
+        match self {
+            SessionMode::Bot => "bot",
+            SessionMode::User => "user",
+            SessionMode::Auto => "auto",
+        }
+    }
+}
+
+/// 获取 Telegram 会话文件路径（存储在系统配置目录下）。
+///
+/// 机器人会话与用户会话分开保存，避免同一 api_id 的两种授权互相覆盖。
+///
+/// Get the Telegram session file path (stored in the system config directory).
+///
+/// Bot and user sessions live in separate files so that two authorizations of the same
+/// api_id never overwrite each other.
+fn session_path(api_id: i32, mode: SessionMode) -> PathBuf {
+    match mode {
+        SessionMode::User => config_dir_path().join(format!("{}_user.db", api_id)),
+        // `auto` 在调用前已解析；兜底按机器人会话处理
+        // `auto` is resolved before it gets here; fall back to the bot session file
+        SessionMode::Bot | SessionMode::Auto => config_dir_path().join(format!("{}.db", api_id)),
+    }
+}
+
+/// 打开（或创建）会话文件并建立 MTProto 连接，但不做任何鉴权。
+/// Open (or create) the session file and connect over MTProto without authenticating.
+async fn open_client(api_id: i32, proxy: &str, mode: SessionMode) -> Result<Client, String> {
+    let path = session_path(api_id, mode);
+
+    // 打开或创建 SQLite 会话文件 / Open or create SQLite session file
+    let session = Arc::new(
+        SqliteSession::open(&path)
+            .await
+            .map_err(|e| format!("open session {} failed: {}", path.display(), e))?,
+    );
+
+    let conn_params = ConnectionParams {
+        proxy_url: if proxy.is_empty() { None } else { Some(proxy.to_string()) },
+        ..Default::default()
+    };
+
+    // 创建连接池并在后台运行 / Create connection pool and run in background
+    let pool = SenderPool::with_configuration(Arc::clone(&session), api_id, conn_params);
+    let runner = pool.runner;
+    tokio::spawn(async move { runner.run().await });
+    // 配置激进的 retry policy：I/O 错误视为 5 秒 flood，flood wait 阈值提高到 5 分钟
+    // Aggressive retry policy: treat I/O errors as 5s flood, raise flood-wait threshold to 5 min
+    Ok(Client::with_configuration(pool.handle, ClientConfiguration {
+        retry_policy: Box::new(AutoSleep {
+            threshold: Duration::from_secs(300),
+            io_errors_as_flood_of: Some(Duration::from_secs(5)),
+        }),
+        auto_cache_peers: true,
+    }))
+}
+
+/// 建立 MTProto 连接，并按登录方式完成鉴权。
+///
+/// - `bot`：会话未授权时使用 Bot Token 登录（首次运行会自动创建会话文件）。
+/// - `user`：会话必须已经通过 `--login` 授权，否则返回错误提示。
+///
+/// Open an MTProto connection and authenticate according to the login mode.
+///
+/// - `bot`: signs in with the Bot Token when the session is not authorized yet
+///   (the session file is created on first run).
+/// - `user`: the session must already be authorized via `--login`, otherwise an error is returned.
+async fn connect_client(
+    api_id: i32,
+    api_hash: &str,
+    bot_token: &str,
+    proxy: &str,
+    mode: SessionMode,
+) -> Result<Client, String> {
+    // `auto` 已经在 read_config 中解析过；这里再兜底一次，保证连接用的总是具体方式
+    // `auto` is already resolved in read_config; resolve again here so the connection always
+    // uses a concrete mode
+    let mode = mode.resolve(api_id);
+    let path = session_path(api_id, mode);
+
+    // 用户模式：会话文件不存在时直接给出可操作的提示
+    // User mode: fail fast with an actionable message when the session file is missing
+    if mode == SessionMode::User && !path.exists() {
+        return Err(format!(
+            "user session not found at {} — click \"Login\" in the pipeline UI (or run the module with --login) first",
+            path.display()
+        ));
+    }
+
+    let client = open_client(api_id, proxy, mode).await?;
+
+    let authorized = client
+        .is_authorized()
+        .await
+        .map_err(|e| format!("is_authorized failed: {}", e))?;
+
+    match mode {
+        // Bot 登录（会话已存在时跳过）/ Bot sign-in (skipped if the session exists)
+        SessionMode::Bot => {
+            if !authorized {
+                client
+                    .bot_sign_in(bot_token, api_hash)
+                    .await
+                    .map_err(|e| format!("bot_sign_in failed: {}", e))?;
+            }
+        }
+        // 用户登录必须事先完成 / The user login must have been completed beforehand
+        SessionMode::User => {
+            if !authorized {
+                return Err(format!(
+                    "user session {} is not authorized — click \"Login\" in the pipeline UI to sign in again",
+                    path.display()
+                ));
+            }
+        }
+        // resolve() 只返回具体方式 / resolve() only ever returns a concrete mode
+        SessionMode::Auto => unreachable!("auto is resolved before connecting"),
+    }
+
+    Ok(client)
 }
 
 /// 根据数字 chat_id 构建 Telegram PeerRef（不需要网络请求）。
 /// Build a Telegram PeerRef from a numeric chat_id (no network request needed).
 ///
-/// 支持用户、普通群组和超级群组/频道的 ID 格式。
-/// Supports user, regular group, and supergroup/channel ID formats.
+/// Telegram 的 Bot API 会话 ID 只有三种形状：
+/// - 普通群：`-<chat_id>`（负数，普通群 ID 已经能到 10~12 位）
+/// - 超级群组/频道：`-100<channel_id>`
+/// - 用户：正数
+///
+/// 另外兼容省略负号的超级群组 ID（把 `-1002795956983` 写成 `1002795956983`）。
+///
+/// Telegram's Bot API dialog ids only come in three shapes:
+/// - basic group: `-<chat_id>` (negative; basic-group ids already reach 10–12 digits)
+/// - supergroup/channel: `-100<channel_id>`
+/// - user: positive
+///
+/// A supergroup id written without the minus sign (`1002795956983`) is also accepted.
 fn build_peer_ref(chat_id: i64) -> PeerRef {
-    let id = if chat_id < -1_000_000_000_000 {
+    let id = if chat_id <= -1_000_000_000_000 {
+        // -100xxxxxxxxxx → 超级群组/频道 / supergroup or channel
         PeerId::channel_unchecked((-chat_id) - 1_000_000_000_000)
-    } else if chat_id < -1_000_000_000 {
-        PeerId::channel_unchecked((-chat_id) - 1_000_000_000)
     } else if chat_id < 0 {
+        // -xxxxxxxxx → 普通群 / basic group
         PeerId::chat_unchecked(-chat_id)
+    } else if chat_id >= 1_000_000_000_000 {
+        // 省略负号的超级群组/频道 ID：100xxxxxxxxxx
+        // Supergroup/channel id written without the minus sign: 100xxxxxxxxxx
+        PeerId::channel_unchecked(chat_id - 1_000_000_000_000)
     } else {
         PeerId::user_unchecked(chat_id)
     };
     PeerRef { id, auth: PeerAuth::default() }
+}
+
+/// 数字 chat_id 可能的 Peer 解释，主解释排在最前面。
+///
+/// 负数只可能是普通群或 `-100…` 频道，但很多人会把频道 ID 写成 `-<channel_id>`（少写
+/// 100 前缀），正数也可能是省略负号的频道 ID。所以解析失败时再按频道解释试一次。
+///
+/// Every plausible peer interpretation of a numeric chat_id, primary first.
+///
+/// A negative id is either a basic group or a `-100…` channel, but people often write a
+/// channel id as `-<channel_id>` (dropping the 100 prefix), and a positive id may be a
+/// channel id without the minus sign. The channel interpretation is therefore tried as a
+/// fallback when the primary one does not resolve.
+fn peer_candidates(chat_id: i64) -> Vec<PeerId> {
+    let primary = build_peer_ref(chat_id).id;
+    let fallback = if chat_id <= -1_000_000_000_000 {
+        None
+    } else if chat_id < 0 {
+        // -<channel_id>：少写了 100 前缀 / the 100 prefix is missing
+        Some(PeerId::channel_unchecked(-chat_id))
+    } else if chat_id >= 1_000_000_000_000 {
+        None
+    } else {
+        // <channel_id>：省略负号 / the minus sign is missing
+        Some(PeerId::channel_unchecked(chat_id))
+    };
+    match fallback {
+        Some(id) if id != primary => vec![primary, id],
+        _ => vec![primary],
+    }
+}
+
+/// 目标会话的类别 / Kind of the resolved target chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatKind {
+    /// 私聊用户 / A user (private chat)
+    User,
+    /// 普通群（从未升级为超级群组）/ A basic group that was never upgraded to a supergroup
+    BasicGroup,
+    /// 超级群组（`forum` 表示是否已开启话题）/ A supergroup; `forum` reports whether Topics are on
+    Supergroup { forum: bool },
+    /// 广播频道 / A broadcast channel
+    Broadcast,
+    /// 未能向 Telegram 确认 / Telegram could not confirm the kind
+    Unknown,
+}
+
+impl ChatKind {
+    /// 供日志与错误提示使用的人类可读名称 / Human-readable name used in logs and errors.
+    fn label(self) -> &'static str {
+        match self {
+            ChatKind::User => "user",
+            ChatKind::BasicGroup => "basic group",
+            ChatKind::Supergroup { forum: true } => "supergroup, topics on",
+            ChatKind::Supergroup { forum: false } => "supergroup, topics off",
+            ChatKind::Broadcast => "broadcast channel",
+            ChatKind::Unknown => "kind unknown",
+        }
+    }
+}
+
+/// 解析后的目标会话：带真实 `access_hash` 的引用 + Telegram 返回的元数据。
+///
+/// The resolved target: a `PeerRef` carrying the real `access_hash`, plus the metadata
+/// Telegram reported for it (when the lookup succeeded).
+#[derive(Debug, Clone)]
+struct Target {
+    peer: PeerRef,
+    kind: ChatKind,
+    title: Option<String>,
+}
+
+impl Target {
+    /// 一行描述，用于日志与自检输出 / One-line description used in logs and the self-test.
+    fn describe(&self) -> String {
+        match &self.title {
+            Some(title) if !title.is_empty() => {
+                format!("{} \"{}\" ({})", self.peer.id, title, self.kind.label())
+            }
+            _ => format!("{} ({})", self.peer.id, self.kind.label()),
+        }
+    }
+
+    /// 该会话为什么无法创建论坛话题；可以创建时返回 `None`。
+    ///
+    /// 提前给出结论，避免把「普通群 / 未开启话题」拖到 Telegram 的 `CHANNEL_INVALID`。
+    ///
+    /// Why this chat cannot host forum topics (`None` when it can).
+    ///
+    /// Deciding this up-front turns a bare `CHANNEL_INVALID` into an actionable message.
+    fn topic_problem(&self, chat_id: i64) -> Option<String> {
+        match self.kind {
+            ChatKind::BasicGroup => Some(format!(
+                "chat {} is a basic group — forum topics only exist in supergroups with Topics \
+                 enabled. Open the group in Telegram → Edit → Topics → turn it on (Telegram then \
+                 upgrades the group to a supergroup and its id becomes -100…; use that new id as \
+                 the Chat ID). To post into the group without topics, turn off \"topic per model\".",
+                chat_id
+            )),
+            ChatKind::Supergroup { forum: false } => Some(format!(
+                "topics are disabled in chat {} — enable Topics in the group settings, or turn off \
+                 \"topic per model\" to post into the main chat.",
+                chat_id
+            )),
+            ChatKind::Broadcast => Some(format!(
+                "chat {} is a broadcast channel — forum topics need a supergroup, not a channel",
+                chat_id
+            )),
+            ChatKind::User => Some(format!(
+                "chat {} is a user, not a group — forum topics need a supergroup",
+                chat_id
+            )),
+            ChatKind::Supergroup { forum: true } | ChatKind::Unknown => None,
+        }
+    }
+}
+
+/// 从 `messages.Chats` 结果中取出会话对象列表 / Pull the chat list out of a `messages.Chats`.
+fn chats_of(result: tl::enums::messages::Chats) -> Vec<tl::enums::Chat> {
+    match result {
+        tl::enums::messages::Chats::Chats(c) => c.chats,
+        tl::enums::messages::Chats::Slice(c) => c.chats,
+    }
+}
+
+/// 从 TL `Chat` 对象读取类别与标题 / Read the kind and title out of a raw `Chat`.
+fn chat_kind_and_title(chat: &tl::enums::Chat) -> (ChatKind, Option<String>) {
+    match chat {
+        tl::enums::Chat::Channel(c) => (
+            if c.broadcast {
+                ChatKind::Broadcast
+            } else {
+                ChatKind::Supergroup { forum: c.forum }
+            },
+            Some(c.title.clone()),
+        ),
+        // 无法访问的会话看不到 forum 标记，按「未开启话题」处理
+        // An inaccessible channel does not expose the forum flag; treat it as "topics off"
+        tl::enums::Chat::ChannelForbidden(c) => (
+            if c.broadcast {
+                ChatKind::Broadcast
+            } else {
+                ChatKind::Supergroup { forum: false }
+            },
+            Some(c.title.clone()),
+        ),
+        tl::enums::Chat::Chat(c) => (ChatKind::BasicGroup, Some(c.title.clone())),
+        tl::enums::Chat::Forbidden(c) => (ChatKind::BasicGroup, Some(c.title.clone())),
+        tl::enums::Chat::Empty(_) => (ChatKind::Unknown, None),
+    }
+}
+
+/// 从 grammers 的 `Peer` 读取类别与标题 / Read the kind and title out of a grammers `Peer`.
+fn peer_kind_and_title(peer: &Peer) -> (ChatKind, Option<String>) {
+    match peer {
+        Peer::User(_) => (ChatKind::User, peer.name().map(str::to_string)),
+        Peer::Channel(c) => (ChatKind::Broadcast, Some(c.raw.title.clone())),
+        Peer::Group(g) => chat_kind_and_title(&g.raw),
+    }
+}
+
+/// 用 Telegram 返回的会话对象补齐 `access_hash`（只有频道/超级群组带这个值）。
+///
+/// Fill in the real `access_hash` from the chat object Telegram returned (channels only).
+fn with_real_access_hash(peer: &PeerRef, chat: &tl::enums::Chat) -> PeerRef {
+    let hash = match chat {
+        tl::enums::Chat::Channel(c) => c.access_hash,
+        tl::enums::Chat::ChannelForbidden(c) => Some(c.access_hash),
+        _ => None,
+    };
+    match hash {
+        Some(hash) => PeerRef { id: peer.id, auth: PeerAuth::from_hash(hash) },
+        None => *peer,
+    }
+}
+
+/// 把 `createForumTopic` 的原始错误翻译成可操作的提示。
+/// Turn a raw `createForumTopic` error into an actionable hint.
+fn topic_error_hint(raw: &str, chat_id: i64) -> String {
+    let upper = raw.to_uppercase();
+    let mut msg = format!("createForumTopic failed: {}", raw);
+    if upper.contains("CHANNEL_INVALID") {
+        msg.push_str(&format!(
+            "\n  hint: Telegram could not resolve chat {} as a supergroup with topics. Most often \
+             the id belongs to a basic group (topics need a supergroup), the account is no longer \
+             a member, or the account has never seen this chat. Enable Topics in the group — it \
+             then becomes a supergroup with a new -100… id — and use that id.",
+            chat_id
+        ));
+    } else if upper.contains("CHAT_ADMIN_REQUIRED") || upper.contains("RIGHT_FORBIDDEN") {
+        msg.push_str(
+            "\n  hint: the account must be a group admin with the \"Manage Topics\" permission.",
+        );
+    } else if upper.contains("CHAT_WRITE_FORBIDDEN") {
+        msg.push_str("\n  hint: the account may not post in this group (check the group permissions).");
+    }
+    msg
+}
+
+/// 在会话的对话框列表中查找指定 Peer。
+///
+/// 对话框里的会话对象带真实的 `access_hash`，用户账号与机器人账号都能用这一招；
+/// 机器人凭 `access_hash = 0` 只能解析「自己已经见过」的会话，所以私有群组常常解析失败。
+/// 最多扫描 `MAX_PAGES` 页，避免账号加入大量群组时耗时过长。
+///
+/// Look the given peer up in the session's dialog list.
+///
+/// Dialogs carry the real `access_hash`, and this works for user and bot accounts alike.
+/// A bot can only resolve chats it has already seen with `access_hash = 0`, which is why
+/// private groups often fail to resolve. At most `MAX_PAGES` pages are scanned.
+async fn find_peer_in_dialogs(client: &Client, targets: &[PeerId]) -> Result<Option<Peer>, String> {
+    const MAX_PAGES: usize = 5;
+    const PAGE: usize = 100;
+
+    let primary = targets[0];
+    let fallback = targets.get(1).copied();
+    let mut fallback_hit: Option<Peer> = None;
+
+    let mut dialogs = client.iter_dialogs();
+    let mut seen = 0usize;
+    let mut pages = 0usize;
+
+    while seen < MAX_PAGES * PAGE {
+        match dialogs.next().await {
+            Ok(Some(dialog)) => {
+                seen += 1;
+                // 主解释命中即返回；备选解释先记下，继续寻找主解释
+                // A primary match wins outright; a fallback match is remembered while the
+                // search continues for the primary one.
+                if dialog.peer_id() == primary {
+                    return Ok(Some(dialog.peer().clone()));
+                }
+                if fallback == Some(dialog.peer_id()) && fallback_hit.is_none() {
+                    fallback_hit = Some(dialog.peer().clone());
+                }
+                if seen % PAGE == 0 {
+                    pages += 1;
+                    if pages >= MAX_PAGES {
+                        break;
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return Err(format!("iter_dialogs failed: {}", e)),
+        }
+    }
+    Ok(fallback_hit)
+}
+
+/// 直接向 Telegram 查询会话对象（`channels.getChannels` / `messages.getChats`）。
+///
+/// 机器人账号可以凭 `access_hash = 0` 解析自己已经见过的会话，因此这一步经常能拿到
+/// 真实的 `access_hash` 以及 `forum`（是否开启话题）标记。
+///
+/// Ask Telegram for the chat object directly (`channels.getChannels` / `messages.getChats`).
+///
+/// A bot can resolve chats it has already seen with `access_hash = 0`, so this often yields the
+/// real `access_hash` along with the `forum` flag.
+async fn fetch_chat(client: &Client, peer: &PeerRef) -> Result<Option<tl::enums::Chat>, String> {
+    let chats = match peer.id.kind() {
+        PeerKind::Channel => chats_of(
+            client
+                .invoke(&tl::functions::channels::GetChannels { id: vec![(*peer).into()] })
+                .await
+                .map_err(|e| format!("channels.getChannels failed: {}", e))?,
+        ),
+        PeerKind::Chat => chats_of(
+            client
+                .invoke(&tl::functions::messages::GetChats { id: vec![peer.id.bare_id()] })
+                .await
+                .map_err(|e| format!("messages.getChats failed: {}", e))?,
+        ),
+        _ => return Ok(None),
+    };
+    Ok(chats.into_iter().next())
+}
+
+/// 解析目标会话：优先 username，其次数字 chat_id；尽量拿到真实 `access_hash` 与元数据。
+///
+/// 解析顺序 / Resolution order:
+/// 1. `username`（公开群组）/ `username` (public groups only)
+/// 2. 对话框列表（用户与机器人都适用）/ the dialog list (user and bot accounts alike)
+/// 3. 直接查询（机器人凭 `access_hash = 0`）/ a direct lookup (bots with `access_hash = 0`)
+///
+/// 三步都失败时返回未确认的引用，由调用方在真正出错时给出提示。
+/// When all three fail the unresolved reference is returned as-is, and the caller reports the
+/// real error when the actual request fails.
+async fn resolve_target(
+    client: &Client,
+    chat_id: i64,
+    username: &str,
+) -> Result<Target, String> {
+    if !username.is_empty() {
+        let peer = client
+            .resolve_username(username)
+            .await
+            .map_err(|e| format!("resolve_username failed: {}", e))?
+            .ok_or_else(|| format!("username @{} not found", username))?;
+        let peer_ref = peer
+            .to_ref()
+            .await
+            .ok_or_else(|| format!("@{} peer_ref unavailable", username))?;
+        let (kind, title) = peer_kind_and_title(&peer);
+        return Ok(Target { peer: peer_ref, kind, title });
+    }
+
+    let candidates = peer_candidates(chat_id);
+
+    match find_peer_in_dialogs(client, &candidates).await {
+        Ok(Some(found)) => {
+            if let Some(peer_ref) = found.to_ref().await {
+                let (kind, title) = peer_kind_and_title(&found);
+                if found.id() != candidates[0] {
+                    println!(
+                        "peer: {} resolved as {} (supergroup/channel interpretation)",
+                        chat_id, peer_ref.id
+                    );
+                }
+                return Ok(Target { peer: peer_ref, kind, title });
+            }
+        }
+        Ok(None) => eprintln!(
+            "peer: {} is not in this account's dialog list (the account must be a member of the chat)",
+            chat_id
+        ),
+        Err(e) => eprintln!("peer: dialog lookup failed ({}), asking Telegram directly", e),
+    }
+
+    for (idx, id) in candidates.iter().enumerate() {
+        let candidate = PeerRef { id: *id, auth: PeerAuth::default() };
+        match fetch_chat(client, &candidate).await {
+            Ok(Some(chat)) => {
+                let (kind, title) = chat_kind_and_title(&chat);
+                let resolved = with_real_access_hash(&candidate, &chat);
+                if idx > 0 {
+                    println!(
+                        "peer: {} resolved as {} (supergroup/channel interpretation)",
+                        chat_id, resolved.id
+                    );
+                }
+                return Ok(Target { peer: resolved, kind, title });
+            }
+            Ok(None) => {}
+            Err(e) if idx == 0 => {
+                eprintln!("peer: direct lookup failed ({}), using the id as-is", e)
+            }
+            Err(_) => {}
+        }
+    }
+
+    Ok(Target { peer: build_peer_ref(chat_id), kind: ChatKind::Unknown, title: None })
 }
 
 /// 计算字符串的 UTF-16 编码长度（Telegram 消息实体使用 UTF-16 偏移量）。
@@ -408,16 +1319,37 @@ fn build_caption(
     (text, entities)
 }
 
-/// 解析 Telegram Peer（优先通过 username 解析，其次使用数字 chat_id）。
-/// Resolve a Telegram Peer (prefers username resolution, falls back to numeric chat_id).
-async fn resolve_peer(client: &Client, chat_id: i64, username: &str) -> Result<PeerRef, String> {
-    if !username.is_empty() {
-        let peer = client.resolve_username(username).await
-            .map_err(|e| format!("resolve_username failed: {}", e))?
-            .ok_or_else(|| format!("username @{} not found", username))?;
-        return peer.to_ref().await.ok_or_else(|| format!("@{} peer_ref unavailable", username));
-    }
-    Ok(build_peer_ref(chat_id))
+/// 生成一次性的上传 `file_id`（正整数，整个上传过程保持不变）。
+///
+/// 混合纳秒时间戳与文件路径，保证不同文件、不同次上传不会撞号；全程使用
+/// wrapping 运算，避免 debug 构建下算术溢出 panic。
+///
+/// Generate a one-off upload `file_id` (a positive integer, kept for the whole upload).
+///
+/// Mixes the nanosecond timestamp with the file path so different files (and repeated
+/// uploads of the same file) never collide. Every step wraps, so a debug build cannot
+/// panic on arithmetic overflow.
+fn upload_file_id(path: &Path) -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let path_hash = {
+        // FNV-1a：稳定的路径哈希，与标准库的随机种子无关
+        // FNV-1a: a stable path hash, independent of the std hasher's random seed
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in path.as_os_str().as_encoded_bytes() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    };
+    let mixed = nanos ^ path_hash.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    // 取正数并排除 0（0 是 Telegram 的「无效 file_id」）
+    // Keep it positive and never zero (0 is Telegram's "invalid file_id")
+    let id = (mixed >> 1) as i64;
+    if id == 0 { 1 } else { id }
 }
 
 /// 上传文件到 Telegram，支持断点续传、进度上报。
@@ -457,11 +1389,7 @@ async fn upload_with_progress(
 
     let total_parts = size.div_ceil(CHUNK_SIZE) as i32;
     // 生成一次性 file_id，整个上传过程保持不变 / Generate file_id once; keep it for the entire upload
-    let file_id = {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-        (t.as_nanos() as i64) ^ (path.as_os_str().len() as i64 * 0x9e3779b97f4a7c15_u64 as i64)
-    };
+    let file_id = upload_file_id(path);
 
     let mut buf = vec![0u8; CHUNK_SIZE];
     let mut speed_bytes: usize = 0;
@@ -555,66 +1483,108 @@ async fn upload_with_progress(
     }))
 }
 
-/// 核心异步函数：建立 Telegram 连接、上传文件并发送消息。
-/// Core async function: establish Telegram connection, upload files, and send messages.
+/// 解析本次发送使用的群组话题 ID；未启用话题模式或解析失败时返回 `None`。
+/// Resolve the group topic id used for this send; returns `None` when disabled or on failure.
+///
+/// 话题解析失败（例如机器人没有管理话题权限）不会中断上传，只是退化为普通发送。
+/// A topic failure (e.g. the bot lacks the "Manage Topics" right) does not abort the upload;
+/// it simply falls back to a normal send.
+async fn resolve_topic_id(
+    client: &Client,
+    target: &Target,
+    chat_id: i64,
+    model_name: &str,
+    enabled: bool,
+    mode: SessionMode,
+) -> Option<i32> {
+    // 本次运行中话题解析已失败过（例如群组不是论坛），不再重复尝试
+    // Topic setup already failed during this run (e.g. the group is not a forum); don't retry
+    static TOPIC_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    if !enabled || TOPIC_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    if model_name.trim().is_empty() {
+        eprintln!("topic: empty model name, sending without topic");
+        return None;
+    }
+    match ensure_topic(client, target, chat_id, model_name, mode.can_list_topics()).await {
+        Ok(id) => Some(id),
+        Err(e) => {
+            eprintln!("topic setup failed, sending without topic: {}", e);
+            TOPIC_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+/// 上传单个文件后立即调用 `messages.UploadMedia` 固化到服务端，带重试。
+/// 固化后的 Media 不受上传 session TTL 限制（约 10 分钟），可安全地在之后发送。
+///
+/// Upload a file then immediately commit it via `messages.UploadMedia`, with retry.
+/// Committed Media is not subject to the ~10-minute upload session TTL.
+async fn commit_media(
+    client: &Client,
+    peer: &PeerRef,
+    raw_media: tl::enums::InputMedia,
+) -> Result<grammers_client::media::Media, String> {
+    const MAX_RETRIES: u32 = 10;
+    const DELAYS: [u64; 5] = [5, 10, 20, 40, 60];
+    let mut attempt = 0u32;
+    loop {
+        match client.invoke(&tl::functions::messages::UploadMedia {
+            business_connection_id: None,
+            peer: (*peer).into(),
+            media: raw_media.clone(),
+        }).await {
+            Ok(committed) => {
+                return grammers_client::media::Media::from_raw(committed)
+                    .ok_or_else(|| "UploadMedia returned unrecognized media type".to_string());
+            }
+            Err(e) => {
+                attempt += 1;
+                if attempt >= MAX_RETRIES {
+                    return Err(format!("UploadMedia failed after {} attempts: {}", attempt, e));
+                }
+                let delay = DELAYS[(attempt as usize - 1).min(DELAYS.len() - 1)];
+                eprintln!("UploadMedia attempt {}/{} failed: {}. retrying in {}s…",
+                    attempt, MAX_RETRIES, e, delay);
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+            }
+        }
+    }
+}
+
+/// 核心异步函数：在已建立的连接上上传文件并发送消息。
+/// Core async function: upload files and send messages on an established connection.
 ///
 /// 流程：
-/// 1. 建立 MTProto 连接并进行 Bot 登录
+/// 1. 解析目标会话
 /// 2. 转换封面图格式（若需要）
 /// 3. 转换/重封装视频格式（若需要）
 /// 4. 并行上传封面图、视频缩略图和视频文件
 /// 5. 以相册形式发送（封面图 + 视频，每批最多 10 条）
 ///
 /// Flow:
-/// 1. Establish MTProto connection and bot sign-in
+/// 1. Resolve the target peer
 /// 2. Convert cover image format if needed
 /// 3. Convert/remux video format if needed
 /// 4. Upload cover image, video thumbnails, and video files
 /// 5. Send as album (cover + videos, up to 10 per batch)
 #[allow(clippy::too_many_arguments)]
 async fn upload_and_send(
-    api_id: i32, api_hash: &str, bot_token: &str, proxy: &str,
+    client: &Client, mode: SessionMode,
     chat_id: i64, username: &str,
     model_name: &str, timestamp: &str, duration_str: &str,
     file_name: &str, file_size_str: &str,
     input: &Path, cover: Option<&Path>, send_video: bool,
-    video_parts: &[PathBuf],
+    topic_per_model: bool, video_parts: &[PathBuf],
 ) -> Result<(), String> {
     let (base_caption_text, base_caption_entities) =
         build_caption(model_name, timestamp, duration_str, file_name, file_size_str, None);
 
-    // 打开或创建 SQLite 会话文件 / Open or create SQLite session file
-    let session = Arc::new(
-        SqliteSession::open(&session_path(api_id)).await
-            .map_err(|e| format!("open session failed: {}", e))?,
-    );
-
-    let conn_params = ConnectionParams {
-        proxy_url: if proxy.is_empty() { None } else { Some(proxy.to_string()) },
-        ..Default::default()
-    };
-
-    // 创建连接池并在后台运行 / Create connection pool and run in background
-    let pool = SenderPool::with_configuration(Arc::clone(&session), api_id, conn_params);
-    let runner = pool.runner;
-    tokio::spawn(async move { runner.run().await });
-    // 配置激进的 retry policy：I/O 错误视为 5 秒 flood，flood wait 阈值提高到 5 分钟
-    // Aggressive retry policy: treat I/O errors as 5s flood, raise flood-wait threshold to 5 min
-    let client = Client::with_configuration(pool.handle, ClientConfiguration {
-        retry_policy: Box::new(AutoSleep {
-            threshold: Duration::from_secs(300),
-            io_errors_as_flood_of: Some(Duration::from_secs(5)),
-        }),
-        auto_cache_peers: true,
-    });
-
-    // Bot 登录（会话已存在时跳过）/ Bot sign-in (skipped if session already exists)
-    if !client.is_authorized().await.map_err(|e| format!("is_authorized failed: {}", e))? {
-        client.bot_sign_in(bot_token, api_hash).await
-            .map_err(|e| format!("bot_sign_in failed: {}", e))?;
-    }
-
-    let peer = resolve_peer(&client, chat_id, username).await?;
+    let target = resolve_target(client, chat_id, username).await?;
+    let peer = target.peer;
 
     // 处理封面图：非 jpg/png 格式需先用 ffmpeg 转换，然后检查尺寸限制
     // Handle cover image: non-jpg/png formats need ffmpeg conversion first, then check dimension limits
@@ -719,53 +1689,19 @@ async fn upload_and_send(
             media: grammers_client::media::Media,  // 已通过 UploadMedia 固化 / committed via UploadMedia
         }
 
-        // 上传单个文件后立即调用 messages.UploadMedia 固化到服务端，带重试。
-        // 固化后的 Media 不受上传 session TTL 限制（约 10 分钟），可安全地在之后发送。
-        //
-        // Upload a file then immediately commit it via messages.UploadMedia, with retry.
-        // Committed Media is not subject to the ~10-minute upload session TTL.
-        async fn commit_media(
-            client: &Client,
-            peer: &PeerRef,
-            raw_media: tl::enums::InputMedia,
-        ) -> Result<grammers_client::media::Media, String> {
-            const MAX_RETRIES: u32 = 10;
-            const DELAYS: [u64; 5] = [5, 10, 20, 40, 60];
-            let mut attempt = 0u32;
-            loop {
-                match client.invoke(&tl::functions::messages::UploadMedia {
-                    business_connection_id: None,
-                    peer: (*peer).into(),
-                    media: raw_media.clone(),
-                }).await {
-                    Ok(committed) => {
-                        return grammers_client::media::Media::from_raw(committed)
-                            .ok_or_else(|| "UploadMedia returned unrecognized media type".to_string());
-                    }
-                    Err(e) => {
-                        attempt += 1;
-                        if attempt >= MAX_RETRIES {
-                            return Err(format!("UploadMedia failed after {} attempts: {}", attempt, e));
-                        }
-                        let delay = DELAYS[(attempt as usize - 1).min(DELAYS.len() - 1)];
-                        eprintln!("UploadMedia attempt {}/{} failed: {}. retrying in {}s…",
-                            attempt, MAX_RETRIES, e, delay);
-                        tokio::time::sleep(Duration::from_secs(delay)).await;
-                    }
-                }
-            }
-        }
+        // 上传单个文件后立即调用 messages.UploadMedia 固化到服务端（顶层函数 `commit_media`）
+        // Committed via the top-level `commit_media` helper below
 
         // 上传封面图并立即固化 / Upload cover and commit immediately
         let committed_cover: Option<grammers_client::media::Media> = if let Some(img) = effective_cover {
-            let uploaded = upload_with_progress(&client, img, Arc::clone(&done), upload_total).await?;
+            let uploaded = upload_with_progress(client, img, Arc::clone(&done), upload_total).await?;
             let raw: tl::enums::InputMedia = tl::types::InputMediaUploadedPhoto {
                 spoiler: false,
                 file: uploaded.raw,
                 stickers: None,
                 ttl_seconds: None,
             }.into();
-            Some(commit_media(&client, &peer, raw).await?)
+            Some(commit_media(client, &peer, raw).await?)
         } else { None };
         if let Some(ref tmp) = converted_cover { let _ = fs::remove_file(tmp); }
         if let Some(ref tmp) = resized_cover { let _ = fs::remove_file(tmp); }
@@ -773,7 +1709,7 @@ async fn upload_and_send(
         // 串行上传每个视频片段及其缩略图，上传后立即固化。
         // Serial upload + immediate commit for each video part and its thumbnail.
         let do_upload_and_commit = |done: Arc<AtomicUsize>| {
-            let client = &client;
+            let client = client;
             let effective_parts = &effective_parts;
             let part_metas = &part_metas;
             let peer = &peer;
@@ -833,6 +1769,10 @@ async fn upload_and_send(
 
         let total_parts = committed_parts.len();
 
+        // 解析/创建该模特对应的群组话题；失败时退化为普通发送，不影响视频上传
+        // Resolve/create the group topic for this model; on failure fall back to a normal send
+        let topic_id = resolve_topic_id(client, &target, chat_id, model_name, topic_per_model, mode).await;
+
         // 辅助函数：从固化的 Media 重建 InputMedia 列表（用于发送重试）
         // Helper: rebuild InputMedia list from committed Media (for send retry)
         let build_items = |cover: &Option<grammers_client::media::Media>,
@@ -842,7 +1782,8 @@ async fn upload_and_send(
                 items.push(InputMedia::new().copy_media(c));
             }
             for (idx, part) in parts.iter().enumerate() {
-                let mut item = InputMedia::new().copy_media(&part.media);                if idx == total_parts - 1 {
+                let mut item = InputMedia::new().copy_media(&part.media);
+                if idx == total_parts - 1 {
                     item = item.fmt_entities(base_caption_entities.clone()).caption(base_caption_text.clone());
                 }
                 items.push(item);
@@ -869,8 +1810,17 @@ async fn upload_and_send(
                 let start = batch_idx * MAX_ALBUM;
                 let mut send_attempt = 0u32;
                 loop {
-                    let batch: Vec<InputMedia> = build_items(&committed_cover, &committed_parts)
+                    let mut batch: Vec<InputMedia> = build_items(&committed_cover, &committed_parts)
                         .into_iter().skip(start).take(MAX_ALBUM).collect();
+                    // 话题模式：每批相册都作为该话题内的消息发送（send_album 只使用首项的 reply_to）
+                    // Topic mode: every album batch is posted inside the topic
+                    // (send_album only uses the first item's reply_to)
+                    if let Some(tid) = topic_id
+                        && !batch.is_empty()
+                    {
+                        let first = batch.remove(0);
+                        batch.insert(0, first.reply_to(Some(tid)));
+                    }
                     match client.send_album(peer, batch).await {
                         Ok(_) => break,
                         Err(e) => {
@@ -881,7 +1831,10 @@ async fn upload_and_send(
                                 break 'batches;
                             }
                             send_attempt += 1;
-                            if send_attempt >= MAX_SEND { return Err(msg); }
+                            if send_attempt >= MAX_SEND {
+                                invalidate_topic_on_error(chat_id, model_name, &msg);
+                                return Err(msg);
+                            }
                             eprintln!("send failed (attempt {}/{}): {}. retrying in {:?}…",
                                 send_attempt, MAX_SEND, msg, SEND_RETRY_DELAY);
                             tokio::time::sleep(SEND_RETRY_DELAY).await;
@@ -903,9 +1856,10 @@ async fn upload_and_send(
         }
     } else if let Some(img) = effective_cover {
         // 仅发送封面图和说明文字 / Send cover image with caption only
-        let uploaded = upload_with_progress(&client, img, Arc::clone(&done), upload_total).await?;
+        let uploaded = upload_with_progress(client, img, Arc::clone(&done), upload_total).await?;
         if let Some(ref tmp) = converted_cover { let _ = fs::remove_file(tmp); }
         if let Some(ref tmp) = resized_cover { let _ = fs::remove_file(tmp); }
+        let topic_id = resolve_topic_id(client, &target, chat_id, model_name, topic_per_model, mode).await;
         const MAX_SEND: u32 = 5;
         const SEND_RETRY_DELAY: Duration = Duration::from_secs(30);
         let mut send_attempt = 0u32;
@@ -913,13 +1867,17 @@ async fn upload_and_send(
             let msg = InputMessage::new()
                 .photo(uploaded.clone())
                 .fmt_entities(base_caption_entities.clone())
+                .reply_to(topic_id)
                 .text(base_caption_text.clone());
             match client.send_message(peer, msg).await {
                 Ok(_) => break,
                 Err(e) => {
                     send_attempt += 1;
                     let err = format!("send_message (photo) failed: {}", e);
-                    if send_attempt >= MAX_SEND { return Err(err); }
+                    if send_attempt >= MAX_SEND {
+                        invalidate_topic_on_error(chat_id, model_name, &err);
+                        return Err(err);
+                    }
                     eprintln!("send failed (attempt {}/{}): {}. retrying in {:?}…",
                         send_attempt, MAX_SEND, err, SEND_RETRY_DELAY);
                     tokio::time::sleep(SEND_RETRY_DELAY).await;
@@ -929,19 +1887,24 @@ async fn upload_and_send(
     } else {
         // 无封面图：仅发送文字消息，发送失败立即重试（不重新上传）
         // No cover image: send text message only; retry send on failure without re-uploading
+        let topic_id = resolve_topic_id(client, &target, chat_id, model_name, topic_per_model, mode).await;
         const MAX_SEND: u32 = 3;
         const SEND_RETRY_DELAY: Duration = Duration::from_secs(30);
         let mut send_attempt = 0u32;
         loop {
             let msg = InputMessage::new()
                 .fmt_entities(base_caption_entities.clone())
+                .reply_to(topic_id)
                 .text(base_caption_text.clone());
             match client.send_message(peer, msg).await {
                 Ok(_) => break,
                 Err(e) => {
                     send_attempt += 1;
                     let err = format!("send_message (text) failed: {}", e);
-                    if send_attempt >= MAX_SEND { return Err(err); }
+                    if send_attempt >= MAX_SEND {
+                        invalidate_topic_on_error(chat_id, model_name, &err);
+                        return Err(err);
+                    }
                     eprintln!("send failed (attempt {}/{}): {}. retrying in {:?}…",
                         send_attempt, MAX_SEND, err, SEND_RETRY_DELAY);
                     tokio::time::sleep(SEND_RETRY_DELAY).await;
@@ -953,6 +1916,521 @@ async fn upload_and_send(
     Ok(())
 }
 
+// ─── 参数与自检模式 / Parameters and self-test mode ──────────────────────────
+
+/// 模块参数集合 / Module parameter set.
+struct TgConfig {
+    api_id: i32,
+    api_hash: String,
+    bot_token: String,
+    chat_id: i64,
+    proxy: String,
+    username: String,
+    send_video: bool,
+    topic_per_model: bool,
+    /// 登录方式（机器人 / 用户账号）/ Login mode (bot / user account)
+    mode: SessionMode,
+}
+
+/// 规范化 Chat ID：去掉首尾空格后必须是数字。
+///
+/// 超级群组形如 `-100xxxxxxxxxx`；普通群是负数（最多 12 位）；用户是正数。
+///
+/// Normalize the Chat ID: trim it and require a number.
+///
+/// Supergroups look like `-100xxxxxxxxxx`, basic groups are negative (up to 12 digits) and
+/// users are positive.
+fn normalize_chat_id(raw: &str) -> Result<i64, String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err("chat_id is required".to_string());
+    }
+    s.parse().map_err(|_| {
+        "chat_id must be a number (a supergroup id looks like -100xxxxxxxxxx)".to_string()
+    })
+}
+
+/// 规范化 Username：去掉首尾空格与用户习惯输入的 `@`。
+/// Normalize the username: trim it and drop the leading `@` people copy along with it.
+fn normalize_username(raw: &str) -> String {
+    raw.trim().trim_start_matches('@').to_string()
+}
+
+/// 读取并验证所有模块参数（正常模式与自检模式共用）。
+/// Read and validate all module parameters (shared by normal and self-test mode).
+fn read_config() -> Result<TgConfig, String> {
+    let api_id: i32 = {
+        let s = param("api_id", "");
+        if s.is_empty() { return Err("api_id is required".to_string()); }
+        s.parse().map_err(|_| "api_id must be a number".to_string())?
+    };
+    let api_hash  = param("api_hash", "");
+    // 已登录的用户会话不需要 api_hash / A signed-in user session needs no api_hash
+    let mode = SessionMode::from_param(&param("account", "auto")).resolve(api_id);
+    let bot_token = param("bot_token", "");
+    if mode == SessionMode::Bot {
+        // 先报「没有任何可用账号」——这是最常见的配置错误，api_hash 只是它的附带项
+        // Report "no usable account" first: it is the usual mistake, and api_hash is secondary
+        if bot_token.is_empty() {
+            return Err(format!(
+                "no Telegram account to post with: api_id {} has no signed-in user session, and \
+                 no bot_token either — click \"Login\" to sign in with your Telegram account, or \
+                 fill in the Bot Token (plus the API Hash)",
+                api_id
+            ));
+        }
+        if api_hash.is_empty() {
+            return Err("api_hash is required for a bot account".to_string());
+        }
+    }
+    let chat_id: i64 = normalize_chat_id(&param("chat_id", ""))?;
+    Ok(TgConfig {
+        api_id,
+        api_hash,
+        bot_token,
+        chat_id,
+        proxy: param("proxy", ""),
+        username: normalize_username(&param("username", "")),
+        send_video: param_bool("send_video", true),
+        // 是否把每个模特的视频发送到该模特专属的群组话题中
+        // Whether to send each model's video into a group forum topic dedicated to that model
+        topic_per_model: param_bool("topic_per_model", true),
+        mode,
+    })
+}
+
+/// Telegram 单文件上传上限：普通账号 2GB，高级会员 4GB。
+/// Maximum single-file upload size: 2GB normally, 4GB for premium accounts.
+const TG_MAX_BYTES_STD: u64 = 2 * 1024 * 1024 * 1024;
+const TG_MAX_BYTES_PREMIUM: u64 = 4 * 1024 * 1024 * 1024;
+
+/// 查询当前账号允许的单文件上传大小。
+///
+/// 机器人账号与普通用户账号为 2GB；用户账号若是 Telegram 高级会员（Premium），
+/// 单文件上限提升到 4GB。
+///
+/// Query the single-file upload size allowed for the signed-in account.
+///
+/// Bot accounts and regular user accounts are limited to 2GB; a premium user account
+/// may upload files up to 4GB without splitting.
+async fn upload_limit_bytes(client: &Client, mode: SessionMode) -> u64 {
+    if mode != SessionMode::User {
+        return TG_MAX_BYTES_STD;
+    }
+    match client.get_me().await {
+        Ok(me) if me.is_premium() => {
+            println!("account: premium user detected, single-file limit raised to 4GB");
+            TG_MAX_BYTES_PREMIUM
+        }
+        Ok(_) => TG_MAX_BYTES_STD,
+        Err(e) => {
+            eprintln!("account: could not query account info ({}), assuming 2GB limit", e);
+            TG_MAX_BYTES_STD
+        }
+    }
+}
+
+/// 自检模式下使用的话题名称（固定名称，重复测试复用同一话题，不会重复创建）。
+/// Topic title used in self-test mode (fixed so repeated tests reuse the same topic).
+const TEST_TOPIC_NAME: &str = "Test";
+
+/// 生成一个 3 秒的测试视频（含音轨），用于验证完整上传链路。
+/// Generate a 3-second test clip (with audio) to verify the whole upload path.
+fn make_test_clip() -> Result<PathBuf, String> {
+    let out = tmp_dir().join("telegram_selftest.mp4");
+
+    // 优先 H.264（Telegram 客户端兼容性最好），失败则回退 mpeg4
+    // Prefer H.264 (best Telegram client compatibility), fall back to mpeg4
+    let codecs: [&[&str]; 2] = [
+        &["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac"],
+        &["-c:v", "mpeg4", "-pix_fmt", "yuv420p", "-c:a", "aac"],
+    ];
+
+    for codec_args in codecs {
+        let _ = fs::remove_file(&out);
+        let status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f", "lavfi", "-i", "testsrc=duration=3:size=640x360:rate=15",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+            ])
+            .args(codec_args)
+            .args(["-shortest", "-movflags", "+faststart"])
+            .arg(&out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| format!("ffmpeg not found: {}", e))?;
+
+        let ok = status.success()
+            && fs::metadata(&out).map(|m| m.len() > 0).unwrap_or(false);
+        if ok {
+            return Ok(out);
+        }
+    }
+    Err("ffmpeg failed to generate the test clip".to_string())
+}
+
+/// 自检主流程：连接 → 解析目标会话 → 解析/创建话题 → 上传并发送测试视频（或文字）。
+/// 任一步骤失败都会返回错误，便于在界面上定位问题。
+///
+/// Self-test flow: connect → resolve target chat → resolve/create topic →
+/// upload and send the test clip (or a text message).
+/// Any failing step returns an error so the problem is visible in the UI.
+async fn self_test(cfg: &TgConfig) -> Result<(), String> {
+    println!(
+        "[1/5] connecting to Telegram as {} ({})…",
+        cfg.mode.label(),
+        session_path(cfg.api_id, cfg.mode).display()
+    );
+
+    let client = connect_client(
+        cfg.api_id,
+        &cfg.api_hash,
+        &cfg.bot_token,
+        &cfg.proxy,
+        cfg.mode,
+    )
+    .await?;
+    println!("      connected");
+
+    let target = resolve_target(&client, cfg.chat_id, &cfg.username).await?;
+    // 打印 Telegram 眼中的这个会话：群还是频道、是否已开启话题
+    // Show what Telegram thinks this chat is: group vs channel, topics on or off
+    println!("[2/5] target chat resolved: {}", target.describe());
+    let peer = target.peer;
+
+    // 话题失败在自检中视为失败（正常发送时会退化为普通消息，但自检需要暴露问题）
+    // A topic failure is fatal in the self-test (normal runs fall back to a plain message,
+    // but the self-test must surface the problem)
+    let topic_id = if cfg.topic_per_model {
+        println!("[3/5] resolving topic \"{}\"…", TEST_TOPIC_NAME);
+        if !cfg.mode.can_list_topics() {
+            println!(
+                "      note: bot accounts cannot list forum topics (BOT_METHOD_INVALID), \
+                 so only the local topic cache is used"
+            );
+        }
+        let id = ensure_topic(
+            &client,
+            &target,
+            cfg.chat_id,
+            TEST_TOPIC_NAME,
+            cfg.mode.can_list_topics(),
+        )
+        .await
+        .map_err(|e| format!("topic setup failed: {}", e))?;
+        println!("      topic ready (id {})", id);
+        Some(id)
+    } else {
+        println!("[3/5] topic mode is off, sending to the main chat");
+        None
+    };
+
+    let caption = format!(
+        "🧪 Test message from StripchatRecorder\n\n\
+         If you can read this, the {} can post to this chat{}.\n\
+         Mode: {}",
+        if cfg.mode == SessionMode::User { "account" } else { "bot" },
+        if topic_id.is_some() { " and create/reuse forum topics" } else { "" },
+        if cfg.send_video { "text + video upload" } else { "text only (send_video is off)" },
+    );
+
+    if cfg.send_video {
+        println!("[4/5] generating a 3-second test clip…");
+        let clip = make_test_clip()?;
+        let size = fs::metadata(&clip).map(|m| m.len() as usize).unwrap_or(0);
+        let (duration, w, h) = video_meta(&clip).unwrap_or((3.0, 640, 360));
+        let thumb_path = extract_video_thumbnail(&clip).ok();
+        let thumb_size = thumb_path
+            .as_ref()
+            .and_then(|p| fs::metadata(p).ok())
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+
+        let total = size + thumb_size;
+        let done = Arc::new(AtomicUsize::new(0));
+
+        println!("[5/5] uploading {} ({})…", clip.display(), format_bytes(size as u64));
+        let thumb_uploaded = match thumb_path.as_ref() {
+            Some(tp) => Some(upload_with_progress(&client, tp, Arc::clone(&done), total).await?),
+            None => None,
+        };
+        let video_uploaded =
+            upload_with_progress(&client, &clip, Arc::clone(&done), total).await?;
+
+        println!("      upload finished, committing media…");
+        let raw_media: tl::enums::InputMedia = tl::types::InputMediaUploadedDocument {
+            nosound_video: false,
+            force_file: false,
+            spoiler: false,
+            file: video_uploaded.raw,
+            thumb: thumb_uploaded.map(|t| t.raw),
+            mime_type: "video/mp4".to_string(),
+            attributes: vec![
+                tl::types::DocumentAttributeFilename {
+                    file_name: clip.file_name().unwrap().to_string_lossy().to_string(),
+                }.into(),
+                tl::types::DocumentAttributeVideo {
+                    round_message: false,
+                    supports_streaming: true,
+                    nosound: false,
+                    duration,
+                    w,
+                    h,
+                    preload_prefix_size: None,
+                    video_start_ts: None,
+                    video_codec: None,
+                }.into(),
+            ],
+            stickers: None,
+            ttl_seconds: None,
+            video_cover: None,
+            video_timestamp: None,
+        }.into();
+
+        let committed = commit_media(&client, &peer, raw_media).await?;
+
+        let mut item = InputMedia::new().copy_media(&committed).caption(caption);
+        if let Some(tid) = topic_id {
+            item = item.reply_to(Some(tid));
+        }
+        client.send_album(peer, vec![item]).await
+            .map_err(|e| format!("send_album failed: {}", e))?;
+        println!("      test video sent");
+
+        let _ = fs::remove_file(&clip);
+        if let Some(tp) = thumb_path { let _ = fs::remove_file(tp); }
+    } else {
+        println!("[4/5] video upload is off, sending a text message…");
+        let msg = InputMessage::new().reply_to(topic_id).text(caption);
+        client.send_message(peer, msg).await
+            .map_err(|e| format!("send_message failed: {}", e))?;
+        println!("      test message sent");
+    }
+
+    Ok(())
+}
+
+/// 自检模式入口（`PP_TEST=1`）：不需要 `PP_INPUT`，只验证凭据、话题和上传链路。
+/// Self-test entry point (`PP_TEST=1`): no `PP_INPUT`; verifies credentials, topic and upload path.
+fn run_test() -> Result<(), String> {
+    let cfg = read_config()?;
+
+    let result = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime error: {}", e))?
+        .block_on(self_test(&cfg));
+
+    // 无论成功与否都清理生成的测试文件（失败时也不会残留）
+    // Clean up the generated test files either way (nothing is left behind on failure)
+    let _ = fs::remove_file(tmp_dir().join("telegram_selftest.mp4"));
+    let _ = fs::remove_file(tmp_dir().join("telegram_selftest.tg_thumb.png"));
+
+    result?;
+    println!("SELF-TEST PASSED");
+    Ok(())
+}
+
+/// 登录行协议的状态前缀 / Prefix used by login state lines.
+const LOGIN_STATE_PREFIX: &str = "LOGIN_STATE:";
+
+/// 向标准输出打印一条登录状态（立即刷新，宿主机按行读取）。
+/// Print one login state line to stdout (flushed immediately; the host reads lines).
+fn login_state(state: &str) {
+    use std::io::Write;
+    println!("{}{}", LOGIN_STATE_PREFIX, state);
+    let _ = std::io::stdout().flush();
+}
+
+/// 登录模式使用的 stdin 行读取器（整个登录过程复用同一个缓冲区）。
+/// Line reader used by login mode (the same buffer is reused for the whole login).
+type LoginStdin = tokio::io::Lines<tokio::io::BufReader<tokio::io::Stdin>>;
+
+/// 创建登录模式的 stdin 行读取器。
+/// Create the line reader used by login mode.
+fn login_stdin() -> LoginStdin {
+    use tokio::io::AsyncBufReadExt;
+    tokio::io::BufReader::new(tokio::io::stdin()).lines()
+}
+
+/// 从 stdin 读取一行命令（`命令:值`），去掉首尾空白；EOF 返回 `None`。
+///
+/// 必须复用同一个读取器：每次新建 `BufReader` 会丢弃已经缓冲的后续行。
+///
+/// Read one command line from stdin (`command:value`), trimmed; `None` on EOF.
+///
+/// The same reader must be reused: creating a new `BufReader` each time would discard
+/// lines that are already buffered.
+async fn read_login_command(lines: &mut LoginStdin) -> Option<String> {
+    match lines.next_line().await {
+        Ok(Some(line)) => Some(line.trim().to_string()),
+        _ => None,
+    }
+}
+
+/// 把用户信息格式化为 `名称:是否高级会员`。
+/// Format a signed-in user as `name:premium`.
+fn login_user_summary(user: &grammers_client::peer::User) -> String {
+    let name = match user.username() {
+        Some(u) => format!("@{}", u),
+        None => {
+            let full = user.full_name();
+            if full.trim().is_empty() {
+                user.id().bare_id().to_string()
+            } else {
+                full
+            }
+        }
+    };
+    format!("{}:{}", name, if user.is_premium() { "premium" } else { "standard" })
+}
+
+/// 交互式登录：通过 stdin/stdout 行协议完成「手机号 → 验证码 →（两步验证密码）」，
+/// 成功后把授权写入用户会话文件 `{api_id}_user.db`，之后 `account=user` 即可直接使用。
+///
+/// Interactive login: drives "phone → code → (2FA password)" over a line protocol on
+/// stdin/stdout and stores the authorization in the user session file `{api_id}_user.db`,
+/// which `account=user` then reuses.
+///
+/// 协议见文件头注释 / See the module documentation for the protocol.
+async fn login_flow() -> Result<(), String> {
+    let api_id: i32 = {
+        let s = param("api_id", "");
+        if s.is_empty() { return Err("api_id is required".to_string()); }
+        s.parse().map_err(|_| "api_id must be a number".to_string())?
+    };
+    let api_hash = param("api_hash", "");
+    if api_hash.is_empty() { return Err("api_hash is required".to_string()); }
+    let proxy = param("proxy", "");
+    let mode = SessionMode::User;
+    let path = session_path(api_id, mode);
+
+    // 已存在的用户会话直接复用，无需再次登录
+    // Reuse an existing user session instead of signing in again
+    let client = open_client(api_id, &proxy, mode).await?;
+    login_state(&format!("session:{}", path.display()));
+
+    if client
+        .is_authorized()
+        .await
+        .map_err(|e| format!("is_authorized failed: {}", e))?
+    {
+        let me = client
+            .get_me()
+            .await
+            .map_err(|e| format!("get_me failed: {}", e))?;
+        login_state(&format!("already:{}", login_user_summary(&me)));
+        return Ok(());
+    }
+
+    login_state("ready");
+
+    // 整个登录过程复用同一个 stdin 读取器 / One stdin reader is reused for the whole login
+    let mut stdin = login_stdin();
+
+    // 第一步：等待手机号 / Step 1: wait for the phone number
+    let phone = loop {
+        let Some(cmd) = read_login_command(&mut stdin).await else {
+            return Err("stdin closed before a phone number was provided".to_string());
+        };
+        if let Some(v) = cmd.strip_prefix("phone:") {
+            let v = v.trim().to_string();
+            if v.is_empty() {
+                login_state("error:phone number is empty");
+                continue;
+            }
+            break v;
+        }
+        if cmd == "quit" {
+            login_state("cancelled");
+            return Ok(());
+        }
+    };
+
+    let token = match client.request_login_code(&phone, &api_hash).await {
+        Ok(t) => t,
+        Err(e) => {
+            login_state(&format!("error:{}", e));
+            return Err(format!("request_login_code failed: {}", e));
+        }
+    };
+    login_state("code_sent");
+
+    // 第二步：等待验证码（输入错误可以重新输入）/ Step 2: wait for the code (retryable)
+    let mut password_token: Option<grammers_client::client::PasswordToken> = None;
+    loop {
+        let Some(cmd) = read_login_command(&mut stdin).await else {
+            return Err("stdin closed before the login code was provided".to_string());
+        };
+        if cmd == "quit" {
+            login_state("cancelled");
+            return Ok(());
+        }
+
+        // 两步验证密码 / Two-factor authentication password
+        if let Some(pw) = cmd.strip_prefix("password:") {
+            let Some(token) = password_token.take() else {
+                login_state("error:no password was requested");
+                continue;
+            };
+            match client.check_password(token, pw.trim()).await {
+                Ok(user) => {
+                    login_state(&format!("done:{}", login_user_summary(&user)));
+                    return Ok(());
+                }
+                Err(grammers_client::SignInError::InvalidPassword(new_token)) => {
+                    password_token = Some(new_token);
+                    login_state("invalid_password");
+                }
+                Err(e) => {
+                    login_state(&format!("error:{}", e));
+                    return Err(format!("check_password failed: {}", e));
+                }
+            }
+            continue;
+        }
+
+        let Some(code) = cmd.strip_prefix("code:") else {
+            continue;
+        };
+
+        match client.sign_in(&token, code.trim()).await {
+            Ok(user) => {
+                login_state(&format!("done:{}", login_user_summary(&user)));
+                return Ok(());
+            }
+            Err(grammers_client::SignInError::PasswordRequired(tok)) => {
+                let hint = tok.hint().unwrap_or("").to_string();
+                password_token = Some(tok);
+                login_state(&format!("password_required:{}", hint));
+            }
+            Err(grammers_client::SignInError::InvalidCode) => login_state("invalid_code"),
+            Err(grammers_client::SignInError::SignUpRequired) => {
+                login_state(
+                    "error:this phone number has no Telegram account — sign up in an official app first",
+                );
+                return Err("sign up with an official client is required".to_string());
+            }
+            Err(e) => {
+                login_state(&format!("error:{}", e));
+                return Err(format!("sign_in failed: {}", e));
+            }
+        }
+    }
+}
+
+/// 登录模式入口（`--login`）：交互式生成用户会话文件，不需要输入视频。
+/// Login entry point (`--login`): interactively create the user session file (no input video).
+fn run_login() -> Result<(), String> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime error: {}", e))?
+        .block_on(login_flow())
+}
+
 /// 模块主逻辑：读取参数、准备文件、带重试的上传发送。
 /// Main module logic: read parameters, prepare files, upload and send with retries.
 fn run() -> Result<(), String> {
@@ -961,23 +2439,18 @@ fn run() -> Result<(), String> {
     if !input.exists() { return Err(format!("Input file not found: {}", input.display())); }
 
     // 读取并验证必填参数 / Read and validate required parameters
-    let api_id: i32 = {
-        let s = param("api_id", "");
-        if s.is_empty() { return Err("api_id is required".to_string()); }
-        s.parse().map_err(|_| "api_id must be a number".to_string())?
-    };
-    let api_hash  = param("api_hash", "");
-    if api_hash.is_empty()  { return Err("api_hash is required".to_string()); }
-    let bot_token = param("bot_token", "");
-    if bot_token.is_empty() { return Err("bot_token is required".to_string()); }
-    let chat_id: i64 = {
-        let s = param("chat_id", "");
-        if s.is_empty() { return Err("chat_id is required".to_string()); }
-        s.parse().map_err(|_| "chat_id must be a number".to_string())?
-    };
-    let proxy      = param("proxy", "");
-    let username   = param("username", "");
-    let send_video = param_bool("send_video", true);
+    let TgConfig {
+        api_id,
+        api_hash,
+        bot_token,
+        chat_id,
+        proxy,
+        username,
+        send_video,
+        topic_per_model,
+        mode,
+    } = read_config()?;
+
 
     // 从文件名解析元数据 / Parse metadata from filename
     let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("recording");
@@ -991,42 +2464,49 @@ fn run() -> Result<(), String> {
 
     let cover = find_cover(&input);
 
-    // Telegram 单文件大小限制为 2GB
-    // Telegram single file size limit is 2GB
-    const TG_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-    let video_parts: Vec<PathBuf> = if send_video { split_video(&input, TG_MAX_BYTES)? } else { vec![input.clone()] };
-    let is_split = video_parts.len() > 1 || video_parts.first().map(|p| p != &input).unwrap_or(false);
-
-    // 构建 Tokio 运行时并执行异步上传，最多重试 3 次
-    // Build Tokio runtime and execute async upload with up to 3 retries
-    tokio::runtime::Builder::new_multi_thread()
+    // 构建 Tokio 运行时，先连接（同时确定单文件上限），再上传发送
+    // Build the Tokio runtime, connect (which also determines the per-file limit), then upload
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|e| format!("tokio runtime error: {}", e))?
-        .block_on(async {
-            const MAX_OUTER: u32 = 3;
-            const RECONNECT_DELAY: Duration = Duration::from_secs(30);
-            let mut attempt = 0u32;
-            loop {
-                let result = upload_and_send(
-                    api_id, &api_hash, &bot_token, &proxy, chat_id, &username,
-                    &model_name, &ts_str, &dur_str, &name_str, &size_str,
-                    &input, cover.as_deref(), send_video, &video_parts,
-                ).await;
-                match result {
-                    Ok(()) => break Ok(()),
-                    Err(e) => {
-                        attempt += 1;
-                        if attempt >= MAX_OUTER { break Err(e); }
-                        eprintln!(
-                            "connection failed (attempt {}/{}): {}. rebuilding connection in {:?}…",
-                            attempt, MAX_OUTER, e, RECONNECT_DELAY
-                        );
-                        tokio::time::sleep(RECONNECT_DELAY).await;
-                    }
+        .map_err(|e| format!("tokio runtime error: {}", e))?;
+
+    let (client, max_bytes) = runtime.block_on(async {
+        let client = connect_client(api_id, &api_hash, &bot_token, &proxy, mode).await?;
+        let limit = upload_limit_bytes(&client, mode).await;
+        Ok::<_, String>((client, limit))
+    })?;
+
+    // 超过单文件上限时自动分割（普通账号 2GB，高级会员 4GB）
+    // Split automatically when a file exceeds the limit (2GB, or 4GB for premium accounts)
+    let video_parts: Vec<PathBuf> = if send_video { split_video(&input, max_bytes)? } else { vec![input.clone()] };
+    let is_split = video_parts.len() > 1 || video_parts.first().map(|p| p != &input).unwrap_or(false);
+
+    // 执行异步上传，最多重试 3 次 / Execute the async upload with up to 3 retries
+    runtime.block_on(async {
+        const MAX_OUTER: u32 = 3;
+        const RECONNECT_DELAY: Duration = Duration::from_secs(30);
+        let mut attempt = 0u32;
+        loop {
+            let result = upload_and_send(
+                &client, mode, chat_id, &username,
+                &model_name, &ts_str, &dur_str, &name_str, &size_str,
+                &input, cover.as_deref(), send_video, topic_per_model, &video_parts,
+            ).await;
+            match result {
+                Ok(()) => break Ok(()),
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= MAX_OUTER { break Err(e); }
+                    eprintln!(
+                        "upload failed (attempt {}/{}): {}. retrying in {:?}…",
+                        attempt, MAX_OUTER, e, RECONNECT_DELAY
+                    );
+                    tokio::time::sleep(RECONNECT_DELAY).await;
                 }
             }
-        })?;
+        }
+    })?;
 
     // 清理分割产生的临时片段文件 / Clean up temporary segment files from splitting
     if is_split {
@@ -1039,18 +2519,242 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-/// 程序入口：处理 `--describe` 参数或执行主逻辑。
-/// Entry point: handle `--describe` argument or execute main logic.
+/// 程序入口：处理 `--describe` / `--login` 参数或执行主逻辑。
+/// Entry point: handle the `--describe` / `--login` argument or run the main logic.
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.get(1).map(|s| s.as_str()) == Some("--describe") {
+    let arg1 = args.get(1).map(|s| s.as_str());
+    if arg1 == Some("--describe") {
         print!("{}", DESCRIBE);
         return;
     }
     // 确保临时目录存在 / Ensure temp directory exists
     tmp_dir();
-    if let Err(e) = run() {
+
+    // 登录模式（--login）：由主程序的「登录」按钮驱动，交互式生成用户会话文件
+    // Login mode (--login): driven by the host's "Login" button, creates the user session file
+    if arg1 == Some("--login") {
+        if let Err(e) = run_login() {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // 自检模式（PP_TEST=1）：由主程序「测试」按钮触发，不需要输入视频
+    // Self-test mode (PP_TEST=1): triggered by the host's "Test" button, no input video needed
+    let is_test = matches!(
+        env::var("PP_TEST").unwrap_or_default().to_lowercase().as_str(),
+        "1" | "true" | "yes"
+    );
+
+    let result = if is_test { run_test() } else { run() };
+    if let Err(e) = result {
         eprintln!("{}", e);
         std::process::exit(1);
+    }
+}
+
+// ─── 单元测试 / Unit tests ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_id_and_username_are_normalised() {
+        // 从 Telegram 客户端复制出来的值常带空格和 @
+        // Values copied out of Telegram clients often carry spaces and a leading @
+        assert_eq!(normalize_chat_id(" -1002795956983 ").unwrap(), -1_002_795_956_983);
+        assert_eq!(normalize_chat_id("-1002795956983").unwrap(), -1_002_795_956_983);
+        assert!(normalize_chat_id("   ").is_err());
+        assert!(normalize_chat_id("mygroup").is_err());
+        assert_eq!(normalize_username(" @mygroup "), "mygroup");
+        assert_eq!(normalize_username("mygroup"), "mygroup");
+        assert_eq!(normalize_username(""), "");
+    }
+
+    #[test]
+    fn session_mode_parsing() {
+        assert_eq!(SessionMode::from_param("user"), SessionMode::User);
+        assert_eq!(SessionMode::from_param(" USER "), SessionMode::User);
+        assert_eq!(SessionMode::from_param("bot"), SessionMode::Bot);
+        // 未填写或写错时按 auto 处理：已登录的真实账号优先
+        // Empty or unknown values mean "auto": the signed-in real account wins
+        assert_eq!(SessionMode::from_param(""), SessionMode::Auto);
+        assert_eq!(SessionMode::from_param("auto"), SessionMode::Auto);
+        assert_eq!(SessionMode::from_param("anything"), SessionMode::Auto);
+    }
+
+    #[test]
+    fn auto_prefers_the_signed_in_user_session() {
+        // 已经登录过的 api_id：auto 必须选真实账号，而不是机器人
+        // For an api_id that has been logged in, auto must pick the real account, not the bot
+        let signed_in = 1_357_592;
+        if session_path(signed_in, SessionMode::User).exists() {
+            assert_eq!(SessionMode::Auto.resolve(signed_in), SessionMode::User);
+        }
+        // 显式选择不会被 auto 覆盖 / An explicit choice is never overridden
+        assert_eq!(SessionMode::User.resolve(0), SessionMode::User);
+        assert_eq!(SessionMode::Bot.resolve(signed_in), SessionMode::Bot);
+        // 没有用户会话时回退到机器人 / No user session falls back to the bot
+        assert_eq!(SessionMode::Auto.resolve(0), SessionMode::Bot);
+    }
+
+    #[test]
+    fn only_user_sessions_may_list_topics() {
+        assert!(SessionMode::User.can_list_topics());
+        assert!(SessionMode::Auto.can_list_topics());
+        // 机器人调用 messages.getForumTopics 会返回 BOT_METHOD_INVALID
+        // Bots get BOT_METHOD_INVALID from messages.getForumTopics
+        assert!(!SessionMode::Bot.can_list_topics());
+    }
+
+    #[test]
+    fn upload_file_ids_are_positive_and_unique() {
+        // 旧实现在 debug 构建下会因 i64 乘法溢出而 panic
+        // The old implementation panicked on i64 multiplication overflow in debug builds
+        let a = upload_file_id(Path::new("/tmp/telegram_selftest.mp4"));
+        let b = upload_file_id(Path::new("/tmp/telegram_selftest.mp4"));
+        let c = upload_file_id(Path::new("/tmp/another_recording.mp4"));
+        assert!(a > 0, "file_id must be positive, got {}", a);
+        assert!(b > 0 && c > 0);
+        assert_ne!(a, b, "two uploads must not share a file_id");
+        assert_ne!(a, c, "different paths must not share a file_id");
+    }
+
+    #[test]
+    fn session_files_are_separate_per_mode() {
+        let bot = session_path(4242, SessionMode::Bot);
+        let user = session_path(4242, SessionMode::User);
+        assert_ne!(bot, user);
+        assert!(bot.to_string_lossy().ends_with("4242.db"));
+        assert!(user.to_string_lossy().ends_with("4242_user.db"));
+    }
+
+    #[test]
+    fn topic_title_is_trimmed_and_truncated() {
+        assert_eq!(topic_title("  alice  "), "alice");
+        assert_eq!(topic_title("   "), "unknown");
+        let long = "x".repeat(MAX_TOPIC_TITLE_LEN + 50);
+        assert_eq!(topic_title(&long).chars().count(), MAX_TOPIC_TITLE_LEN);
+    }
+
+    #[test]
+    fn topic_model_key_is_case_insensitive() {
+        assert_eq!(topic_model_key(" Alice "), "alice");
+        assert_eq!(topic_model_key("ALICE"), topic_model_key("alice"));
+    }
+
+    #[test]
+    fn basic_group_ids_are_chats_not_channels() {
+        // -123456789 是普通群，话题只存在于超级群组里
+        // -123456789 is a basic group; topics only exist in supergroups
+        let group = build_peer_ref(-123_456_789);
+        assert_eq!(group.id.kind(), grammers_session::types::PeerKind::Chat);
+        let target = Target { peer: group, kind: ChatKind::BasicGroup, title: None };
+        let problem = target.topic_problem(-123_456_789).expect("basic groups cannot host topics");
+        assert!(problem.contains("basic group"));
+        assert!(problem.contains("Topics"));
+    }
+
+    #[test]
+    fn topics_depend_on_the_forum_flag() {
+        let peer = build_peer_ref(-1_002_795_956_983);
+        let on = Target {
+            peer,
+            kind: ChatKind::Supergroup { forum: true },
+            title: Some("Group".to_string()),
+        };
+        assert_eq!(on.topic_problem(-1_002_795_956_983), None);
+
+        let off = Target { kind: ChatKind::Supergroup { forum: false }, ..on.clone() };
+        let problem = off.topic_problem(-1_002_795_956_983).expect("topics are off");
+        assert!(problem.contains("topics are disabled"));
+
+        let broadcast = Target { kind: ChatKind::Broadcast, ..on.clone() };
+        assert!(broadcast.topic_problem(-1_002_795_956_983).unwrap().contains("broadcast channel"));
+    }
+
+    #[test]
+    fn target_description_shows_id_title_and_kind() {
+        let target = Target {
+            peer: build_peer_ref(-1_002_795_956_983),
+            kind: ChatKind::Supergroup { forum: true },
+            title: Some("My Group".to_string()),
+        };
+        let text = target.describe();
+        assert!(text.contains("-1002795956983"), "{}", text);
+        assert!(text.contains("My Group"), "{}", text);
+        assert!(text.contains("topics on"), "{}", text);
+    }
+
+    #[test]
+    fn channel_invalid_errors_get_an_actionable_hint() {
+        // 用户遇到的就是这个错误：CHANNEL_INVALID 本身看不出问题在哪
+        // This is the error the user hit: CHANNEL_INVALID alone says nothing useful
+        let msg = topic_error_hint(
+            "request error: rpc error 400: CHANNEL_INVALID caused by messages.createForumTopic",
+            -1_002_795_956_983,
+        );
+        assert!(msg.starts_with("createForumTopic failed:"));
+        assert!(msg.contains("-1002795956983"), "{}", msg);
+        assert!(msg.contains("supergroup"), "{}", msg);
+
+        let admin = topic_error_hint("rpc error 400: CHAT_ADMIN_REQUIRED", -1);
+        assert!(admin.contains("Manage Topics"), "{}", admin);
+    }
+
+    #[test]
+    fn ten_digit_basic_group_ids_are_groups_not_channels() {
+        // 普通群 ID 已经到 10 位（-1234567890）。旧实现把它当成频道 234567890，
+        // 于是 createForumTopic 返回 CHANNEL_INVALID。
+        // Basic-group ids already reach 10 digits (-1234567890). The old mapping treated it as
+        // channel 234567890, which made createForumTopic fail with CHANNEL_INVALID.
+        let group = build_peer_ref(-1_234_567_890);
+        assert_eq!(group.id.kind(), grammers_session::types::PeerKind::Chat);
+        assert_eq!(group.id, grammers_session::types::PeerId::chat_unchecked(1_234_567_890));
+    }
+
+    #[test]
+    fn a_channel_interpretation_is_offered_as_fallback() {
+        // -<channel_id> 与 <channel_id> 这两种少写 100 前缀的写法要有备选解释
+        // Both "missing 100 prefix" spellings need a channel fallback
+        let from_negative = peer_candidates(-2_795_956_983);
+        assert_eq!(from_negative.len(), 2);
+        assert_eq!(from_negative[0].kind(), grammers_session::types::PeerKind::Chat);
+        assert_eq!(from_negative[1].kind(), grammers_session::types::PeerKind::Channel);
+
+        let from_positive = peer_candidates(2_795_956_983);
+        assert_eq!(from_positive.len(), 2);
+        assert_eq!(from_positive[0].kind(), grammers_session::types::PeerKind::User);
+        assert_eq!(from_positive[1].kind(), grammers_session::types::PeerKind::Channel);
+
+        // 已经是 -100… / 100… 时没有歧义
+        // No ambiguity once the id already carries -100… / 100…
+        assert_eq!(peer_candidates(-1_002_795_956_983).len(), 1);
+        assert_eq!(peer_candidates(1_002_795_956_983).len(), 1);
+    }
+
+    #[test]
+    fn bare_supergroup_ids_resolve_to_channels() {
+        // -1002795956983 与省略负号的 1002795956983 必须解析为同一个频道
+        // -1002795956983 and 1002795956983 must resolve to the same channel
+        let with_sign = build_peer_ref(-1_002_795_956_983);
+        let without_sign = build_peer_ref(1_002_795_956_983);
+        assert_eq!(with_sign.id, without_sign.id);
+        assert_eq!(with_sign.id.kind(), grammers_session::types::PeerKind::Channel);
+        // 普通用户 ID 仍然是用户
+        // A regular user id stays a user
+        assert_eq!(
+            build_peer_ref(123_456_789).id.kind(),
+            grammers_session::types::PeerKind::User
+        );
+    }
+
+    #[test]
+    fn upload_limits_are_two_and_four_gigabytes() {
+        assert_eq!(TG_MAX_BYTES_STD, 2 * 1024 * 1024 * 1024);
+        assert_eq!(TG_MAX_BYTES_PREMIUM, 4 * 1024 * 1024 * 1024);
     }
 }

@@ -1,13 +1,15 @@
 {
-  "name": "Telegram Notification 0.2.0",
-  "description": "Send recording info, cover image and video to Telegram via MTProto (supports files over 50 MB and HTTP/SOCKS5 proxies)",
+  "name": "Telegram Notification 0.4.1",
+  "description": "Send recording info, cover image and video to Telegram via MTProto (supports files over 50 MB and HTTP/SOCKS5 proxies). Can create/reuse one group forum topic per model and post the video into it. Uses your signed-in account by default: it can list existing topics (no duplicates) and premium accounts can upload single files up to 4 GB",
   "params": {
+    "account": { "label": "Login mode (auto = your signed-in account wins / user = your account only / bot = bot account only)" },
     "api_id": { "label": "API ID (from my.telegram.org)" },
-    "api_hash": { "label": "API Hash" },
-    "bot_token": { "label": "Bot Token (from @BotFather)" },
-    "chat_id": { "label": "Chat ID (supergroup format: -100xxxxxxxxxx)" },
-    "username": { "label": "Group username (required for supergroups, e.g. mygroupname, without @)" },
+    "api_hash": { "label": "API Hash (bot accounts only — leave empty for a user account)" },
+    "bot_token": { "label": "Bot Token (from @BotFather, bot accounts only)" },
+    "chat_id": { "label": "Chat ID (groups and supergroups: -100xxxxxxxxxx; a private group has no username, so the id is the only way to target it)" },
+    "username": { "label": "Group username (optional — public groups only, e.g. mygroupname, without @; leave empty for private groups and use Chat ID)" },
     "proxy": { "label": "Proxy (http:// or socks5://)" },
-    "send_video": { "label": "Also send video file" }
+    "send_video": { "label": "Also send video file" },
+    "topic_per_model": { "label": "Create/reuse a group topic per model and upload into it" }
   }
 }

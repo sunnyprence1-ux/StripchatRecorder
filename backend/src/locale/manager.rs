@@ -154,9 +154,104 @@ pub fn init_locale_dirs() {
             validate_module_locale,
             &format!("{}/{}", module_id, locale_code),
         );
+        // 已存在的文件不会被覆盖（用户可能改过），但内置默认新增的参数标签需要补上，
+        // 否则新参数会显示模块 `--describe` 里的原始标签。
+        // Existing files are never overwritten (the user may have edited them), but parameter
+        // labels added to the built-in defaults are merged in, otherwise new parameters would
+        // fall back to the raw label from the module's `--describe`.
+        merge_module_locale_defaults(&file_path, content);
     }
 
     tracing::info!("Locale dirs initialized at {:?}", locale_dir());
+}
+
+/// 去掉名称末尾的版本号（如 `"Telegram 通知 0.3.0"` → `"Telegram 通知"`）。
+/// Strip a trailing version number from a name (`"Telegram 通知 0.3.0"` → `"Telegram 通知"`).
+fn strip_name_version(name: &str) -> &str {
+    let trimmed = name.trim_end();
+    let without_version = trimmed.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    if without_version == trimmed {
+        return trimmed;
+    }
+    without_version.trim_end()
+}
+
+/// 把内置默认文件中「本地文件缺少的参数标签」合并进已有文件，
+/// 并在名称明显是旧版本内置名称时同步更新名称与描述。
+///
+/// 只在文件可解析为 JSON object 时生效；解析失败的文件已在上一步被重建。
+///
+/// Merge parameter labels that the local file is missing from the built-in default, and
+/// refresh the name/description when the local name is clearly an older built-in name.
+///
+/// Only applies when the file parses as a JSON object; unparsable files were already rebuilt.
+fn merge_module_locale_defaults(path: &std::path::Path, default_content: &str) {
+    let Ok(local_raw) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(mut local) = serde_json::from_str::<serde_json::Value>(&local_raw) else {
+        return;
+    };
+    let Ok(default) = serde_json::from_str::<serde_json::Value>(default_content) else {
+        return;
+    };
+    let (Some(local_obj), Some(default_obj)) = (local.as_object_mut(), default.as_object())
+    else {
+        return;
+    };
+
+    let mut changed = false;
+
+    // 1) 名称/描述：本地名称去掉版本号后与默认名称一致，说明是旧版内置文本
+    // 1) Name/description: when the local name matches the default after removing the
+    //    version suffix, it is stale built-in text
+    let stale_keys: Vec<&str> = ["name", "description"]
+        .into_iter()
+        .filter(|key| {
+            match (
+                local_obj.get(*key).and_then(|v| v.as_str()),
+                default_obj.get(*key).and_then(|v| v.as_str()),
+            ) {
+                (Some(l), Some(d)) => strip_name_version(l) == strip_name_version(d) && l != d,
+                _ => false,
+            }
+        })
+        .collect();
+    for key in stale_keys {
+        if let Some(value) = default_obj.get(key) {
+            local_obj.insert(key.to_string(), value.clone());
+            changed = true;
+        }
+    }
+
+    // 2) 参数标签：只补充本地缺失的键，不覆盖用户已有的翻译
+    // 2) Parameter labels: add only the missing keys, never overwrite existing translations
+    if let Some(default_params) = default_obj.get("params").and_then(|v| v.as_object()) {
+        let local_params = local_obj
+            .entry("params")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(local_params) = local_params.as_object_mut() {
+            for (key, value) in default_params {
+                if !local_params.contains_key(key) {
+                    local_params.insert(key.clone(), value.clone());
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    if changed {
+        match serde_json::to_string_pretty(&local) {
+            Ok(content) => {
+                if let Err(e) = std::fs::write(path, content + "\n") {
+                    tracing::warn!("Failed to merge locale file {:?}: {}", path, e);
+                } else {
+                    tracing::info!("Merged missing defaults into locale file {:?}", path);
+                }
+            }
+            Err(e) => tracing::warn!("Failed to serialize locale file {:?}: {}", path, e),
+        }
+    }
 }
 
 /// 校验主程序语言文件：
@@ -556,4 +651,25 @@ pub fn list_available_locales() -> Vec<LocaleEntry> {
     }
 
     entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_name_version;
+
+    #[test]
+    fn strips_trailing_version() {
+        assert_eq!(strip_name_version("Telegram 通知 0.3.0"), "Telegram 通知");
+        assert_eq!(
+            strip_name_version("Telegram Notification 0.4.0"),
+            "Telegram Notification"
+        );
+    }
+
+    #[test]
+    fn keeps_names_without_version() {
+        assert_eq!(strip_name_version("Telegram 通知"), "Telegram 通知");
+        assert_eq!(strip_name_version("My custom name"), "My custom name");
+        assert_eq!(strip_name_version(""), "");
+    }
 }
