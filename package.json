@@ -3,6 +3,7 @@
 	"private": true,
 	"version": "0.3.5",
 	"scripts": {
+		"start": "node scripts/dev.js",
 		"dev": "node scripts/dev.js",
 		"build": "node scripts/release.js",
 		"check": "node scripts/check.js",

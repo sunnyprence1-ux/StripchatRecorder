@@ -11,6 +11,8 @@ const { execSync } = require("child_process");
 const path = require("path");
 const fs   = require("fs");
 
+const { prepareBuildEnv } = require("./env");
+
 // ── 路径常量 / Path constants ────────────────────────────────────────────────
 
 const ROOT        = path.resolve(__dirname, "..");
@@ -97,11 +99,23 @@ function step(current, total, msg) {
 
 /**
  * 同步执行命令，继承 stdio / Run a command synchronously, inheriting stdio.
+ *
+ * 失败时只打印一行可读的错误并以相同退出码退出，而不是抛出整段 Node 栈。
+ * On failure prints one readable line and exits with the same code instead of
+ * dumping a full Node stack trace. Set DEBUG=1 to keep the stack.
+ *
  * @param {string} cmd
  * @param {import("child_process").ExecSyncOptions} [opts]
  */
 function run(cmd, opts = {}) {
-  execSync(cmd, { stdio: "inherit", ...opts });
+  try {
+    execSync(cmd, { stdio: "inherit", ...opts });
+  } catch (err) {
+    const code = typeof err.status === "number" && err.status > 0 ? err.status : 1;
+    console.error(`\n  ✗ Command failed (exit ${code}): ${cmd}`);
+    if (process.env.DEBUG === "1") console.error(err.stack || String(err));
+    process.exit(code);
+  }
 }
 
 // ── 二进制收集 / Binary collection ──────────────────────────────────────────
@@ -123,6 +137,83 @@ function collectBinaries(releaseDir) {
     if (isWindows) return name.endsWith(".exe");
     return !path.extname(name) && (stat.mode & 0o111) !== 0;
   });
+}
+
+/**
+ * 同上，但跳过符号链接。
+ * Same as above, but symlinks are skipped.
+ *
+ * cargo 上一次构建遗留的旧版本二进制通常是 `deps/` 里的软链（本环境的 `.l2s.*`），
+ * 把它们当成产物复制出去，会让同一个模块 id 在模块目录里出现两份。
+ * Leftovers from a previous build are usually symlinks into `deps/` (`.l2s.*`
+ * here); copying them out makes one module id show up twice.
+ *
+ * @param {string} dir
+ * @returns {string[]}
+ */
+function collectRealBinaries(dir) {
+  return collectBinaries(dir).filter((name) => {
+    try {
+      return !fs.lstatSync(path.join(dir, name)).isSymbolicLink();
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
+ * 通过 `cargo metadata` 取得该包真正产出的二进制名。
+ * Ask `cargo metadata` for the binary names the package actually produces.
+ *
+ * 直接读目录会把上一次构建遗留的旧版本二进制一起算进去，所以这里以包定义为准。
+ * Reading the directory would also pick up binaries left over from a previous
+ * build, so the package definition is the source of truth.
+ *
+ * @param {string} manifest Cargo.toml 路径 / path to Cargo.toml
+ * @returns {string[]|null} 失败时返回 null / null when it cannot be determined
+ */
+function packageBinNames(manifest) {
+  try {
+    const json = execSync(
+      `cargo metadata --no-deps --format-version 1 --manifest-path "${manifest}"`,
+      { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] }
+    );
+    const meta = JSON.parse(json);
+    const names = [];
+    for (const pkg of meta.packages || []) {
+      for (const target of pkg.targets || []) {
+        if (Array.isArray(target.kind) && target.kind.includes("bin")) {
+          names.push(target.name);
+        }
+      }
+    }
+    return names.length ? [...new Set(names)] : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 解析某模块本次构建实际产出的二进制文件名。
+ * Resolve the binary file names a module actually produced in this build.
+ *
+ * @param {string} name     模块名 / module name
+ * @param {string} manifest Cargo.toml 路径 / path to Cargo.toml
+ * @param {string} profile  构建模式 / build profile
+ * @returns {string[]}
+ */
+function moduleBinaries(name, manifest, profile) {
+  const dir = path.join(moduleTarget(name), profile);
+  const names = packageBinNames(manifest) || collectRealBinaries(dir);
+  const out = [];
+  for (const bin of names) {
+    if (fs.existsSync(path.join(dir, bin))) {
+      out.push(bin);
+    } else if (process.platform === "win32" && fs.existsSync(path.join(dir, `${bin}.exe`))) {
+      out.push(`${bin}.exe`);
+    }
+  }
+  return out;
 }
 
 // ── 目录列表 / Directory listing ────────────────────────────────────────────
@@ -162,6 +253,43 @@ function checkModules() {
 }
 
 /**
+ * 删除同一模块遗留的旧版本二进制（如 notify_telegram_v031 → _v040）。
+ * 模块 id 来自 --describe，而不是文件名；旧二进制残留会让同一 id 出现两次，
+ * 管线节点就可能绑定到旧版本。
+ *
+ * Remove stale binaries left behind by a previous version of the same module
+ * (e.g. notify_telegram_v031 → _v040). A module's id comes from `--describe`,
+ * not its filename, so a leftover binary makes the same id show up twice and a
+ * pipeline node may bind to the old build.
+ *
+ * @param {string} outDir  二进制目录 / binary directory
+ * @param {string} name    模块名 / module name
+ * @param {Set<string>} keep 本次刚复制的文件名 / file names just copied
+ */
+function pruneStaleModuleBinaries(outDir, name, keep) {
+  const prefix = `${name}_v`;
+  let entries;
+  try {
+    entries = fs.readdirSync(outDir);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.startsWith(prefix) || keep.has(entry)) continue;
+    const full = path.join(outDir, entry);
+    try {
+      const st = fs.statSync(full);
+      if (!st.isFile()) continue;
+      if (process.platform !== "win32" && (st.mode & 0o111) === 0) continue;
+      fs.rmSync(full, { force: true });
+      console.log(`  ⚠ removed stale binary ${entry}`);
+    } catch {
+      /* 删不掉就跳过，不影响构建 / skip if it cannot be removed */
+    }
+  }
+}
+
+/**
  * 构建所有模块并将产物二进制复制到指定目录。
  * Build all modules and copy output binaries to the given directory.
  *
@@ -173,16 +301,17 @@ function buildModules(profile, outDir) {
   fs.mkdirSync(outDir, { recursive: true });
   for (const name of listModules()) {
     console.log(`  → ${name}`);
-    run(
-      `cargo build --manifest-path "${path.join(MODULES_DIR, name, "Cargo.toml")}" --bins${releaseFlag}`,
-      { env: { ...process.env, CARGO_TARGET_DIR: moduleTarget(name) } }
-    );
-    const bins = collectBinaries(path.join(moduleTarget(name), profile));
+    const manifest = path.join(MODULES_DIR, name, "Cargo.toml");
+    run(`cargo build --manifest-path "${manifest}" --bins${releaseFlag}`, {
+      env: { ...process.env, CARGO_TARGET_DIR: moduleTarget(name) },
+    });
+    const bins = moduleBinaries(name, manifest, profile);
     for (const bin of bins) {
       const dst = path.join(outDir, bin);
       fs.copyFileSync(path.join(moduleTarget(name), profile, bin), dst);
       if (process.platform !== "win32") fs.chmodSync(dst, 0o755);
     }
+    pruneStaleModuleBinaries(outDir, name, new Set(bins));
     console.log(`  ✓ ${name}\n`);
   }
 }
@@ -233,6 +362,13 @@ function installDesktop() {
 
 // ── 导出 / Exports ───────────────────────────────────────────────────────────
 
+// 所有脚本在 require 本模块时即完成环境准备：cargo 在 PATH 上、
+// LIBCLANG_PATH 指向 libclang（bindgen 编译 btls-sys 时需要）。
+// Every script gets a prepared environment the moment it requires this module:
+// cargo on PATH and LIBCLANG_PATH pointing at libclang (bindgen needs it to
+// build btls-sys).
+prepareBuildEnv({ quiet: NESTED });
+
 module.exports = {
   ROOT,
   FRONTEND,
@@ -256,4 +392,5 @@ module.exports = {
   copyDir,
   installFrontend,
   installDesktop,
+  prepareBuildEnv,
 };
