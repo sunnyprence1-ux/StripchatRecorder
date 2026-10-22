@@ -86,6 +86,10 @@ export interface ModuleInfo {
 	params: ParamDef[];
 	/** 多语言翻译（可选）/ i18n translations (optional) */
 	i18n?: Record<string, ModuleI18nLocale>;
+	/** 是否支持自检（「测试」按钮）/ Whether the module supports self-test (the "Test" button) */
+	testable?: boolean;
+	/** 是否支持交互式登录（「登录」按钮）/ Whether the module supports interactive login (the "Login" button) */
+	loginable?: boolean;
 }
 
 /** 流水线节点（模块实例）/ Pipeline node (module instance) */

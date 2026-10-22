@@ -79,6 +79,7 @@
 	/** 表单响应式数据（与 store.settings 保持同步）/ Reactive form data (synced with store.settings) */
 	const form = reactive<Settings>({
 		output_dir: "",
+		final_video_dir: "",
 		poll_interval_secs: 30,
 		auto_record: true,
 		api_proxy_url: null,
@@ -99,6 +100,7 @@
 	// 保存各代理字段的原始值，用于检测是否有实际变更
 	// Store original values for proxy fields to detect actual changes
 	const originalOutputDir = ref("");
+	const originalFinalVideoDir = ref("");
 	const originalApiProxy = ref<string | null>(null);
 	const originalCdnProxy = ref<string | null>(null);
 	const originalScMirror = ref<string | null>(null);
@@ -114,6 +116,7 @@
 		await store.fetchSettings();
 		Object.assign(form, store.settings);
 		originalOutputDir.value = form.output_dir;
+		originalFinalVideoDir.value = form.final_video_dir;
 		originalApiProxy.value = form.api_proxy_url;
 		originalCdnProxy.value = form.cdn_proxy_url;
 		originalScMirror.value = form.sc_mirror_url;
@@ -167,6 +170,7 @@
 			initialized = false;
 			Object.assign(form, newSettings);
 			originalOutputDir.value = newSettings.output_dir;
+			originalFinalVideoDir.value = newSettings.final_video_dir;
 			originalApiProxy.value = newSettings.api_proxy_url;
 			originalCdnProxy.value = newSettings.cdn_proxy_url;
 			originalScMirror.value = newSettings.sc_mirror_url;
@@ -223,6 +227,30 @@
 		} else {
 			// 用户取消时恢复原始值 / Restore original value if user cancels
 			form.output_dir = originalOutputDir.value;
+		}
+	}
+
+	/**
+	 * 保存最终视频目录（需要用户确认，因为会影响正在进行的录制）。
+	 * Save the final video directory (requires confirmation as it affects ongoing recordings).
+	 */
+	async function saveFinalVideoDir() {
+		if (!initialized) return;
+		if (form.final_video_dir === originalFinalVideoDir.value) return;
+		const ok = await confirm({
+			title: t("settings.finalVideoDir.changeTitle"),
+			message: t("settings.finalVideoDir.changeMessage", {
+				dir: form.final_video_dir || form.output_dir,
+			}),
+			confirmText: t("settings.finalVideoDir.changeConfirm"),
+		});
+		if (ok) {
+			await store.saveSettings({ ...form });
+			originalFinalVideoDir.value = form.final_video_dir;
+			toast(t("settings.finalVideoDir.changeDone"), "info");
+		} else {
+			// 用户取消时恢复原始值 / Restore original value if user cancels
+			form.final_video_dir = originalFinalVideoDir.value;
 		}
 	}
 
@@ -352,6 +380,20 @@
 					/>
 					<p class="text-xs text-muted-foreground">
 						{{ t("settings.outputDir.hint") }}
+					</p>
+				</div>
+
+				<div class="flex flex-col gap-1.5">
+					<Label>{{ t("settings.finalVideoDir.label") }}</Label>
+					<Input
+						v-model="form.final_video_dir"
+						:placeholder="t('settings.finalVideoDir.placeholder')"
+						autocomplete="off"
+						@keyup.enter="saveFinalVideoDir"
+						@blur="saveFinalVideoDir"
+					/>
+					<p class="text-xs text-muted-foreground">
+						{{ t("settings.finalVideoDir.hint") }}
 					</p>
 				</div>
 

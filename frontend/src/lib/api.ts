@@ -219,6 +219,26 @@ const COMMAND_MAP: Record<
 		body: (a) => a.pipeline,
 	},
 	list_modules: { method: "GET", url: () => "/api/modules" },
+	test_module: {
+		method: "POST",
+		url: () => "/api/modules/test",
+		body: (a) => ({ moduleId: a.moduleId, params: a.params }),
+	},
+	login_start: {
+		method: "POST",
+		url: () => "/api/modules/login/start",
+		body: (a) => ({ moduleId: a.moduleId, params: a.params }),
+	},
+	login_input: {
+		method: "POST",
+		url: () => "/api/modules/login/input",
+		body: (a) => ({ loginId: a.loginId, value: a.value }),
+	},
+	login_cancel: {
+		method: "POST",
+		url: () => "/api/modules/login/cancel",
+		body: (a) => ({ loginId: a.loginId }),
+	},
 	get_postprocess_tasks: { method: "GET", url: () => "/api/postprocess-tasks" },
 	get_module_outputs: {
 		method: "POST",

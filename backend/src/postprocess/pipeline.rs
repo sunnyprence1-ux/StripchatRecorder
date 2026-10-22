@@ -48,6 +48,15 @@ pub struct ModuleInfo {
     /// 多语言翻译（可选，key 为语言代码如 "en-US"）/ i18n translations (optional, key is locale like "en-US")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub i18n: Option<serde_json::Value>,
+    /// 是否支持自检模式（通过 `PP_TEST=1` 调用，无需输入视频）
+    /// Whether the module supports self-test mode (invoked with `PP_TEST=1`, no input video needed)
+    #[serde(default)]
+    pub testable: bool,
+    /// 是否支持交互式登录（通过 `--login` 调用，用 stdin/stdout 行协议驱动）
+    /// Whether the module supports interactive login (invoked with `--login`, driven over a
+    /// stdin/stdout line protocol)
+    #[serde(default)]
+    pub loginable: bool,
     /// 模块可执行文件路径（不序列化，运行时填充）/ Module executable path (not serialized, filled at runtime)
     #[serde(skip)]
     pub exe_path: PathBuf,
@@ -198,12 +207,16 @@ pub fn run_pipeline(
     pipeline: &PipelineConfig,
     modules: &[ModuleInfo],
     cancel: Option<Arc<AtomicBool>>,
-    max_tmp_dir_gb: f64,
+    settings: &crate::config::settings::Settings,
     on_progress: impl Fn(usize, usize, u32, u32, &str, &str),
     on_log: impl Fn(&str, &str, &str),
 ) -> Vec<NodeResult> {
     let mut results = Vec::new();
     let mut current_input = video_path.to_path_buf();
+    let max_tmp_dir_gb = settings.max_tmp_dir_gb;
+    // 副产物目录：与元数据文件同目录（输出目录），避免污染最终视频目录
+    // Sidecar dir: same directory as the metadata file (output dir), keeping the video dir clean
+    let sidecar_dir = settings.sidecar_dir_for_video(video_path);
 
     let all_nodes: Vec<&PipelineNode> = pipeline.nodes.iter().collect();
     let total = all_nodes.iter().filter(|n| n.enabled).count();
@@ -248,6 +261,7 @@ pub fn run_pipeline(
             &current_input,
             cancel.clone(),
             max_tmp_dir_gb,
+            sidecar_dir.as_deref(),
             &|md, mt| {
                 *last_mod.lock().unwrap() = (md, mt);
                 let st = status_text.lock().unwrap().clone();
@@ -274,7 +288,7 @@ pub fn run_pipeline(
                 tracing::warn!("DELETE_INPUT: failed to remove {:?}: {}", current_input, e);
             } else {
                 tracing::info!("DELETE_INPUT: removed {:?}", current_input);
-                crate::recording::meta::delete_meta(&current_input);
+                crate::recording::meta::delete_meta(settings, &current_input);
             }
         }
 
@@ -320,6 +334,7 @@ fn run_node(
     input: &std::path::Path,
     cancel: Option<Arc<AtomicBool>>,
     max_tmp_dir_gb: f64,
+    sidecar_dir: Option<&std::path::Path>,
     on_module_progress: &dyn Fn(u32, u32),
     on_log: &dyn Fn(&str, &str),
     on_status: &dyn Fn(&str),
@@ -343,7 +358,15 @@ fn run_node(
     let max_tmp_mb = (max_tmp_dir_gb * 1024.0) as u64;
     cmd.env("PP_INPUT", input)
         .env("PP_EXE_DIR", exe_dir())
-        .env("PP_MAX_TMP_MB", max_tmp_mb.to_string())
+        .env("PP_MAX_TMP_MB", max_tmp_mb.to_string());
+
+    // 副产物（联系表图片等）输出目录：默认与输入同目录，分离布局下为输出目录
+    // Side-output directory (contact sheets etc.): input dir by default, output dir in split layout
+    if let Some(dir) = sidecar_dir {
+        cmd.env("PP_SIDECAR_DIR", dir);
+    }
+
+    cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -543,5 +566,201 @@ fn run_node(
         message,
         output: if success { output_path } else { None },
         delete_input: success && delete_input,
+    }
+}
+
+// ─── 模块自检 / Module self-test ─────────────────────────────────────────────
+
+/// 自检输出的一行日志 / A single line of self-test output
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestLog {
+    /// 输出流名称（"stdout" / "stderr"）/ Output stream name
+    pub stream: String,
+    /// 行内容 / Line content
+    pub line: String,
+}
+
+/// 模块自检结果 / Module self-test result
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestResult {
+    /// 自检是否成功 / Whether the self-test succeeded
+    pub success: bool,
+    /// 结果摘要（成功时为最后一行 stdout，失败时为最后一行 stderr）
+    /// Result summary (last stdout line on success, last stderr line on failure)
+    pub message: String,
+    /// 完整输出日志（按时间顺序，上限 `TEST_MAX_LOG_LINES` 行）
+    /// Full output log (chronological, capped at `TEST_MAX_LOG_LINES` lines)
+    pub logs: Vec<TestLog>,
+}
+
+/// 自检最长执行时间 / Maximum self-test duration
+const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// 自检保留的最大日志行数 / Maximum number of log lines kept from a self-test
+const TEST_MAX_LOG_LINES: usize = 500;
+
+/// 以自检模式（`PP_TEST=1`）运行模块：不提供 `PP_INPUT`，由模块自行验证其配置与外部连通性。
+///
+/// Runs a module in self-test mode (`PP_TEST=1`): no `PP_INPUT` is provided; the module
+/// verifies its own configuration and external connectivity.
+///
+/// # 参数 / Parameters
+/// - `module`: 模块信息（含可执行文件路径与 `testable` 标记）/ Module info (exe path and `testable` flag)
+/// - `params`: 节点参数值 / Node parameter values
+pub fn run_module_test(
+    module: &ModuleInfo,
+    params: &HashMap<String, serde_json::Value>,
+) -> TestResult {
+    use std::io::{BufRead, BufReader};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// 子进程输出事件 / Subprocess output events
+    enum TestEvent {
+        Line(bool, String),
+        Eof,
+    }
+
+    if !module.testable {
+        return TestResult {
+            success: false,
+            message: format!("模块 '{}' 不支持自检", module.id),
+            logs: vec![],
+        };
+    }
+
+    let mut cmd = std::process::Command::new(&module.exe_path);
+    cmd.env("PP_TEST", "1")
+        .env("PP_EXE_DIR", exe_dir())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    for (key, val) in params {
+        let env_key = format!("PP_PARAM_{}", key.to_uppercase());
+        let env_val = match val {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        cmd.env(env_key, env_val);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return TestResult {
+                success: false,
+                message: format!("Failed to spawn: {}", e),
+                logs: vec![],
+            }
+        }
+    };
+
+    let (tx, rx) = mpsc::channel::<TestEvent>();
+    let mut open_streams = 0usize;
+
+    if let Some(stdout) = child.stdout.take() {
+        open_streams += 1;
+        let tx = tx.clone();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(TestEvent::Line(false, line)).is_err() {
+                    return;
+                }
+            }
+            let _ = tx.send(TestEvent::Eof);
+        });
+    }
+
+    if let Some(stderr) = child.stderr.take() {
+        open_streams += 1;
+        let tx = tx.clone();
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if tx.send(TestEvent::Line(true, line)).is_err() {
+                    return;
+                }
+            }
+            let _ = tx.send(TestEvent::Eof);
+        });
+    }
+
+    drop(tx);
+
+    let mut logs: Vec<TestLog> = Vec::new();
+    let mut truncated = false;
+    let mut last_stdout = String::new();
+    let started = Instant::now();
+    let mut timed_out = false;
+
+    while open_streams > 0 {
+        if started.elapsed() > TEST_TIMEOUT {
+            timed_out = true;
+            let _ = child.kill();
+            break;
+        }
+
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(TestEvent::Line(is_stderr, line)) => {
+                let line = line.trim_end().to_string();
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if logs.len() < TEST_MAX_LOG_LINES {
+                    logs.push(TestLog {
+                        stream: if is_stderr { "stderr" } else { "stdout" }.to_string(),
+                        line: line.clone(),
+                    });
+                } else {
+                    truncated = true;
+                }
+                if !is_stderr {
+                    last_stdout = line;
+                }
+            }
+            Ok(TestEvent::Eof) => open_streams = open_streams.saturating_sub(1),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    let status = child.wait();
+
+    if truncated {
+        logs.push(TestLog {
+            stream: "stdout".to_string(),
+            line: format!("… output truncated ({} lines max)", TEST_MAX_LOG_LINES),
+        });
+    }
+
+    let exit_ok = matches!(&status, Ok(s) if s.success());
+    let success = !timed_out && exit_ok;
+
+    let message = if timed_out {
+        format!("自检超时（{} 秒）", TEST_TIMEOUT.as_secs())
+    } else if success {
+        if last_stdout.is_empty() {
+            "OK".to_string()
+        } else {
+            last_stdout
+        }
+    } else {
+        // 失败时优先展示最后一行 stderr / Prefer the last stderr line on failure
+        logs.iter()
+            .rev()
+            .find(|l| l.stream == "stderr")
+            .map(|l| l.line.clone())
+            .unwrap_or_else(|| match &status {
+                Ok(s) => format!("exit {}", s),
+                Err(e) => format!("wait failed: {}", e),
+            })
+    };
+
+    TestResult {
+        success,
+        message,
+        logs,
     }
 }

@@ -36,11 +36,6 @@ pub fn list_recordings_inner(
     recorder: &Arc<RecorderManager>,
 ) -> std::io::Result<Vec<RecordingFile>> {
     let settings = state.get_settings();
-    let output_dir = std::path::Path::new(&settings.output_dir);
-
-    if !output_dir.exists() {
-        return Ok(Vec::new());
-    }
 
     let sessions = recorder.get_active_sessions();
     let merging = recorder.merging_dirs.read().clone();
@@ -49,14 +44,30 @@ pub fn list_recordings_inner(
         merging.union(&waiting_merging).cloned().collect();
 
     let mut files: Vec<RecordingFile> = Vec::new();
+    // 元数据保存在输出目录；最终视频目录中可能残留旧布局的 meta，一并扫描并去重
+    // Metadata lives in the output dir; the video dir may still hold legacy meta files,
+    // so both are scanned and deduplicated by video path
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut roots: Vec<PathBuf> = vec![PathBuf::from(settings.output_dir.trim())];
+    for root in settings.video_scan_roots() {
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
 
-    collect_from_meta(
-        output_dir,
-        &mut files,
-        &sessions,
-        &all_merging,
-        &settings.merge_format,
-    )?;
+    for root in roots {
+        if !root.exists() {
+            continue;
+        }
+        collect_from_meta(
+            &root,
+            &mut files,
+            &sessions,
+            &all_merging,
+            &settings,
+            &mut seen,
+        )?;
+    }
 
     files.sort_by(|a, b| b.started_at.cmp(&a.started_at));
     Ok(files)
@@ -67,8 +78,10 @@ fn collect_from_meta(
     files: &mut Vec<RecordingFile>,
     sessions: &[(PathBuf, chrono::DateTime<chrono::Utc>)],
     merging: &std::collections::HashSet<PathBuf>,
-    merge_format: &str,
+    settings: &crate::config::settings::Settings,
+    seen: &mut std::collections::HashSet<PathBuf>,
 ) -> std::io::Result<()> {
+    let merge_format = settings.merge_format.as_str();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -78,7 +91,7 @@ fn collect_from_meta(
             if name.starts_with('.') || merging.contains(&path) {
                 continue;
             }
-            collect_from_meta(&path, files, sessions, merging, merge_format)?;
+            collect_from_meta(&path, files, sessions, merging, settings, seen)?;
         } else if path.is_file() {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if !name.starts_with('.') || !name.ends_with(".json") {
@@ -90,27 +103,29 @@ fn collect_from_meta(
                 _ => continue,
             };
 
-            let meta = match crate::recording::meta::read_meta(
-                &path
-                    .parent()
-                    .unwrap_or(dir)
-                    .join(format!("{}.{}", stem, merge_format)),
-            ) {
-                Some(m) => m,
+            // 由 meta 路径推导成片路径：meta 位于输出目录，成片位于最终视频目录
+            // Derive the video path from the meta path: meta in the output dir,
+            // the video in the final video directory
+            let video_path = match crate::recording::meta::video_path_for_meta(settings, &path) {
+                Some(p) => p,
                 None => continue,
             };
 
-            let video_path = path
-                .parent()
-                .unwrap_or(dir)
-                .join(format!("{}.{}", stem, merge_format));
+            if !seen.insert(video_path.clone()) {
+                continue;
+            }
+
+            let meta = match crate::recording::meta::read_meta_file(&path) {
+                Some(m) => m,
+                None => continue,
+            };
 
             if video_path.exists() {
                 let actual_size = fs::metadata(&video_path).map(|m| m.len()).unwrap_or(0);
                 let effective_size = if meta.size_bytes != actual_size && actual_size > 0 {
                     let mut updated = meta.clone();
                     updated.size_bytes = actual_size;
-                    crate::recording::meta::write_meta(&video_path, &updated);
+                    crate::recording::meta::write_meta(settings, &video_path, &updated);
                     actual_size
                 } else {
                     meta.size_bytes
@@ -129,7 +144,9 @@ fn collect_from_meta(
                     module_outputs: meta.module_outputs,
                 });
             } else {
-                let session_dir = path.parent().unwrap_or(dir).join(stem);
+                // 分片目录始终位于输出目录中，按路径映射关系计算
+                // The segment directory always lives under the output dir; derive it from the video path
+                let session_dir = settings.session_dir_for_video(&video_path);
 
                 if let Some((_, dt)) = sessions.iter().find(|(sp, _)| sp == &session_dir) {
                     let local: chrono::DateTime<chrono::Local> = (*dt).into();
@@ -186,6 +203,8 @@ pub fn delete_recording_inner(
         ));
     }
 
+    let settings = state.get_settings();
+
     state.pp_task_cancel(path);
 
     let task_status = state.pp_tasks.read().get(path).map(|t| t.status.clone());
@@ -219,17 +238,29 @@ pub fn delete_recording_inner(
         if let Some(e) = last_err {
             return Err(crate::core::error::AppError::Other(e.to_string()));
         }
-        if let Some(parent) = p.parent()
-            && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
-        {
-            for ext in &["webp", "jpg", "jpeg", "png"] {
-                let sidecar = parent.join(format!("{}.{}", stem, ext));
-                if sidecar.exists() {
-                    let _ = fs::remove_file(&sidecar);
+        // 删除模块副产物（联系表图片等）：成片同目录与输出目录（副产物目录）都要检查
+        // Delete module side outputs (contact sheets etc.): check both the video dir and the
+        // output dir (the sidecar directory)
+        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+            let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+            if let Some(parent) = p.parent() {
+                dirs.push(parent.to_path_buf());
+            }
+            if let Some(dir) = settings.sidecar_dir_for_video(p)
+                && !dirs.contains(&dir)
+            {
+                dirs.push(dir);
+            }
+            for dir in dirs {
+                for ext in &["webp", "jpg", "jpeg", "png"] {
+                    let sidecar = dir.join(format!("{}.{}", stem, ext));
+                    if sidecar.exists() {
+                        let _ = fs::remove_file(&sidecar);
+                    }
                 }
             }
         }
-        crate::recording::meta::delete_meta(p);
+        crate::recording::meta::delete_meta(&settings, p);
     }
 
     {

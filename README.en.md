@@ -23,11 +23,12 @@ A self-hosted Stripchat live stream recorder with a web-based management UI. Sup
 - Supports split network proxies: configure Stripchat API proxy and CDN chunk proxy separately
 - Supports configurable Stripchat mirror site (replaces `stripchat.com` in requests with your mirror domain)
 - **Mouflon HLS decryption**: manage `pkey → pdkey` key pairs for decrypting Stripchat's encrypted HLS segment filenames; supports automatic key sync from a configured URL
+- **Segments and finished videos kept apart**: `.ts` segments and metadata (`.json`) stay in the output directory while merged videos are written to a separate *Final Video Directory* that holds nothing else
 - Configurable post-processing pipeline with pluggable modules:
   - **contact_sheet** — generates a tiled preview image with timestamps
   - **filter_short** — deletes recordings below a minimum duration
   - **notify_discord** — sends recording info and cover image to a Discord Webhook
-  - **notify_telegram** — sends recording info, cover image, and video via MTProto (supports files >2 GB, HTTP/SOCKS5 proxy)
+  - **notify_telegram** — sends recording info, cover image, and video via MTProto (supports files >2 GB, HTTP/SOCKS5 proxy); can create/reuse one group forum topic per model and upload the video into it
 - Disk space monitoring on the recordings page, with a warning highlight when less than 5 GB remains
 - Dual runtime: Tauri desktop app or headless server accessible via browser
 - Real-time UI updates via Server-Sent Events with multi-client sync
@@ -73,7 +74,8 @@ The following options are available in the Web UI under Settings:
 
 | Setting                        | Description                                                                 |
 | ------------------------------ | --------------------------------------------------------------------------- |
-| Output directory               | Path where recordings are saved                                             |
+| Output directory               | Path where segments and session directories are saved (`.ts` files while recording) |
+| Final video directory          | Only merged videos are stored here; `.ts` segments and metadata stay in the output directory. Leave empty to use the output directory |
 | Max concurrent                 | Maximum number of simultaneous recordings; `0` means unlimited             |
 | Poll interval                  | How often to check if a streamer is live (seconds), range 10–300           |
 | Preferred recording resolution | Target stream resolution and fallback direction (prefer lower or prefer higher); if no stream exists in that direction, the nearest stream in the other direction is used instead of failing; defaults to original/highest |
@@ -90,6 +92,18 @@ Stripchat mirror project: <https://github.com/ChanTrail/StripchatMirror>
 1. API Proxy: used for Stripchat API access; if a mirror is also set, mirror requests go through this proxy.
 2. CDN Proxy: used for downloading live stream chunks; can be configured independently from the API proxy.
 3. Stripchat Mirror: replaces `stripchat.com` in requests with your mirror domain.
+
+### Cloudflare and Filtered Networks
+
+Stripchat's API is behind Cloudflare, which fingerprints the TLS/HTTP2 handshake. A plain HTTP client is answered with `403` even when it sends a complete set of browser headers, and some ISPs (India, for example) poison the DNS answer for `stripchat.com`, so every request hangs until it times out. Both look like a generic "API error" when adding a streamer.
+
+The backend handles this by itself:
+
+- API requests use a real browser TLS/HTTP2 fingerprint (BoringSSL with a Chrome profile) instead of the default client handshake, which passes Cloudflare's check.
+- Hostnames are resolved through DNS-over-HTTPS (Cloudflare `1.1.1.1` and Google), falling back to the system resolver when DoH is unreachable, so a poisoned local resolver no longer breaks the connection.
+- When an API proxy is configured, the proxy is used as before and DoH is skipped (the proxy resolves names itself).
+
+If you still get `403` / `451`, the network is blocked at a level the client cannot fix — configure an API Proxy or a mirror.
 
 ### Mouflon HLS Decryption Keys
 
@@ -137,15 +151,51 @@ Modules are standalone executables implementing a simple protocol. They receive 
 | `contact_sheet`   | Extracts frames at a configurable interval and tiles them into a preview image |
 | `filter_short`    | Deletes recordings shorter than a configurable minimum duration                |
 | `notify_discord`  | Sends recording info and cover image to a Discord Webhook                      |
-| `notify_telegram` | Sends recording info, cover image, and video to Telegram via MTProto (supports files >2 GB, HTTP/SOCKS5 proxy) |
+| `notify_telegram` | Sends recording info, cover image, and video to Telegram via MTProto (supports files >2 GB, HTTP/SOCKS5 proxy); can create/reuse one forum topic per model and post into it |
 
 Custom modules placed in the `modules` volume directory are discovered automatically and will not be overwritten when the container restarts. See the [Module Development Guide](docs/module-development.en.md) for details.
+
+### Testing a Module
+
+On the Post-processing page, modules that support self-testing (declared with `"testable": true` in their metadata, e.g. `notify_telegram`) show a **Test** button on their node. It runs the module in self-test mode (`PP_TEST=1`) with that node's current parameters and streams the output into a dialog:
+
+- The Telegram module verifies the credentials, the target chat and topic resolution/creation, then posts a test message into that chat (or topic). With **send video** enabled it also generates a 3-second test clip and runs the full upload path.
+- Nothing is modified on disk; the only side effect is the test message/clip in the configured destination.
+- The test uses a fixed topic named `Test`, so repeated tests reuse the same topic instead of creating new ones.
+
+### Telegram Login (user account / large files)
+
+The Telegram module supports three login modes, selected with the `account` parameter (default `auto`):
+
+- `auto`: **a signed-in user session wins**; the bot account is used only when no user session exists. Once you have logged in there is nothing to switch by hand.
+- `user`: your own account (used even when a Bot Token is filled in). Modules that support login show a **Login** button on their node; enter your phone number and the login code (plus your password if two-step verification is on) and the session is stored in `~/.config/notify_telegram/<api_id>_user.db`. A user account needs neither `api_hash` nor a Bot Token.
+- `bot`: a bot account using a Bot Token. Bots **cannot** list forum topics (`messages.getForumTopics` fails with `BOT_METHOD_INVALID`), so topics rely on the local cache (`~/.config/notify_telegram/topics.tsv`).
+
+A user account can list forum topics, so existing topics are reused reliably and never duplicated. Premium accounts can also upload single files up to 4 GB (2 GB for regular accounts and bots); anything larger is split automatically.
+
+### Telegram forum topics
+
+"Create/reuse a group topic per model" only works in a **supergroup with Topics enabled**, and the account must be an admin with the **Manage Topics** permission. Common setup mistakes:
+
+- **A basic group has no topics.** Turning on Topics in the group settings makes Telegram upgrade the group to a supergroup, and its id changes from `-1234567890` to a `-100…` form — put the new id in Chat ID.
+- **Private groups have no username**: leave `username` empty and use the Chat ID only (`-100xxxxxxxxxx` for supergroups). A channel id written as `-<channel_id>`, or without the minus sign, is also understood — the module retries it as a supergroup when the first interpretation does not resolve.
+- Topics are optional: turn "Create/reuse a group topic per model" off and messages go straight into the group's main chat (basic groups work fine that way).
 
 ---
 
 ## Building from Source
 
-**Prerequisites:** Rust, Node.js (LTS), ffmpeg
+**Prerequisites:** Rust (1.98+), Node.js (LTS), ffmpeg, and — for the BoringSSL used by the API client — `cmake`, `perl`, a C/C++ toolchain and `libclang` (for bindgen). On Debian/Ubuntu:
+
+```bash
+apt-get install -y build-essential cmake perl libclang-dev
+```
+
+`npm run dev`, `npm run check` and `npm run build` find `cargo` (including `~/.cargo/bin`, which is not on `PATH` until you source `~/.cargo/env`) and `libclang` on their own — system installs, LLVM directories and the pip `clang` wheel — and fall back to `pip install libclang` when neither exists. If it lives somewhere unusual, point bindgen at the directory containing the shared library:
+
+```bash
+export LIBCLANG_PATH=/path/to/libclang
+```
 
 ### First-launch Setup
 

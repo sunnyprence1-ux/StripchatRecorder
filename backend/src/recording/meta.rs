@@ -3,9 +3,18 @@
 //! 每个录制对应一个隐藏的 JSON 元数据文件，文件名格式为 `.{stem}.json`。
 //! 元数据文件在录制开始时创建，并随录制/合并/后处理各阶段持续更新 `status` 字段。
 //!
+//! 元数据文件始终保存在**输出目录**（与 `.ts` 分片目录同级），而不是最终视频目录：
+//! 最终视频目录只存放合并完成的成片。当输出目录与最终视频目录相同时，
+//! 路径与旧布局（视频同目录）完全一致。
+//!
 //! Each recording has a hidden JSON metadata file named `.{stem}.json`.
 //! The file is created when recording starts and its `status` field is updated
 //! throughout the recording / merging / post-processing lifecycle.
+//!
+//! Metadata files always live in the **output directory** (as a sibling of the `.ts`
+//! segment directory), never in the final video directory, which only holds merged
+//! videos. When both directories are the same, the paths match the legacy
+//! "next to the video" layout.
 //!
 //! ## Status 状态流转 / Status lifecycle
 //!
@@ -14,8 +23,10 @@
 //!                                       ↘ finish (no pipeline)    ↘ pp_error
 //! ```
 
+use crate::config::settings::{AppState, Settings};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// 当前 meta 文件格式版本。
 /// 每次对 `VideoMeta` 结构做不向后兼容的变更时递增此值，
@@ -100,37 +111,64 @@ pub struct VideoMeta {
     pub module_outputs: Option<std::collections::HashMap<String, String>>,
 }
 
-/// 根据视频文件路径计算对应的元数据文件路径（`.{stem}.json`）。
-/// Compute the metadata file path for a given video file path (`.{stem}.json`).
-pub fn meta_path_for(video_path: &Path) -> Option<PathBuf> {
-    let parent = video_path.parent()?;
-    let stem = video_path.file_stem()?.to_str()?;
-    Some(parent.join(format!(".{}.json", stem)))
+/// 根据视频文件路径计算对应的元数据文件路径（`.{stem}.json`，位于输出目录）。
+/// Compute the metadata file path for a given video file path (`.{stem}.json`, in the output dir).
+pub fn meta_path_for(settings: &Settings, video_path: &Path) -> Option<PathBuf> {
+    settings.meta_path_for_video(video_path)
 }
 
-/// 读取视频文件对应的元数据，若文件不存在或解析失败则返回 `None`。
-/// Read the metadata for a video file; returns `None` if the file doesn't exist or fails to parse.
-pub fn read_meta(video_path: &Path) -> Option<VideoMeta> {
-    let meta_path = meta_path_for(video_path)?;
-    let content = std::fs::read_to_string(&meta_path).ok()?;
+/// 读取指定元数据文件的原始内容。
+/// Read the raw content of a given metadata file.
+pub fn read_meta_file(meta_path: &Path) -> Option<VideoMeta> {
+    let content = std::fs::read_to_string(meta_path).ok()?;
     serde_json::from_str(&content).ok()
 }
 
-/// 将元数据写入视频文件对应的 `.{stem}.json` 文件。
-/// 写入前自动将 `meta_version` 设置为当前版本常量。
+/// 读取视频文件对应的元数据，若文件不存在或解析失败则返回 `None`。
+/// 优先读取输出目录中的标准位置，找不到时回退到旧布局（视频同目录）。
 ///
-/// Write metadata to the `.{stem}.json` file for a video file.
+/// Read the metadata for a video file; returns `None` if the file doesn't exist or fails to parse.
+/// Prefers the canonical location in the output dir, falling back to the legacy layout
+/// (next to the video).
+pub fn read_meta(settings: &Settings, video_path: &Path) -> Option<VideoMeta> {
+    if let Some(meta_path) = settings.meta_path_for_video(video_path)
+        && let Some(meta) = read_meta_file(&meta_path)
+    {
+        return Some(meta);
+    }
+    Settings::legacy_meta_path_for_video(video_path).and_then(|p| read_meta_file(&p))
+}
+
+/// 将元数据写入视频文件对应的 `.{stem}.json` 文件（输出目录）。
+/// 写入前自动将 `meta_version` 设置为当前版本常量。
+/// 若旧布局下视频同目录仍残留元数据文件，写入成功后将其删除（升级迁移）。
+///
+/// Write metadata to the `.{stem}.json` file for a video file (in the output dir).
 /// Automatically sets `meta_version` to the current version constant before writing.
-pub fn write_meta(video_path: &Path, meta: &VideoMeta) {
-    let Some(meta_path) = meta_path_for(video_path) else {
+/// If a legacy metadata file still sits next to the video, it is removed after a
+/// successful write (upgrade migration).
+pub fn write_meta(settings: &Settings, video_path: &Path, meta: &VideoMeta) {
+    let Some(meta_path) = settings.meta_path_for_video(video_path) else {
         return;
     };
+    if let Some(parent) = meta_path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!("Failed to create meta dir {:?}: {}", parent, e);
+        return;
+    }
     let mut meta = meta.clone();
     meta.meta_version = META_VERSION;
     match serde_json::to_string_pretty(&meta) {
         Ok(json) => {
             if let Err(e) = std::fs::write(&meta_path, json) {
                 tracing::warn!("Failed to write meta {:?}: {}", meta_path, e);
+            } else if let Some(legacy) = Settings::legacy_meta_path_for_video(video_path)
+                && legacy != meta_path
+                && legacy.exists()
+            {
+                // 旧布局残留：迁移后清理 / Legacy leftover: clean up after migrating
+                let _ = std::fs::remove_file(&legacy);
             }
         }
         Err(e) => {
@@ -139,13 +177,59 @@ pub fn write_meta(video_path: &Path, meta: &VideoMeta) {
     }
 }
 
-/// 删除视频文件对应的元数据文件（若存在）。
-/// Delete the metadata file for a video file (if it exists).
-pub fn delete_meta(video_path: &Path) {
-    if let Some(meta_path) = meta_path_for(video_path)
-        && meta_path.exists() {
-        let _ = std::fs::remove_file(&meta_path);
+/// 删除视频文件对应的元数据文件（标准位置与旧布局残留都会删除）。
+/// Delete the metadata file for a video file (both the canonical and legacy locations).
+pub fn delete_meta(settings: &Settings, video_path: &Path) {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(p) = settings.meta_path_for_video(video_path) {
+        candidates.push(p);
     }
+    if let Some(p) = Settings::legacy_meta_path_for_video(video_path)
+        && !candidates.contains(&p)
+    {
+        candidates.push(p);
+    }
+    for meta_path in candidates {
+        if meta_path.exists() {
+            let _ = std::fs::remove_file(&meta_path);
+        }
+    }
+}
+
+/// 将旧布局（视频同目录）中的元数据文件迁移到输出目录。
+/// 标准位置已存在或旧文件不存在时不做任何操作。
+///
+/// Migrate a legacy metadata file (next to the video) into the output directory.
+/// Does nothing when the canonical file already exists or the legacy one is missing.
+fn migrate_legacy_meta(settings: &Settings, video_path: &Path) {
+    let (Some(canonical), Some(legacy)) = (
+        settings.meta_path_for_video(video_path),
+        Settings::legacy_meta_path_for_video(video_path),
+    ) else {
+        return;
+    };
+    if canonical == legacy || canonical.exists() || !legacy.exists() {
+        return;
+    }
+    if let Some(parent) = canonical.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!("Failed to create meta dir {:?}: {}", parent, e);
+        return;
+    }
+    if std::fs::rename(&legacy, &canonical).is_err() {
+        if std::fs::copy(&legacy, &canonical).is_ok() {
+            let _ = std::fs::remove_file(&legacy);
+        } else {
+            tracing::warn!(
+                "Failed to migrate meta {:?} → {:?}",
+                legacy,
+                canonical
+            );
+            return;
+        }
+    }
+    tracing::info!("Migrated meta {:?} → {:?}", legacy, canonical);
 }
 
 /// 仅更新 meta 文件的 `status` 字段，其余字段保持不变。
@@ -153,8 +237,8 @@ pub fn delete_meta(video_path: &Path) {
 ///
 /// Update only the `status` field of the meta file, leaving other fields unchanged.
 /// If the meta file doesn't exist, rebuilds it from video file info before writing.
-pub fn set_status(video_path: &Path, status: &str) {
-    let mut meta = match read_meta(video_path) {
+pub fn set_status(settings: &Settings, video_path: &Path, status: &str) {
+    let mut meta = match read_meta(settings, video_path) {
         Some(m) => m,
         None => {
             let size_bytes = std::fs::metadata(video_path).map(|m| m.len()).unwrap_or(0);
@@ -181,18 +265,19 @@ pub fn set_status(video_path: &Path, status: &str) {
         }
     };
     meta.status = status.to_string();
-    write_meta(video_path, &meta);
+    write_meta(settings, video_path, &meta);
 }
 
 /// 后处理完成时更新 meta：写入最终状态、各模块结果和输出路径。
 /// Update meta when post-processing completes: write final status, module results, and output paths.
 pub fn set_pp_done(
+    settings: &Settings,
     video_path: &Path,
     status: &str,
     results: Vec<PpModuleResult>,
     module_outputs: std::collections::HashMap<String, String>,
 ) {
-    let mut meta = match read_meta(video_path) {
+    let mut meta = match read_meta(settings, video_path) {
         Some(m) => m,
         None => {
             let size_bytes = std::fs::metadata(video_path).map(|m| m.len()).unwrap_or(0);
@@ -223,15 +308,16 @@ pub fn set_pp_done(
     if !module_outputs.is_empty() {
         meta.module_outputs = Some(module_outputs);
     }
-    write_meta(video_path, &meta);
+    write_meta(settings, video_path, &meta);
 }
 
 /// 若 meta 文件已存在则不覆盖，否则创建初始 meta（用于启动时遗留片段的保险创建）。
 /// Does not overwrite if the meta file already exists; otherwise creates an initial meta
 /// (used as a safety net for leftover segments on startup).
-pub fn ensure_meta(video_path: &Path, started_at: &str) {
-    if let Some(meta_path) = meta_path_for(video_path)
-        && meta_path.exists() {
+pub fn ensure_meta(settings: &Settings, video_path: &Path, started_at: &str) {
+    if let Some(meta_path) = settings.meta_path_for_video(video_path)
+        && meta_path.exists()
+    {
         return;
     }
     let size_bytes = std::fs::metadata(video_path).map(|m| m.len()).unwrap_or(0);
@@ -244,39 +330,34 @@ pub fn ensure_meta(video_path: &Path, started_at: &str) {
         pp_results: None,
         module_outputs: None,
     };
-    write_meta(video_path, &meta);
+    write_meta(settings, video_path, &meta);
 }
 
-/// 启动时扫描输出目录，为所有缺少 meta 文件的视频补写，并补全缺失的 `video_duration_secs`。
-/// On startup, scan the output directory and write missing meta files for all videos,
+/// 启动时扫描所有视频目录，为所有缺少 meta 文件的视频补写，并补全缺失的 `video_duration_secs`。
+/// On startup, scan all video roots and write missing meta files for all videos,
 /// also filling in missing `video_duration_secs` via ffprobe.
-pub fn startup_ensure_meta_files(
-    output_dir: &Path,
-    merge_format: &str,
-) {
-    ensure_meta_files(output_dir, merge_format);
+pub fn startup_ensure_meta_files(settings: &Settings) {
+    ensure_meta_files(settings);
 }
 
-/// 扫描输出目录，为所有缺少或版本过旧的 meta 文件执行创建/重建，
-/// 并补全缺失的 `video_duration_secs`。
+/// 扫描所有视频目录，为所有缺少或版本过旧的 meta 文件执行创建/重建，
+/// 并补全缺失的 `video_duration_secs`；同时把旧布局（视频同目录）中的 meta 迁移到输出目录。
 /// 跳过仍处于活跃状态（录制中/合并中/后处理中）的 meta，避免干扰正在进行的任务。
 ///
-/// Scan the output directory and create/rebuild meta files that are missing or have an
-/// outdated version, also filling in missing `video_duration_secs` via ffprobe.
+/// Scan all video roots and create/rebuild meta files that are missing or have an
+/// outdated version, also filling in missing `video_duration_secs` via ffprobe;
+/// legacy metadata files (next to the video) are migrated into the output directory.
 /// Skips meta files in active states (recording/merging/post-processing) to avoid
 /// interfering with ongoing tasks.
-pub fn ensure_meta_files(output_dir: &Path, merge_format: &str) {
-    if !output_dir.exists() {
-        return;
-    }
+pub fn ensure_meta_files(settings: &Settings) {
     let mut count_created = 0usize;
     let mut count_updated = 0usize;
-    scan_and_ensure_meta(
-        output_dir,
-        merge_format,
-        &mut count_created,
-        &mut count_updated,
-    );
+    for root in settings.video_scan_roots() {
+        if !root.exists() {
+            continue;
+        }
+        scan_and_ensure_meta(&root, settings, &mut count_created, &mut count_updated);
+    }
     if count_created > 0 || count_updated > 0 {
         tracing::info!(
             "Meta scan: created {} new, rebuilt/updated {} existing meta files",
@@ -288,7 +369,7 @@ pub fn ensure_meta_files(output_dir: &Path, merge_format: &str) {
 
 fn scan_and_ensure_meta(
     dir: &Path,
-    merge_format: &str,
+    settings: &Settings,
     count_created: &mut usize,
     count_updated: &mut usize,
 ) {
@@ -304,15 +385,19 @@ fn scan_and_ensure_meta(
             if name.starts_with('.') {
                 continue;
             }
-            scan_and_ensure_meta(&path, merge_format, count_created, count_updated);
+            scan_and_ensure_meta(&path, settings, count_created, count_updated);
         } else if path.is_file() {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with('.') || ext != merge_format {
+            if name.starts_with('.') || ext != settings.merge_format {
                 continue;
             }
 
-            match read_meta(&path) {
+            // 旧布局的 meta 先迁移到输出目录，后续读写都使用标准位置
+            // Migrate legacy meta into the output dir first; all reads/writes then use the canonical path
+            migrate_legacy_meta(settings, &path);
+
+            match read_meta(settings, &path) {
                 None => {
                     // meta 不存在：新建
                     // Meta missing: create it
@@ -338,7 +423,7 @@ fn scan_and_ensure_meta(
                         pp_results: None,
                         module_outputs: None,
                     };
-                    write_meta(&path, &meta);
+                    write_meta(settings, &path, &meta);
                     *count_created += 1;
                 }
                 Some(mut meta) => {
@@ -378,7 +463,7 @@ fn scan_and_ensure_meta(
                         }
                         // meta_version 由 write_meta 自动设置为 META_VERSION
                         // meta_version is set to META_VERSION automatically by write_meta
-                        write_meta(&path, &meta);
+                        write_meta(settings, &path, &meta);
                         *count_updated += 1;
                         continue;
                     }
@@ -390,7 +475,7 @@ fn scan_and_ensure_meta(
                         changed = true;
                     }
                     if changed {
-                        write_meta(&path, &meta);
+                        write_meta(settings, &path, &meta);
                         *count_updated += 1;
                     }
                 }
@@ -399,25 +484,111 @@ fn scan_and_ensure_meta(
     }
 }
 
-/// 扫描输出目录，删除所有对应视频文件已不存在的孤立 meta 文件（`.{stem}.json`）。
-/// Scan the output directory and delete orphaned meta files (`.{stem}.json`) whose
-/// corresponding video files no longer exist.
+/// 由 meta 文件路径推导其所属的录制会话（.ts 分片）目录。
+/// 标准位置（输出目录中与分片目录同级）和旧布局（视频同目录）都适用。
+///
+/// Derive the recording session (.ts segment) directory a meta file belongs to.
+/// Works both for the canonical location (output dir, sibling of the segment dir)
+/// and for the legacy layout (next to the video).
+pub fn session_dir_for_meta(meta_path: &Path) -> Option<PathBuf> {
+    let name = meta_path.file_name()?.to_str()?;
+    let stem = name.strip_prefix('.')?.strip_suffix(".json")?;
+    if stem.is_empty() {
+        return None;
+    }
+    Some(meta_path.parent()?.join(stem))
+}
+
+/// 由 meta 文件路径推导其所属的最终视频路径。
+/// Derive the final video path a meta file belongs to.
+pub fn video_path_for_meta(settings: &Settings, meta_path: &Path) -> Option<PathBuf> {
+    let session_dir = session_dir_for_meta(meta_path)?;
+    Some(settings.video_path_for_session_with_format(&session_dir, &settings.merge_format))
+}
+
+/// meta 文件对应视频的存在性判断结果。
+/// Presence verdict for the video belonging to a meta file.
+#[derive(Debug, PartialEq, Eq)]
+enum VideoPresence {
+    /// 视频存在 / The video exists
+    Present,
+    /// 确认视频已被删除 / The video is confirmed gone
+    Missing,
+    /// 无法判断（例如最终视频目录已被改到别处）/ Cannot tell (e.g. the video dir was moved)
+    Unknown,
+}
+
+/// 判断 meta 文件对应的视频是否仍然存在（不限定扩展名，兼容修改过合并格式的录制）。
+/// 视频所在目录不存在时返回 `Unknown`：此时多半是最终视频目录被改到了别处，
+/// 不能据此删除元数据，否则改一次目录就会丢掉全部历史元数据。
+///
+/// Whether the video belonging to a meta file still exists (any extension, so recordings
+/// merged with a since-changed `merge_format` are still recognised). Returns `Unknown`
+/// when the video's directory itself is gone: that usually means the final video directory
+/// was moved elsewhere, and metadata must not be discarded on that basis.
+fn meta_video_presence(settings: &Settings, meta_path: &Path) -> VideoPresence {
+    let Some(video_path) = video_path_for_meta(settings, meta_path) else {
+        return VideoPresence::Unknown;
+    };
+    if video_path.exists() {
+        return VideoPresence::Present;
+    }
+    let Some(parent) = video_path.parent() else {
+        return VideoPresence::Unknown;
+    };
+    if !parent.is_dir() {
+        // 视频目录本身不存在：无法确认视频是否被删除
+        // The video directory itself is missing: cannot confirm the video was deleted
+        return VideoPresence::Unknown;
+    }
+    let stem = video_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let same_stem = std::fs::read_dir(parent)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| {
+            let p = e.path();
+            if !p.is_file() {
+                return false;
+            }
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            !name.starts_with('.') && p.file_stem().and_then(|s| s.to_str()) == Some(stem)
+        });
+    if same_stem {
+        VideoPresence::Present
+    } else {
+        VideoPresence::Missing
+    }
+}
+
+/// 扫描输出目录（以及最终视频目录中旧布局遗留的 meta），
+/// 删除所有对应视频文件已不存在的孤立 meta 文件（`.{stem}.json`）。
+///
+/// Scan the output directory (plus legacy meta files still sitting in the video dir)
+/// and delete orphaned meta files (`.{stem}.json`) whose videos no longer exist.
 ///
 /// 返回删除的文件数量。
 /// Returns the number of deleted files.
-pub fn cleanup_orphaned_meta_files(output_dir: &Path) -> usize {
-    if !output_dir.exists() {
-        return 0;
+pub fn cleanup_orphaned_meta_files(settings: &Settings) -> usize {
+    let mut roots: Vec<PathBuf> = vec![PathBuf::from(settings.output_dir.trim())];
+    for root in settings.video_scan_roots() {
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
     }
     let mut count = 0usize;
-    cleanup_orphaned_meta_recursive(output_dir, &mut count);
+    for root in roots {
+        if root.exists() {
+            cleanup_orphaned_meta_recursive(&root, settings, &mut count);
+        }
+    }
     if count > 0 {
         tracing::info!("Meta cleanup: deleted {} orphaned meta file(s)", count);
     }
     count
 }
 
-fn cleanup_orphaned_meta_recursive(dir: &Path, count: &mut usize) {
+fn cleanup_orphaned_meta_recursive(dir: &Path, settings: &Settings, count: &mut usize) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -428,7 +599,7 @@ fn cleanup_orphaned_meta_recursive(dir: &Path, count: &mut usize) {
         if path.is_dir() {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if !name.starts_with('.') {
-                cleanup_orphaned_meta_recursive(&path, count);
+                cleanup_orphaned_meta_recursive(&path, settings, count);
             }
             continue;
         }
@@ -447,83 +618,54 @@ fn cleanup_orphaned_meta_recursive(dir: &Path, count: &mut usize) {
             continue;
         }
 
-        // 从 meta 文件名还原视频文件 stem：去掉首字符 '.' 和末尾 '.json'
-        // Recover video stem from meta filename: strip leading '.' and trailing '.json'
-        let stem = &name[1..name.len() - 5]; // ".{stem}.json" → "{stem}"
-        let parent = match path.parent() {
-            Some(p) => p,
-            None => continue,
-        };
+        // 仅在确认视频已被删除时清理；无法判断时保留元数据
+        // Only clean up when the video is confirmed gone; keep metadata when unsure
+        if meta_video_presence(settings, &path) != VideoPresence::Missing {
+            continue;
+        }
 
-        // 检查是否存在任意扩展名的同名视频文件
-        // Check whether a video file with the same stem exists (any extension)
-        let video_exists = std::fs::read_dir(parent)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .any(|e| {
-                let p = e.path();
-                if !p.is_file() {
-                    return false;
-                }
-                let vname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if vname.starts_with('.') {
-                    return false;
-                }
-                p.file_stem().and_then(|s| s.to_str()) == Some(stem)
-            });
+        // 跳过仍处于活跃状态的 meta（录制中/合并中/后处理中），
+        // 此时视频文件尚未生成，不应视为孤立文件。
+        // Skip meta files that are still in an active state (recording / merging / post-processing).
+        // The video file doesn't exist yet at these stages, so they are not truly orphaned.
+        let is_active = read_meta_file(&path)
+            .map(|m| {
+                matches!(
+                    m.status.as_str(),
+                    "recording" | "merging_waiting" | "merging" | "pp_waiting" | "pp_running"
+                )
+            })
+            .unwrap_or(false);
 
-        if !video_exists {
-            // 跳过仍处于活跃状态的 meta（录制中/合并中/后处理中），
-            // 此时视频文件尚未生成，不应视为孤立文件。
-            // Skip meta files that are still in an active state (recording / merging / post-processing).
-            // The video file doesn't exist yet at these stages, so they are not truly orphaned.
-            let is_active = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|c| serde_json::from_str::<VideoMeta>(&c).ok())
-                .map(|m| {
-                    matches!(
-                        m.status.as_str(),
-                        "recording" | "merging_waiting" | "merging" | "pp_waiting" | "pp_running"
-                    )
-                })
-                .unwrap_or(false);
+        if is_active {
+            tracing::debug!("Meta cleanup: skipping active meta {:?}", path);
+            continue;
+        }
 
-            if is_active {
-                tracing::debug!("Meta cleanup: skipping active meta {:?}", path);
-                continue;
-            }
-
-            if let Err(e) = std::fs::remove_file(&path) {
-                tracing::warn!("Meta cleanup: failed to delete {:?}: {}", path, e);
-            } else {
-                tracing::info!("Meta cleanup: deleted orphaned meta {:?}", path);
-                *count += 1;
-            }
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!("Meta cleanup: failed to delete {:?}: {}", path, e);
+        } else {
+            tracing::info!("Meta cleanup: deleted orphaned meta {:?}", path);
+            *count += 1;
         }
     }
 }
 
 /// 启动孤立 meta 文件清理调度器：立即执行一次，之后每小时执行一次。
 /// Start the orphaned meta cleanup scheduler: run once immediately, then once every hour.
-pub async fn schedule_meta_cleanup(output_dir: std::path::PathBuf) {
-    // 立即执行一次 / Run once immediately
-    let dir = output_dir.clone();
-    tokio::task::spawn_blocking(move || {
-        cleanup_orphaned_meta_files(&dir);
-    })
-    .await
-    .ok();
-
-    // 之后每小时执行一次 / Then run every hour
+///
+/// 每轮都会重新读取设置，因此输出目录 / 最终视频目录的变更无需重启即可生效。
+/// Settings are re-read every round, so output/video dir changes apply without a restart.
+pub async fn schedule_meta_cleanup(state: Arc<AppState>) {
     loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
-        let dir = output_dir.clone();
+        let settings = state.get_settings();
         tokio::task::spawn_blocking(move || {
-            cleanup_orphaned_meta_files(&dir);
+            cleanup_orphaned_meta_files(&settings);
         })
         .await
         .ok();
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
     }
 }
 
@@ -533,31 +675,171 @@ pub async fn schedule_meta_cleanup(output_dir: std::path::PathBuf) {
 /// Start the meta version-check polling scheduler: run once immediately, then at the
 /// specified interval. Rebuilds meta files with missing or mismatched versions,
 /// skipping active recordings.
-pub async fn schedule_meta_version_check(
-    output_dir: std::path::PathBuf,
-    merge_format: String,
-    interval_secs: u64,
-) {
-    // 立即执行一次 / Run once immediately
-    {
-        let dir = output_dir.clone();
-        let fmt = merge_format.clone();
+///
+/// # 参数 / Parameters
+/// - `state`: 应用状态（每轮重新读取设置）/ Application state (settings re-read every round)
+/// - `interval_secs`: 轮询间隔（秒）/ Poll interval (seconds)
+pub async fn schedule_meta_version_check(state: Arc<AppState>, interval_secs: u64) {
+    loop {
+        let settings = state.get_settings();
         tokio::task::spawn_blocking(move || {
-            ensure_meta_files(&dir, &fmt);
+            ensure_meta_files(&settings);
         })
         .await
         .ok();
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 在系统临时目录下创建唯一测试目录 / Create a unique test directory under the system temp dir
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "scr_meta_test_{}_{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
-    // 之后按间隔循环执行 / Then run at the specified interval
-    loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
-        let dir = output_dir.clone();
-        let fmt = merge_format.clone();
-        tokio::task::spawn_blocking(move || {
-            ensure_meta_files(&dir, &fmt);
-        })
-        .await
-        .ok();
+    fn sample_meta(status: &str) -> VideoMeta {
+        VideoMeta {
+            meta_version: META_VERSION,
+            status: status.to_string(),
+            started_at: "2026-01-01T12:00:00+08:00".to_string(),
+            size_bytes: 0,
+            video_duration_secs: None,
+            pp_results: None,
+            module_outputs: None,
+        }
+    }
+
+    #[test]
+    fn write_meta_goes_to_output_dir_not_video_dir() {
+        let root = temp_root("split");
+        let out = root.join("out");
+        let fin = root.join("fin");
+        let settings = Settings {
+            output_dir: out.to_string_lossy().to_string(),
+            final_video_dir: fin.to_string_lossy().to_string(),
+            ..Settings::default()
+        };
+        let video = fin.join("model").join("model_20260101_120000.mp4");
+        std::fs::create_dir_all(video.parent().unwrap()).unwrap();
+        std::fs::write(&video, b"x").unwrap();
+
+        write_meta(&settings, &video, &sample_meta("finish"));
+
+        let meta = settings.meta_path_for_video(&video).unwrap();
+        assert_eq!(meta, out.join("model").join(".model_20260101_120000.json"));
+        assert!(meta.exists());
+        // 最终视频目录中不得出现任何元数据文件
+        // No metadata file may appear in the final video directory
+        let stray: Vec<_> = std::fs::read_dir(video.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".json"))
+            .collect();
+        assert!(stray.is_empty(), "unexpected files in video dir: {:?}", stray);
+
+        // 通过视频路径可以读回 / The meta can be read back through the video path
+        assert_eq!(read_meta(&settings, &video).unwrap().status, "finish");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_meta_is_read_and_migrated() {
+        let root = temp_root("legacy");
+        let out = root.join("out");
+        let fin = root.join("fin");
+        let settings = Settings {
+            output_dir: out.to_string_lossy().to_string(),
+            final_video_dir: fin.to_string_lossy().to_string(),
+            ..Settings::default()
+        };
+        let video = fin.join("model").join("model_20260101_120000.mp4");
+        std::fs::create_dir_all(video.parent().unwrap()).unwrap();
+        std::fs::write(&video, b"x").unwrap();
+
+        // 旧布局：meta 与视频同目录 / Legacy layout: meta next to the video
+        let legacy = Settings::legacy_meta_path_for_video(&video).unwrap();
+        std::fs::write(&legacy, serde_json::to_string(&sample_meta("finish")).unwrap()).unwrap();
+
+        // 旧文件仍可读取 / The legacy file is still readable
+        assert_eq!(read_meta(&settings, &video).unwrap().status, "finish");
+
+        // 迁移后旧文件消失、新位置存在 / After migration the old file is gone and the new one exists
+        migrate_legacy_meta(&settings, &video);
+        let canonical = settings.meta_path_for_video(&video).unwrap();
+        assert!(canonical.exists());
+        assert!(!legacy.exists());
+        assert_eq!(read_meta_file(&canonical).unwrap().status, "finish");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn orphan_cleanup_removes_meta_only_when_video_is_really_gone() {
+        let root = temp_root("orphan");
+        let out = root.join("out");
+        let fin = root.join("fin");
+        let settings = Settings {
+            output_dir: out.to_string_lossy().to_string(),
+            final_video_dir: fin.to_string_lossy().to_string(),
+            ..Settings::default()
+        };
+
+        // 1) 视频目录整体不存在（最终视频目录被改到别处）→ 保留元数据
+        // 1) The whole video dir is missing (final video dir was moved) → keep the meta
+        std::fs::create_dir_all(out.join("model")).unwrap();
+        let moved_meta = out.join("model").join(".moved_20260101_120000.json");
+        std::fs::write(
+            &moved_meta,
+            serde_json::to_string(&sample_meta("finish")).unwrap(),
+        )
+        .unwrap();
+        cleanup_orphaned_meta_files(&settings);
+        assert!(moved_meta.exists(), "meta must survive a moved video dir");
+
+        // 2) 视频目录存在但视频已被删除 → 清理元数据
+        // 2) The video dir exists but the video is gone → the meta is cleaned up
+        std::fs::create_dir_all(fin.join("model")).unwrap();
+        std::fs::write(fin.join("model").join("other_20260101_120000.mp4"), b"x").unwrap();
+        let dead_meta = out.join("model").join(".dead_20260101_120000.json");
+        std::fs::write(
+            &dead_meta,
+            serde_json::to_string(&sample_meta("finish")).unwrap(),
+        )
+        .unwrap();
+        cleanup_orphaned_meta_files(&settings);
+        assert!(!dead_meta.exists(), "orphaned meta should be deleted");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn meta_paths_map_back_to_video() {
+        let settings = Settings {
+            output_dir: "/rec".to_string(),
+            final_video_dir: "/final".to_string(),
+            ..Settings::default()
+        };
+        let meta = Path::new("/rec/model/.model_20260101_120000.json");
+        assert_eq!(
+            session_dir_for_meta(meta),
+            Some(PathBuf::from("/rec/model/model_20260101_120000"))
+        );
+        assert_eq!(
+            video_path_for_meta(&settings, meta),
+            Some(PathBuf::from("/final/model/model_20260101_120000.mp4"))
+        );
     }
 }

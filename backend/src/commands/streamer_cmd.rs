@@ -96,9 +96,13 @@ pub async fn remove_streamer(
         recorder.stop_recording(&username).await?;
     }
     let settings = state.get_settings();
-    let streamer_dir = std::path::PathBuf::from(&settings.output_dir).join(&username);
-    if streamer_dir.exists() {
-        std::fs::remove_dir_all(&streamer_dir)?;
+    // 分片目录与最终视频目录都可能有该主播的文件夹，需一并删除
+    // Both the segment dir and the final video dir may hold a folder for this streamer
+    for root in settings.video_scan_roots() {
+        let streamer_dir = root.join(&username);
+        if streamer_dir.exists() {
+            std::fs::remove_dir_all(&streamer_dir)?;
+        }
     }
     state.remove_streamer(&username)?;
     Ok(())

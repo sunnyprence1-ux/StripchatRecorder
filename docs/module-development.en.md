@@ -51,6 +51,57 @@ A module must support two invocation modes:
 | `PP_INPUT`       | Yes      | Absolute path to the input video file                         |
 | `PP_PARAM_<KEY>` | No       | Module parameter; `<KEY>` is the uppercased parameter key     |
 | `PP_EXE_DIR`     | No       | Directory containing the module binary, useful for temp files |
+| `PP_SIDECAR_DIR` | No       | Side-output directory (the output directory). Finished videos live in the final video directory, so images and other side outputs belong here |
+| `PP_TEST`        | No       | `1` in self-test mode; `PP_INPUT` is **not** provided (see below) |
+| `PP_LOGIN`       | No       | Not set by the host; login mode is selected with the `--login` argument |
+
+### Self-test Mode (`PP_TEST=1`)
+
+Modules that declare `"testable": true` in their metadata descriptor can be run from the
+**Test** button on the Post-processing page. In this mode the host:
+
+- spawns the module with `PP_TEST=1` and the node's current `PP_PARAM_<KEY>` values,
+- does **not** set `PP_INPUT` (there is no video to process),
+- captures stdout/stderr and shows the lines in a dialog, and
+- treats a non-zero exit code as a failure (the last stderr line becomes the error message).
+
+The module should verify everything that can fail at runtime — credentials, network access,
+permissions — and print human-readable progress lines. Keep it short and side-effect free
+apart from the minimal test action itself (e.g. `notify_telegram` posts a small test clip into
+the configured chat/topic). `OUTPUT:` is not required in self-test mode; the host runs the
+module standalone, never inside a pipeline.
+
+### Interactive Login Mode (`--login`)
+
+Some modules need a human to sign in once (a Telegram user account, for example, requires a
+phone number and a login code), which cannot happen inside a single short-lived process.
+Modules that declare `"loginable": true` get a **Login** button on the Post-processing page.
+The host then spawns the module with the `--login` argument and **keeps the process alive**,
+driving it with a line protocol:
+
+| Direction          | Line                                                   |
+| ------------------ | ------------------------------------------------------ |
+| host → module      | `command:value`, e.g. `phone:+8613800138000`, `code:12345`, `password:secret`, `quit` |
+| module → host      | `LOGIN_STATE:<state>[:<detail>]`                        |
+
+The host reads stdout until a `LOGIN_STATE:` line arrives and shows the state in the dialog;
+any other stdout/stderr line is displayed as a log line. The suggested states are:
+
+| State                       | Meaning                                                    |
+| --------------------------- | ---------------------------------------------------------- |
+| `ready`                     | Connected and waiting for the first input (the phone)      |
+| `code_sent`                 | The login code was sent; waiting for `code:`               |
+| `password_required:<hint>`  | Two-factor authentication is on; waiting for `password:`   |
+| `invalid_code`              | Wrong code; the host lets the user type it again           |
+| `invalid_password`          | Wrong password; the host lets the user type it again       |
+| `done:<name>:<tier>`        | Signed in; the process exits                               |
+| `already:<name>:<tier>`     | The stored session is still valid; nothing to do           |
+| `error:<message>`           | Failed; the process exits with a non-zero code             |
+
+The module may also emit `LOGIN_STATE:session:<path>` to tell the host where the credentials
+were stored, so the UI can display it. Exit as soon as the login is finished — the host closes
+stdin and kills the process if the dialog is dismissed, so a session must never be required to
+stay alive after `done`.
 
 ### Stdout Protocol
 
@@ -90,6 +141,8 @@ When invoked with `--describe`, the module must print a JSON object to stdout an
 	"id": "my_module", // Unique identifier, lowercase letters, digits, underscores only
 	"name": "My Module", // Display name shown in the UI
 	"description": "Does X", // Short description shown in the UI
+	"testable": true, // Optional: enables the "Test" button (PP_TEST=1)
+	"loginable": true, // Optional: enables the "Login" button (--login)
 	"params": [
 		// Parameter list, may be empty array
 		{
@@ -104,12 +157,14 @@ When invoked with `--describe`, the module must print a JSON object to stdout an
 
 ### Field Reference
 
-| Field         | Type   | Required | Description                                                  |
-| ------------- | ------ | -------- | ------------------------------------------------------------ |
-| `id`          | string | Yes      | Unique module ID, must not conflict within the same instance |
-| `name`        | string | Yes      | Display name in the UI                                       |
-| `description` | string | Yes      | Description in the UI                                        |
-| `params`      | array  | Yes      | Parameter definitions; pass empty array if none              |
+| Field         | Type    | Required | Description                                                  |
+| ------------- | ------- | -------- | ------------------------------------------------------------ |
+| `id`          | string  | Yes      | Unique module ID, must not conflict within the same instance |
+| `name`        | string  | Yes      | Display name in the UI                                       |
+| `description` | string  | Yes      | Description in the UI                                        |
+| `params`      | array   | Yes      | Parameter definitions; pass empty array if none              |
+| `testable`    | boolean | No       | `true` enables the **Test** button (`PP_TEST=1`); default `false` |
+| `loginable`   | boolean | No       | `true` enables the **Login** button (`--login`); default `false` |
 
 ---
 
@@ -518,10 +573,11 @@ The project ships four modules under `modules/`, which are automatically copied 
 | `api_id`     | string  | `""`    | Telegram API ID from my.telegram.org (required)                |
 | `api_hash`   | string  | `""`    | Telegram API Hash (required)                                   |
 | `bot_token`  | string  | `""`    | Bot Token from @BotFather (required)                           |
-| `chat_id`    | string  | `""`    | Chat ID; supergroup format: `-100xxxxxxxxxx` (required)        |
-| `username`   | string  | `""`    | Group username, required for supergroups (without `@`)         |
+| `chat_id`    | string  | `""`    | Chat ID; groups and supergroups use `-100xxxxxxxxxx` (required); a private group has no username, so the id is the only way to target it |
+| `username`   | string  | `""`    | Group username, optional — public groups only, without `@`; leave empty for private groups |
 | `proxy`      | string  | `""`    | Proxy address; supports `http://` and `socks5://`              |
 | `send_video` | boolean | `true`  | Also send the video file                                       |
+| `topic_per_model` | boolean | `true` | Create/reuse one forum topic per model and post the video into it; the group must be a forum and the bot needs "Manage Topics" |
 
 ---
 
@@ -530,4 +586,5 @@ The project ships four modules under `modules/`, which are automatically copied 
 - Modules should be **stateless** and not rely on any residual state from previous executions.
 - Modules should not modify or delete files other than `PP_INPUT` unless that is their explicit purpose (e.g. `filter_short`).
 - If a module needs temporary files, use `PP_EXE_DIR/tmp/` and clean up before exiting.
+- If a module produces side outputs (contact sheets, etc.), write them to `PP_SIDECAR_DIR` (falling back to the input video's directory when unset) rather than the finished-video directory.
 - Modules must complete within a reasonable time; prolonged absence of progress output may cause the UI to appear stalled.

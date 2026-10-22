@@ -16,8 +16,10 @@ import { call, on } from "@/lib/api";
 
 /** 应用设置数据结构 / Application settings data structure */
 export interface Settings {
-	/** 录制文件输出目录 / Recording output directory */
+	/** 录制文件输出目录（.ts 分片与会话目录）/ Recording output directory (.ts segments and session dirs) */
 	output_dir: string;
+	/** 最终视频目录（留空表示与 output_dir 相同）/ Final video directory (empty = same as output_dir) */
+	final_video_dir: string;
 	/** 主播状态轮询间隔（秒）/ Streamer status poll interval (seconds) */
 	poll_interval_secs: number;
 	/** 是否默认开启自动录制 / Whether auto-record is enabled by default */
@@ -64,6 +66,7 @@ export const useSettingsStore = defineStore("settings", () => {
 	/** 当前设置值 / Current settings values */
 	const settings = ref<Settings>({
 		output_dir: "",
+		final_video_dir: "",
 		poll_interval_secs: 30,
 		auto_record: true,
 		api_proxy_url: null,

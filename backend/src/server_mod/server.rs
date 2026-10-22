@@ -145,6 +145,10 @@ pub fn build_router(state: ServerState) -> Router {
         )
         .route("/api/pipeline", get(get_pipeline).post(save_pipeline))
         .route("/api/modules", get(list_modules))
+        .route("/api/modules/test", post(test_module))
+        .route("/api/modules/login/start", post(login_start))
+        .route("/api/modules/login/input", post(login_input))
+        .route("/api/modules/login/cancel", post(login_cancel))
         .route("/api/postprocess-tasks", get(get_postprocess_tasks))
         .route("/api/recordings/module-outputs", post(get_module_outputs))
         .route("/api/locale/{locale_code}", get(get_locale_handler))
@@ -271,9 +275,13 @@ async fn remove_streamer(
             .map_err(ApiError::from)?;
     }
     let settings = s.app_state.get_settings();
-    let dir = std::path::PathBuf::from(&settings.output_dir).join(&name);
-    if dir.exists() {
-        let _ = std::fs::remove_dir_all(&dir);
+    // 分片目录与最终视频目录都可能有该主播的文件夹，需一并删除
+    // Both the segment dir and the final video dir may hold a folder for this streamer
+    for root in settings.video_scan_roots() {
+        let dir = root.join(&name);
+        if dir.exists() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
     s.app_state.remove_streamer(&name).map_err(ApiError::from)?;
     s.emitter
@@ -521,23 +529,18 @@ async fn get_merging_dirs_handler(
 
     let make_entry = |path: &std::path::PathBuf, status: &str| {
         let path_str = path.to_string_lossy().to_string();
-        let stem = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
         let username = path
             .parent()
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
-        let parent = path
-            .parent()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let sep = if path_str.contains('\\') { "\\" } else { "/" };
-        let merged_path = format!("{}{}{}.{}", parent, sep, stem, merge_format);
+        // 合并目标位于最终视频目录（可能与分片目录不同）
+        // The merge target lives in the final video directory (may differ from the segment dir)
+        let merged_path = settings
+            .video_path_for_session_with_format(path, &merge_format)
+            .to_string_lossy()
+            .to_string();
         serde_json::json!({
             "session_dir": path_str,
             "merged_path": merged_path,
@@ -567,6 +570,128 @@ async fn get_merging_dirs_handler(
 #[derive(Deserialize)]
 struct PathBody {
     path: String,
+}
+
+/// 模块自检请求体 / Module self-test request body
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModuleTestBody {
+    /// 模块 ID / Module ID
+    module_id: String,
+    /// 节点参数值 / Node parameter values
+    #[serde(default)]
+    params: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// 以自检模式（`PP_TEST=1`）运行指定模块，返回完整输出日志。
+/// 用于在界面上验证模块配置（例如 Telegram 的机器人凭据、群组与话题）。
+///
+/// Run the given module in self-test mode (`PP_TEST=1`) and return its full output log.
+/// Used to verify a module's configuration from the UI (e.g. Telegram bot credentials,
+/// chat and forum topic).
+async fn test_module(Json(body): Json<ModuleTestBody>) -> ApiResult<serde_json::Value> {
+    let result = tokio::task::spawn_blocking(move || {
+        let module = crate::postprocess::pipeline::discover_modules()
+            .into_iter()
+            .find(|m| m.id == body.module_id);
+        match module {
+            Some(m) => crate::postprocess::pipeline::run_module_test(&m, &body.params),
+            None => crate::postprocess::pipeline::TestResult {
+                success: false,
+                message: format!("模块 '{}' 不存在", body.module_id),
+                logs: vec![],
+            },
+        }
+    })
+    .await
+    .unwrap_or_else(|e| crate::postprocess::pipeline::TestResult {
+        success: false,
+        message: format!("自检任务失败: {}", e),
+        logs: vec![],
+    });
+
+    Ok(Json(serde_json::to_value(result).unwrap()))
+}
+
+/// 登录会话请求体（启动）/ Login request body (start)
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoginStartBody {
+    /// 模块 ID / Module ID
+    module_id: String,
+    /// 节点参数值 / Node parameter values
+    #[serde(default)]
+    params: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// 登录会话请求体（输入一行命令）/ Login request body (submit one command line)
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoginInputBody {
+    /// 登录会话 ID / Login session id
+    login_id: String,
+    /// 命令行（如 `phone:+8613800138000`、`code:12345`、`password:…`）
+    /// Command line (e.g. `phone:+8613800138000`, `code:12345`, `password:…`)
+    value: String,
+}
+
+/// 启动模块的交互式登录，返回第一状态（`ready` / `already` / `error`）。
+///
+/// Start the module's interactive login and return the first state
+/// (`ready` / `already` / `error`).
+async fn login_start(Json(body): Json<LoginStartBody>) -> ApiResult<serde_json::Value> {
+    let update = tokio::task::spawn_blocking(move || {
+        let module = crate::postprocess::pipeline::discover_modules()
+            .into_iter()
+            .find(|m| m.id == body.module_id);
+        match module {
+            Some(m) => crate::postprocess::login::start_login(&m, &body.params)
+                .map_err(crate::core::error::AppError::Other),
+            None => Err(crate::core::error::AppError::Other(format!(
+                "模块 '{}' 不存在",
+                body.module_id
+            ))),
+        }
+    })
+    .await
+    .map_err(|e| ApiError(format!("登录任务失败: {}", e)))??;
+
+    Ok(Json(serde_json::to_value(update).unwrap()))
+}
+
+/// 向登录会话提交一行命令（手机号 / 验证码 / 密码），返回下一个状态。
+///
+/// Submit one command line (phone / code / password) to a login session and return
+/// the next state.
+async fn login_input(Json(body): Json<LoginInputBody>) -> ApiResult<serde_json::Value> {
+    let update = tokio::task::spawn_blocking(move || {
+        crate::postprocess::login::send_login_input(&body.login_id, &body.value)
+            .map_err(crate::core::error::AppError::Other)
+    })
+    .await
+    .map_err(|e| ApiError(format!("登录任务失败: {}", e)))??;
+
+    Ok(Json(serde_json::to_value(update).unwrap()))
+}
+
+/// 取消登录请求体 / Cancel-login request body
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoginCancelBody {
+    /// 登录会话 ID / Login session id
+    login_id: String,
+}
+
+/// 取消并结束一个登录会话 / Cancel and terminate a login session.
+async fn login_cancel(Json(body): Json<LoginCancelBody>) -> ApiResult<serde_json::Value> {
+    tokio::task::spawn_blocking(move || {
+        crate::postprocess::login::cancel_login(&body.login_id)
+            .map_err(crate::core::error::AppError::Other)
+    })
+    .await
+    .map_err(|e| ApiError(format!("取消登录失败: {}", e)))??;
+
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn delete_recording(
@@ -709,18 +834,26 @@ async fn serve_output_file(
     Query(q): Query<FileQuery>,
 ) -> impl IntoResponse {
     let settings = s.app_state.get_settings();
-    let output_dir = std::path::Path::new(&settings.output_dir);
     let requested = std::path::Path::new(&q.path);
 
-    let canonical_output = match output_dir.canonicalize() {
-        Ok(p) => p,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "output dir error").into_response(),
-    };
+    // 允许访问的根目录：最终视频目录（及其遗留的）输出目录
+    // Allowed roots: the final video dir and the (legacy) output dir
+    let allowed_roots: Vec<std::path::PathBuf> = settings
+        .video_scan_roots()
+        .into_iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .collect();
+    if allowed_roots.is_empty() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "output dir error").into_response();
+    }
     let canonical_requested = match requested.canonicalize() {
         Ok(p) => p,
         Err(_) => return (StatusCode::NOT_FOUND, "file not found").into_response(),
     };
-    if !canonical_requested.starts_with(&canonical_output) {
+    if !allowed_roots
+        .iter()
+        .any(|root| canonical_requested.starts_with(root))
+    {
         return (StatusCode::FORBIDDEN, "access denied").into_response();
     }
 
@@ -761,12 +894,24 @@ async fn get_module_outputs(
                 .get("format")
                 .and_then(|v: &serde_json::Value| v.as_str())
                 .unwrap_or("webp");
-            if let (Some(parent), Some(stem)) = (
-                video_path.parent(),
-                video_path.file_stem().and_then(|s| s.to_str()),
-            ) {
-                let img_path = parent.join(format!("{}.{}", stem, format));
-                if img_path.exists() {
+            if let Some(stem) = video_path.file_stem().and_then(|s| s.to_str()) {
+                // 副产物写在输出目录（副产物目录）；成片同目录为旧布局回退
+                // Side outputs live in the output dir (sidecar dir); the video dir is a legacy fallback
+                let settings = s.app_state.get_settings();
+                let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+                if let Some(dir) = settings.sidecar_dir_for_video(video_path) {
+                    dirs.push(dir);
+                }
+                if let Some(parent) = video_path.parent()
+                    && !dirs.iter().any(|d| d == parent)
+                {
+                    dirs.push(parent.to_path_buf());
+                }
+                let found = dirs
+                    .into_iter()
+                    .map(|dir| dir.join(format!("{}.{}", stem, format)))
+                    .find(|p| p.exists());
+                if let Some(img_path) = found {
                     outputs.insert(
                         node.module_id.clone(),
                         img_path.to_string_lossy().to_string(),
@@ -872,6 +1017,7 @@ pub async fn run_server(port: u16) {
         let settings = app_state.get_settings();
         let output_dir = std::path::PathBuf::from(&settings.output_dir);
         let merge_format = settings.merge_format.clone();
+        let scan_roots = settings.video_scan_roots();
         let emitter_clone = Arc::clone(&emitter);
         let recorder_clone = Arc::clone(&recorder);
         tokio::task::spawn_blocking(move || {
@@ -881,10 +1027,12 @@ pub async fn run_server(port: u16) {
                 &emitter_clone,
                 &recorder_clone,
             );
-            crate::recording::recorder::startup_remove_empty_dirs(&output_dir);
-            // 扫描并补写缺失的 meta 文件
-            // Scan and write missing meta files
-            crate::recording::meta::startup_ensure_meta_files(&output_dir, &merge_format);
+            for root in &scan_roots {
+                crate::recording::recorder::startup_remove_empty_dirs(root);
+            }
+            // 扫描并补写缺失的 meta 文件（并迁移旧布局的 meta 到输出目录）
+            // Scan and write missing meta files (migrating legacy meta into the output dir)
+            crate::recording::meta::startup_ensure_meta_files(&settings);
         });
     }
 
@@ -922,20 +1070,18 @@ pub async fn run_server(port: u16) {
     // 启动孤立 meta 文件清理调度器（启动时立即执行一次，之后每小时一次）
     // Start orphaned meta cleanup scheduler (once on startup, then every hour)
     {
-        let output_dir = std::path::PathBuf::from(&app_state.get_settings().output_dir);
+        let state = Arc::clone(&app_state);
         tokio::spawn(async move {
-            crate::recording::meta::schedule_meta_cleanup(output_dir).await;
+            crate::recording::meta::schedule_meta_cleanup(state).await;
         });
     }
 
     // 启动 meta 版本检查轮询调度器（启动时立即执行一次，之后每 5 分钟一次）
     // Start meta version-check polling scheduler (once on startup, then every 5 minutes)
     {
-        let settings = app_state.get_settings();
-        let output_dir = std::path::PathBuf::from(&settings.output_dir);
-        let merge_format = settings.merge_format.clone();
+        let state = Arc::clone(&app_state);
         tokio::spawn(async move {
-            crate::recording::meta::schedule_meta_version_check(output_dir, merge_format, 300).await;
+            crate::recording::meta::schedule_meta_version_check(state, 300).await;
         });
     }
 

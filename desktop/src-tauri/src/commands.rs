@@ -98,9 +98,13 @@ pub async fn remove_streamer(
         state.recorder.stop_recording(&username).await.map_err(map_err)?;
     }
     let settings = state.app_state.get_settings();
-    let dir = std::path::PathBuf::from(&settings.output_dir).join(&username);
-    if dir.exists() {
-        let _ = std::fs::remove_dir_all(&dir);
+    // 分片目录与最终视频目录都可能有该主播的文件夹，需一并删除
+    // Both the segment dir and the final video dir may hold a folder for this streamer
+    for root in settings.video_scan_roots() {
+        let dir = root.join(&username);
+        if dir.exists() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
     state.app_state.remove_streamer(&username).map_err(map_err)?;
     state.emitter.emit("streamer-removed", &serde_json::json!({ "username": username }));
@@ -286,16 +290,18 @@ pub async fn get_merging_dirs(state: State<'_, DesktopState>) -> CmdResult<serde
 
     let make_entry = |path: &std::path::PathBuf, status: &str| {
         let path_str = path.to_string_lossy().to_string();
-        let stem = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
         let username = path
             .parent()
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
-        let parent = path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-        let sep = if path_str.contains('\\') { "\\" } else { "/" };
-        let merged_path = format!("{}{}{}.{}", parent, sep, stem, merge_format);
+        // 合并目标位于最终视频目录（可能与分片目录不同）
+        // The merge target lives in the final video directory (may differ from the segment dir)
+        let merged_path = settings
+            .video_path_for_session_with_format(path, &merge_format)
+            .to_string_lossy()
+            .to_string();
         serde_json::json!({
             "session_dir": path_str,
             "merged_path": merged_path,
@@ -422,6 +428,83 @@ pub async fn list_modules() -> CmdResult<serde_json::Value> {
     Ok(serde_json::to_value(modules).unwrap())
 }
 
+/// 以自检模式（`PP_TEST=1`）运行指定模块并返回完整输出日志。
+/// 用于在界面上验证模块配置（例如 Telegram 的机器人凭据、群组与话题）。
+///
+/// Run the given module in self-test mode (`PP_TEST=1`) and return its full output log.
+/// Used to verify a module's configuration from the UI (e.g. Telegram bot credentials,
+/// chat and forum topic).
+#[tauri::command]
+pub async fn test_module(
+    module_id: String,
+    params: std::collections::HashMap<String, serde_json::Value>,
+) -> CmdResult<serde_json::Value> {
+    let result = tokio::task::spawn_blocking(move || {
+        let module = stripchat_recorder_lib::postprocess::pipeline::discover_modules()
+            .into_iter()
+            .find(|m| m.id == module_id);
+        match module {
+            Some(m) => stripchat_recorder_lib::postprocess::pipeline::run_module_test(&m, &params),
+            None => stripchat_recorder_lib::postprocess::pipeline::TestResult {
+                success: false,
+                message: format!("模块 '{}' 不存在", module_id),
+                logs: vec![],
+            },
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(serde_json::to_value(result).unwrap())
+}
+
+/// 启动模块的交互式登录，返回第一状态（`ready` / `already` / `error`）。
+///
+/// Start the module's interactive login and return the first state
+/// (`ready` / `already` / `error`).
+#[tauri::command]
+pub async fn login_start(
+    module_id: String,
+    params: std::collections::HashMap<String, serde_json::Value>,
+) -> CmdResult<serde_json::Value> {
+    let update = tokio::task::spawn_blocking(move || {
+        let module = stripchat_recorder_lib::postprocess::pipeline::discover_modules()
+            .into_iter()
+            .find(|m| m.id == module_id);
+        match module {
+            Some(m) => stripchat_recorder_lib::postprocess::login::start_login(&m, &params),
+            None => Err(format!("模块 '{}' 不存在", module_id)),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(serde_json::to_value(update).unwrap())
+}
+
+/// 向登录会话提交一行命令（手机号 / 验证码 / 密码），返回下一个状态。
+///
+/// Submit one command line (phone / code / password) to a login session and return
+/// the next state.
+#[tauri::command]
+pub async fn login_input(login_id: String, value: String) -> CmdResult<serde_json::Value> {
+    let update = tokio::task::spawn_blocking(move || {
+        stripchat_recorder_lib::postprocess::login::send_login_input(&login_id, &value)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(serde_json::to_value(update).unwrap())
+}
+
+/// 取消并结束一个登录会话 / Cancel and terminate a login session.
+#[tauri::command]
+pub async fn login_cancel(login_id: String) -> CmdResult<serde_json::Value> {
+    tokio::task::spawn_blocking(move || {
+        stripchat_recorder_lib::postprocess::login::cancel_login(&login_id)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(serde_json::json!({ "ok": true }))
+}
+
 // ─── Locale ───────────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -507,8 +590,9 @@ pub async fn open_output_dir(
     state: State<'_, DesktopState>,
 ) -> CmdResult<serde_json::Value> {
     use tauri_plugin_opener::OpenerExt;
-    let output_dir = state.app_state.get_settings().output_dir;
-    app.opener().open_path(&output_dir, None::<&str>).map_err(|e| e.to_string())?;
+    // 最终视频目录（未单独设置时即为输出目录）/ The final video directory (equals output dir when unset)
+    let video_dir = state.app_state.get_settings().videos_root();
+    app.opener().open_path(&video_dir, None::<&str>).map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "ok": true }))
 }
 
@@ -520,14 +604,17 @@ pub async fn read_output_file(
     state: State<'_, DesktopState>,
 ) -> CmdResult<serde_json::Value> {
     let settings = state.app_state.get_settings();
-    let output_dir = std::path::Path::new(&settings.output_dir);
     let requested = std::path::Path::new(&path);
 
-    // 安全检查：确保请求的文件在输出目录范围内
-    // Safety check: ensure requested file is within the output directory
-    let canonical_output = output_dir.canonicalize().map_err(|e| e.to_string())?;
+    // 安全检查：确保请求的文件在最终视频目录或输出目录范围内
+    // Safety check: ensure the requested file is within the video dir or the output dir
+    let allowed_roots: Vec<std::path::PathBuf> = settings
+        .video_scan_roots()
+        .into_iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .collect();
     let canonical_requested = requested.canonicalize().map_err(|_| "文件不存在".to_string())?;
-    if !canonical_requested.starts_with(&canonical_output) {
+    if !allowed_roots.iter().any(|root| canonical_requested.starts_with(root)) {
         return Err("访问被拒绝".to_string());
     }
 

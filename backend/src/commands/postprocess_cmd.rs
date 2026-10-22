@@ -29,7 +29,7 @@ pub fn run_postprocess_for_path(
     );
 
     // 更新元数据文件中的后处理状态 / Update post-processing status in metadata file
-    crate::recording::meta::set_status(video_path, "pp_waiting");
+    crate::recording::meta::set_status(&state.get_settings(), video_path, "pp_waiting");
 
     run_postprocess_for_path_inner(video_path, pipeline, emitter, state);
 }
@@ -68,7 +68,8 @@ pub fn run_postprocess_for_path_inner(
 
     // 从 meta 读取上次的后处理结果，用于跳过已成功的模块（重新后处理时复用）
     // Read previous pp_results from meta to skip already-succeeded modules on re-run
-    let meta_snapshot = crate::recording::meta::read_meta(video_path);
+    let settings = state.get_settings();
+    let meta_snapshot = crate::recording::meta::read_meta(&settings, video_path);
     tracing::info!(
         "pp re-run: video={:?}, meta_status={:?}, meta_pp_results_count={}",
         video_path,
@@ -138,16 +139,14 @@ pub fn run_postprocess_for_path_inner(
     );
 
     // 更新元数据文件：标记为运行中 / Update metadata file: mark as running
-    crate::recording::meta::set_status(video_path, "pp_running");
-
-    let max_tmp_dir_gb = state.get_settings().max_tmp_dir_gb;
+    crate::recording::meta::set_status(&settings, video_path, "pp_running");
 
     let new_results: Vec<NodeResult> = run_pipeline(
         video_path,
         &effective_pipeline,
         &modules,
         Some(cancel_flag),
-        max_tmp_dir_gb,
+        &settings,
         // 进度回调：更新状态并向前端发送进度事件
         // Progress callback: update state and emit progress event to frontend
         |node_done: usize, node_total: usize, mod_done: u32, mod_total: u32, module_name: &str, status_text: &str| {
@@ -235,7 +234,7 @@ pub fn run_postprocess_for_path_inner(
     let all_ok = results.iter().all(|r| r.success);
 
     if !video_path.exists() {
-        crate::recording::meta::delete_meta(video_path);
+        crate::recording::meta::delete_meta(&settings, video_path);
         {
             let mut data = state.data.write();
             data.pp_results.retain(|p| p != &path_str);
@@ -262,7 +261,7 @@ pub fn run_postprocess_for_path_inner(
             })
             .collect();
         let mut module_outputs = std::collections::HashMap::new();
-        if let Some(prev_meta) = crate::recording::meta::read_meta(video_path)
+        if let Some(prev_meta) = crate::recording::meta::read_meta(&settings, video_path)
             && let Some(prev_outputs) = prev_meta.module_outputs {
             module_outputs.extend(prev_outputs);
         }
@@ -278,6 +277,7 @@ pub fn run_postprocess_for_path_inner(
             }
         }
         crate::recording::meta::set_pp_done(
+            &settings,
             video_path,
             final_status,
             pp_module_results,

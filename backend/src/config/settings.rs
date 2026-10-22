@@ -12,7 +12,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -62,8 +62,12 @@ pub struct PpTaskStatus {
 /// 用户可配置的录制器设置 / User-configurable recorder settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
-    /// 录制文件输出目录 / Recording output directory
+    /// 录制文件输出目录（存放 .ts 分片与合并前的会话目录）/ Recording output directory (stores .ts segments and session dirs)
     pub output_dir: String,
+    /// 最终视频目录（仅存放合并后的视频与元数据；留空表示与 output_dir 相同）
+    /// Final video directory (merged videos and their metadata only; empty = same as output_dir)
+    #[serde(default)]
+    pub final_video_dir: String,
     /// 主播状态轮询间隔（秒）/ Streamer status poll interval (seconds)
     pub poll_interval_secs: u64,
     /// 是否默认开启自动录制 / Whether auto-record is enabled by default
@@ -143,11 +147,91 @@ fn default_server_port() -> u16 {
 }
 
 /// 返回可执行文件所在目录，用于定位配置文件和模块目录。
+///
+/// `current_exe()` 会解析符号链接：当可执行文件是 `target/debug/` 下指向 `deps/` 的链接时，
+/// 目录会变成 `deps/`，导致 `modules/`、`locale/`、`config/` 全部找不到（后处理模块列表为空）。
+/// 因此按以下顺序挑选候选目录：启动参数 argv[0] 的目录 → `current_exe()` 的目录 →
+/// 从候选目录向上回溯的父目录；取第一个真正包含 `modules/` 或 `locale/` 的目录。
+///
 /// Returns the directory containing the executable, used to locate config files and module directories.
+///
+/// `current_exe()` resolves symlinks: when the executable is a link under `target/debug/` that
+/// points into `deps/`, the directory becomes `deps/`, so `modules/`, `locale/` and `config/`
+/// are all missed (the post-processing module list comes back empty). Candidates are therefore
+/// tried in this order: the directory of argv[0] as launched → the directory of `current_exe()` →
+/// parent directories of those; the first one that actually contains `modules/` or `locale/` wins.
 pub fn exe_dir() -> PathBuf {
-    std::env::current_exe()
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<PathBuf> = OnceLock::new();
+    CACHE.get_or_init(compute_exe_dir).clone()
+}
+
+/// 计算 `exe_dir()` 的实际结果（见上方的候选目录规则）。
+/// Compute the actual `exe_dir()` result (candidate rules described above).
+fn compute_exe_dir() -> PathBuf {
+    /// 把候选目录规范化为绝对路径；相对路径按当前工作目录展开。
+    /// Normalize a candidate into an absolute path; relative paths resolve against the CWD.
+    fn absolute(dir: &Path) -> PathBuf {
+        let joined = if dir.is_absolute() {
+            dir.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(dir))
+                .unwrap_or_else(|_| dir.to_path_buf())
+        };
+        std::fs::canonicalize(&joined).unwrap_or(joined)
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // 1) 启动参数 argv[0]（不解析符号链接，反映用户实际调用的路径）
+    // 1) argv[0] as launched (symlinks not resolved, reflects the path the user invoked)
+    if let Some(arg0) = std::env::args_os().next() {
+        let path = PathBuf::from(arg0);
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            candidates.push(absolute(parent));
+        }
+    }
+
+    // 2) current_exe() 的目录（可能已被解析到 deps/）
+    // 2) The directory of current_exe() (may already be resolved into deps/)
+    let current_exe_dir = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .and_then(|p| p.parent().map(absolute));
+    if let Some(dir) = current_exe_dir.clone()
+        && !candidates.contains(&dir)
+    {
+        candidates.push(dir);
+    }
+
+    // 3) 优先选择包含 modules/ 或 locale/ 的候选目录
+    // 3) Prefer a candidate that actually contains modules/ or locale/
+    for marker in ["modules", "locale"] {
+        for dir in &candidates {
+            if dir.join(marker).is_dir() {
+                return dir.clone();
+            }
+        }
+    }
+
+    // 4) cargo 的 deps/ 布局：从 current_exe() 目录向上回溯最多 3 层
+    // 4) cargo's deps/ layout: walk up to 3 ancestors from the current_exe() directory
+    if let Some(dir) = current_exe_dir {
+        let mut cur: &Path = &dir;
+        for _ in 0..3 {
+            let Some(parent) = cur.parent() else { break };
+            if parent.join("modules").is_dir() || parent.join("locale").is_dir() {
+                return parent.to_path_buf();
+            }
+            cur = parent;
+        }
+    }
+
+    // 5) 全部落空：退回第一个候选目录（保持旧行为）
+    // 5) Nothing matched: fall back to the first candidate (preserves the old behaviour)
+    candidates
+        .into_iter()
+        .next()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
@@ -159,6 +243,7 @@ impl Default for Settings {
 
         Self {
             output_dir,
+            final_video_dir: String::new(),
             poll_interval_secs: 30,
             auto_record: true,
             api_proxy_url: None,
@@ -175,6 +260,125 @@ impl Default for Settings {
             mouflon_sync_url: default_mouflon_sync_url(),
             mouflon_sync_token: None,
             setup_done: false,
+        }
+    }
+}
+
+impl Settings {
+    /// 最终视频所在根目录；`final_video_dir` 为空时回退到 `output_dir`。
+    /// Root directory holding final videos; falls back to `output_dir` when `final_video_dir` is empty.
+    pub fn videos_root(&self) -> PathBuf {
+        let custom = self.final_video_dir.trim();
+        if custom.is_empty() {
+            PathBuf::from(&self.output_dir)
+        } else {
+            PathBuf::from(custom)
+        }
+    }
+
+    /// 是否将最终视频与分片分开存放。
+    /// Whether final videos are stored separately from the segment directories.
+    pub fn has_separate_video_dir(&self) -> bool {
+        self.videos_root() != PathBuf::from(&self.output_dir)
+    }
+
+    /// 计算录制会话目录对应的最终视频路径：`{videos_root}/{username}/{stem}.{fmt}`。
+    /// 若会话目录直接位于输出目录下（旧布局），则不再额外插入用户名层级。
+    ///
+    /// Compute the final video path for a session directory: `{videos_root}/{username}/{stem}.{fmt}`.
+    /// When the session dir sits directly under the output dir (legacy layout), no username level is added.
+    pub fn video_path_for_session_with_format(&self, session_dir: &std::path::Path, fmt: &str) -> PathBuf {
+        let stem = session_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        let output_root = Path::new(self.output_dir.trim());
+        let username = match session_dir.parent() {
+            Some(parent) if parent != output_root => {
+                parent.file_name().and_then(|n| n.to_str()).unwrap_or("")
+            }
+            _ => "",
+        };
+        let root = self.videos_root();
+        let dir = if username.is_empty() {
+            root
+        } else {
+            root.join(username)
+        };
+        dir.join(format!("{}.{}", stem, fmt))
+    }
+
+    /// 计算录制会话目录对应的最终视频路径（使用当前 `merge_format`）。
+    /// Compute the final video path for a session directory (using the current `merge_format`).
+    pub fn video_path_for_session(&self, session_dir: &std::path::Path) -> PathBuf {
+        self.video_path_for_session_with_format(session_dir, &self.merge_format)
+    }
+
+    /// 计算最终视频对应的录制会话（.ts 分片）目录。
+    /// Compute the recording session (.ts segment) directory that belongs to a final video.
+    pub fn session_dir_for_video(&self, video_path: &std::path::Path) -> PathBuf {
+        let stem = video_path
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        let videos_root = self.videos_root();
+        let username = match video_path.parent() {
+            Some(parent) if parent != videos_root => {
+                parent.file_name().and_then(|n| n.to_str()).unwrap_or("")
+            }
+            _ => "",
+        };
+        let output_root = PathBuf::from(self.output_dir.trim());
+        let dir = if username.is_empty() {
+            output_root
+        } else {
+            output_root.join(username)
+        };
+        dir.join(stem)
+    }
+
+    /// 计算最终视频对应的元数据文件路径：`.{stem}.json`，存放在**输出目录**中、
+    /// 与分片目录同级的隐藏文件。最终视频目录只保存成片，不存放任何元数据。
+    ///
+    /// 输出目录与最终视频目录相同时，该路径与「视频同目录」的旧布局完全一致。
+    ///
+    /// Compute the metadata file path for a final video: `.{stem}.json`, a hidden file that
+    /// lives in the **output directory**, as a sibling of the segment directory.
+    /// The final video directory only ever holds merged videos.
+    ///
+    /// When the output dir and the final video dir are the same, this is identical to the
+    /// legacy "next to the video" layout.
+    pub fn meta_path_for_video(&self, video_path: &std::path::Path) -> Option<PathBuf> {
+        let stem = video_path.file_stem()?.to_str()?;
+        let session_dir = self.session_dir_for_video(video_path);
+        Some(session_dir.with_file_name(format!(".{}.json", stem)))
+    }
+
+    /// 旧布局（元数据与视频同目录）下的元数据路径，用于升级时迁移遗留文件。
+    /// Legacy (metadata next to the video) meta path, used to migrate files on upgrade.
+    pub fn legacy_meta_path_for_video(video_path: &std::path::Path) -> Option<PathBuf> {
+        let parent = video_path.parent()?;
+        let stem = video_path.file_stem()?.to_str()?;
+        Some(parent.join(format!(".{}.json", stem)))
+    }
+
+    /// 模块副产物（联系表图片等）应写入的目录：与元数据文件同目录，即输出目录。
+    /// Directory where module side outputs (contact sheets etc.) should be written:
+    /// the directory of the metadata file, i.e. the output directory.
+    pub fn sidecar_dir_for_video(&self, video_path: &std::path::Path) -> Option<PathBuf> {
+        self.meta_path_for_video(video_path)
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    }
+
+    /// 需要扫描最终视频的所有根目录（去重；最终视频目录优先，其次是遗留的输出目录）。
+    /// All roots that may contain final videos (deduplicated; video dir first, then legacy output dir).
+    pub fn video_scan_roots(&self) -> Vec<PathBuf> {
+        let videos = self.videos_root();
+        let output = PathBuf::from(&self.output_dir);
+        if videos == output {
+            vec![videos]
+        } else {
+            vec![videos, output]
         }
     }
 }
@@ -280,6 +484,7 @@ impl AppState {
         let data = AppData { settings, streamers, mouflon_keys, pipeline, pp_results };
 
         fs::create_dir_all(&data.settings.output_dir)?;
+        fs::create_dir_all(data.settings.videos_root())?;
 
         Ok(Arc::new(Self {
             data: RwLock::new(data),
@@ -327,6 +532,7 @@ impl AppState {
     /// If mouflon_sync_url or mouflon_sync_token changed, notify the sync scheduler to trigger immediately.
     pub fn update_settings(&self, settings: Settings) -> Result<()> {
         fs::create_dir_all(&settings.output_dir)?;
+        fs::create_dir_all(settings.videos_root())?;
         let old = self.data.read().settings.clone();
         let poll_interval_changed = old.poll_interval_secs != settings.poll_interval_secs;
         let mouflon_sync_changed = old.mouflon_sync_url != settings.mouflon_sync_url
@@ -659,14 +865,22 @@ impl AppState {
     pub fn get_pp_tasks(&self) -> Vec<PpTaskStatus> {
         let mut tasks: HashMap<String, PpTaskStatus> = self.pp_tasks.read().clone();
 
+        // 先取出设置与记录列表，避免在持有读锁时再次读取设置造成锁重入
+        // Snapshot settings and the recorded list first, so settings can be read
+        // without re-entering the data lock
+        let (settings, pp_results) = {
+            let data = self.data.read();
+            (data.settings.clone(), data.pp_results.clone())
+        };
+
         // 从 pp_results 目录文件补充历史任务，通过 meta 确认 success/failure
         // Supplement historical tasks from pp_results directory, confirming success/failure via meta
-        for path in self.data.read().pp_results.iter() {
+        for path in pp_results.iter() {
             if tasks.contains_key(path) {
                 continue;
             }
             let video_path = std::path::Path::new(path);
-            let success = crate::recording::meta::read_meta(video_path)
+            let success = crate::recording::meta::read_meta(&settings, video_path)
                 .map(|m| m.status == "finish")
                 .unwrap_or(false);
             tasks.insert(path.clone(), PpTaskStatus {
@@ -825,5 +1039,80 @@ pub async fn schedule_mouflon_sync(
                 tracing::info!("Mouflon sync: settings changed, triggering immediate sync");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Settings;
+    use std::path::{Path, PathBuf};
+
+    /// 构造一个用于路径映射测试的设置 / Build settings for path-mapping tests
+    fn settings(output_dir: &str, final_video_dir: &str) -> Settings {
+        Settings {
+            output_dir: output_dir.to_string(),
+            final_video_dir: final_video_dir.to_string(),
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn meta_lives_in_output_dir_when_dirs_are_split() {
+        let s = settings("/rec", "/final");
+        let video = Path::new("/final/model/model_20260101_120000.mp4");
+        assert_eq!(
+            s.meta_path_for_video(video),
+            Some(PathBuf::from("/rec/model/.model_20260101_120000.json"))
+        );
+        assert_eq!(
+            s.sidecar_dir_for_video(video),
+            Some(PathBuf::from("/rec/model"))
+        );
+    }
+
+    #[test]
+    fn meta_matches_legacy_layout_when_dirs_are_the_same() {
+        let s = settings("/rec", "");
+        let video = Path::new("/rec/model/model_20260101_120000.mp4");
+        let canonical = s.meta_path_for_video(video);
+        assert_eq!(
+            canonical,
+            Settings::legacy_meta_path_for_video(video)
+        );
+        assert_eq!(
+            canonical,
+            Some(PathBuf::from("/rec/model/.model_20260101_120000.json"))
+        );
+    }
+
+    #[test]
+    fn flat_legacy_layout_has_no_username_level() {
+        let s = settings("/rec", "");
+        let video = Path::new("/rec/model_20260101_120000.mp4");
+        assert_eq!(
+            s.meta_path_for_video(video),
+            Some(PathBuf::from("/rec/.model_20260101_120000.json"))
+        );
+    }
+
+    #[test]
+    fn video_path_round_trips_through_session_dir() {
+        let s = settings("/rec", "/final");
+        let session = Path::new("/rec/model/model_20260101_120000");
+        let video = s.video_path_for_session(session);
+        assert_eq!(video, PathBuf::from("/final/model/model_20260101_120000.mp4"));
+        assert_eq!(s.session_dir_for_video(&video), session);
+        assert_eq!(
+            s.meta_path_for_video(&video),
+            Some(PathBuf::from("/rec/model/.model_20260101_120000.json"))
+        );
+    }
+
+    #[test]
+    fn videos_root_falls_back_to_output_dir() {
+        assert_eq!(settings("/rec", "   ").videos_root(), PathBuf::from("/rec"));
+        assert_eq!(settings("/rec", "/final").videos_root(), PathBuf::from("/final"));
+        assert!(!settings("/rec", "").has_separate_video_dir());
+        assert!(settings("/rec", "/final").has_separate_video_dir());
     }
 }

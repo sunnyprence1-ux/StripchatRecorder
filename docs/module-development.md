@@ -53,6 +53,53 @@ PP_INPUT=<path>  PP_PARAM_<KEY>=<value> ...  ./<module_binary>
 | `PP_INPUT`       | 是   | 输入视频文件的绝对路径                     |
 | `PP_PARAM_<KEY>` | 否   | 模块参数，`<KEY>` 为参数键名的大写形式     |
 | `PP_EXE_DIR`     | 否   | 模块二进制文件所在目录，可用于存放临时文件 |
+| `PP_SIDECAR_DIR` | 否   | 副产物输出目录（输出目录）。成片保存在最终视频目录，模块生成的图片等副产物应写入此目录，避免污染成片目录 |
+| `PP_TEST`        | 否   | 自检模式下为 `1`，此时**不提供** `PP_INPUT`（见下节） |
+| `PP_LOGIN`       | 否   | 主程序不设置；登录模式通过 `--login` 参数选择 |
+
+### 自检模式（`PP_TEST=1`）
+
+在元数据中声明 `"testable": true` 的模块，可以在「后处理」页面通过节点上的「测试」按钮直接运行。
+自检模式下主程序会：
+
+- 以 `PP_TEST=1` 加上节点当前的 `PP_PARAM_<KEY>` 参数启动模块；
+- **不设置** `PP_INPUT`（此时没有待处理的视频）；
+- 捕获 stdout/stderr 并在对话框中逐行展示；
+- 退出码非 0 视为失败（最后一行 stderr 作为错误信息）。
+
+模块应校验所有运行时可能失败的因素——凭据、网络连通性、权限等——并输出便于阅读的进度行。
+除测试动作本身外（例如 `notify_telegram` 会向配置的群组/话题发送一个很小的测试视频），
+自检不应产生其他副作用。自检模式不需要输出 `OUTPUT:`：模块是独立运行的，不参与流水线。
+
+### 交互式登录模式（`--login`）
+
+有些模块需要人工登录一次（例如 Telegram 用户账号需要手机号和验证码），
+这类登录无法在单次短命进程内完成。声明 `"loginable": true` 的模块会在「后处理」页面
+多出一个「登录」按钮：主程序以 `--login` 参数启动模块并**保持进程存活**，
+通过行协议分步驱动：
+
+| 方向         | 行内容                                                 |
+| ------------ | ------------------------------------------------------ |
+| 宿主 → 模块  | `命令:值`，如 `phone:+8613800138000`、`code:12345`、`password:密码`、`quit` |
+| 模块 → 宿主  | `LOGIN_STATE:<状态>[:<附加信息>]`                       |
+
+主程序会持续读取 stdout，直到出现 `LOGIN_STATE:` 开头的行为止，并把该状态显示在对话框中；
+其他 stdout/stderr 行作为日志逐行展示。建议使用以下状态：
+
+| 状态                        | 含义                                        |
+| --------------------------- | ------------------------------------------- |
+| `ready`                     | 已连接，等待第一项输入（手机号）            |
+| `code_sent`                 | 验证码已发送，等待 `code:`                  |
+| `password_required:<hint>`  | 已开启两步验证，等待 `password:`            |
+| `invalid_code`              | 验证码错误，界面允许重新输入                |
+| `invalid_password`          | 密码错误，界面允许重新输入                  |
+| `done:<名称>:<等级>`        | 登录成功，进程退出                          |
+| `already:<名称>:<等级>`     | 已有会话仍然有效，无需登录                  |
+| `error:<信息>`              | 失败，进程以非 0 退出码结束                 |
+
+模块还可以输出 `LOGIN_STATE:session:<路径>`，告知宿主凭据保存位置，界面会显示该路径。
+登录完成后应立即退出；若用户关闭对话框，主程序会关闭 stdin 并结束进程，
+因此不要把「进程存活」作为登录状态的前提。
 
 ### 标准输出协议
 
@@ -92,6 +139,8 @@ PP_INPUT=<path>  PP_PARAM_<KEY>=<value> ...  ./<module_binary>
 	"id": "my_module", // 模块唯一标识符，仅含小写字母、数字和下划线
 	"name": "我的模块", // UI 中显示的名称
 	"description": "模块功能描述", // UI 中显示的简短描述
+	"testable": true, // 可选：开启「测试」按钮（PP_TEST=1）
+	"loginable": true, // 可选：开启「登录」按钮（--login）
 	"params": [
 		// 参数列表，可为空数组
 		{
@@ -106,12 +155,14 @@ PP_INPUT=<path>  PP_PARAM_<KEY>=<value> ...  ./<module_binary>
 
 ### 字段说明
 
-| 字段          | 类型   | 必填 | 说明                              |
-| ------------- | ------ | ---- | --------------------------------- |
-| `id`          | string | 是   | 模块唯一 ID，在同一实例中不可重复 |
-| `name`        | string | 是   | UI 显示名称                       |
-| `description` | string | 是   | UI 显示描述                       |
-| `params`      | array  | 是   | 参数定义列表，无参数时传空数组    |
+| 字段          | 类型    | 必填 | 说明                              |
+| ------------- | ------- | ---- | --------------------------------- |
+| `id`          | string  | 是   | 模块唯一 ID，在同一实例中不可重复 |
+| `name`        | string  | 是   | UI 显示名称                       |
+| `description` | string  | 是   | UI 显示描述                       |
+| `params`      | array   | 是   | 参数定义列表，无参数时传空数组    |
+| `testable`    | boolean | 否   | 为 `true` 时显示「测试」按钮（`PP_TEST=1`），默认 `false` |
+| `loginable`   | boolean | 否   | 为 `true` 时显示「登录」按钮（`--login`），默认 `false` |
 
 ---
 
@@ -520,10 +571,11 @@ chmod +x ./data/modules/copy_to_dir
 | `api_id`      | string  | `""`    | Telegram API ID（从 my.telegram.org 获取，必填）  |
 | `api_hash`    | string  | `""`    | Telegram API Hash（必填）                         |
 | `bot_token`   | string  | `""`    | Bot Token（从 @BotFather 获取，必填）             |
-| `chat_id`     | string  | `""`    | Chat ID，超级群组格式为 `-100xxxxxxxxxx`（必填）  |
-| `username`    | string  | `""`    | 群组 Username，超级群组必填（不含 `@`）           |
+| `chat_id`     | string  | `""`    | Chat ID，群组/超级群组格式为 `-100xxxxxxxxxx`（必填）；私有群组没有 username，只能填 ID |
+| `username`    | string  | `""`    | 群组 Username，可选（仅公开群组，不含 `@`；私有群组留空） |
 | `proxy`       | string  | `""`    | 代理地址，支持 `http://`、`socks5://`             |
 | `send_video`  | boolean | `true`  | 是否同时发送视频文件                              |
+| `topic_per_model` | boolean | `true` | 按模特名自动创建/复用群组话题（Topic），视频发送到对应话题；群组需为论坛模式且 Bot 具备「管理话题」权限 |
 
 ---
 
@@ -532,4 +584,5 @@ chmod +x ./data/modules/copy_to_dir
 - 模块应为**无状态**的，不依赖上次执行的任何残留状态。
 - 模块不应修改或删除 `PP_INPUT` 以外的文件，除非这是其明确功能（如 `filter_short`）。
 - 若模块需要临时文件，建议使用 `PP_EXE_DIR/tmp/` 目录，并在退出前清理。
+- 若模块会生成副产物（如联系表图片），请写入 `PP_SIDECAR_DIR`（未设置时回退到输入视频所在目录），不要写入成片所在目录。
 - 模块必须在合理时间内完成，长时间无进度输出可能导致 UI 显示异常。

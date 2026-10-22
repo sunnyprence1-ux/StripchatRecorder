@@ -109,6 +109,10 @@ pub fn run() {
             commands::get_pipeline,
             commands::save_pipeline,
             commands::list_modules,
+            commands::test_module,
+            commands::login_start,
+            commands::login_input,
+            commands::login_cancel,
             // Locale
             commands::get_locale,
             commands::list_locales,
@@ -163,13 +167,14 @@ async fn setup_app(app_handle: tauri::AppHandle) {
     // Remove empty directories on startup (sync, fast)
     {
         let settings = app_state.get_settings();
-        let output_path_buf = std::path::PathBuf::from(&settings.output_dir);
-        let output_ref = output_path_buf.as_path();
-        stripchat_recorder_lib::recording::recorder::startup_remove_empty_dirs(output_ref);
-        stripchat_recorder_lib::recording::meta::startup_ensure_meta_files(
-            output_ref,
-            &settings.merge_format,
-        );
+        // 最终视频目录与（遗留的）输出目录都需要扫描
+        // Both the final video dir and the (legacy) output dir need scanning
+        for root in settings.video_scan_roots() {
+            stripchat_recorder_lib::recording::recorder::startup_remove_empty_dirs(&root);
+        }
+        // 扫描并补写缺失的 meta 文件（元数据统一存放在输出目录）
+        // Scan and write missing meta files (metadata always lives in the output dir)
+        stripchat_recorder_lib::recording::meta::startup_ensure_meta_files(&settings);
     }
 
     // 检测 ffmpeg 是否可用 / Check if ffmpeg is available
@@ -235,16 +240,15 @@ async fn setup_app(app_handle: tauri::AppHandle) {
 
     // Meta 文件清理调度器 / Meta file cleanup scheduler
     {
-        let output_dir = std::path::PathBuf::from(app_state.get_settings().output_dir.clone());
-        tokio::spawn(async move { schedule_meta_cleanup(output_dir).await });
+        let state = Arc::clone(&app_state);
+        tokio::spawn(async move { schedule_meta_cleanup(state).await });
     }
 
     // Meta 版本检查调度器 / Meta version check scheduler
     {
-        let output_dir = std::path::PathBuf::from(app_state.get_settings().output_dir.clone());
-        let merge_format = app_state.get_settings().merge_format.clone();
+        let state = Arc::clone(&app_state);
         tokio::spawn(async move {
-            schedule_meta_version_check(output_dir, merge_format, 3600).await;
+            schedule_meta_version_check(state, 3600).await;
         });
     }
 

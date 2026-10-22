@@ -40,53 +40,58 @@ fn should_emit(event: &Event) -> bool {
     event.paths.iter().any(|p| !is_noisy_path(p))
 }
 
-/// 启动录制输出目录监控器（在独立线程中运行）。
-/// 当输出目录设置变更时自动切换监控目标。
+/// 启动录制目录监控器（在独立线程中运行）。
+/// 同时监控最终视频目录与输出（分片）目录，目录设置变更时自动切换监控目标。
 ///
-/// Start the recording output directory watcher (runs in a dedicated thread).
-/// Automatically switches the watch target when the output directory setting changes.
+/// Start the recording directory watcher (runs in a dedicated thread).
+/// Watches both the final video directory and the output (segment) directory,
+/// switching the watch targets automatically when the settings change.
 pub fn start_recordings_dir_watcher(state: Arc<AppState>, emitter: Arc<dyn Emitter>) {
     std::thread::spawn(move || {
         let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
 
-        let mut watched_dir = PathBuf::new();
+        // 每个被监控目录对应一个 watcher 实例 / One watcher instance per watched directory
+        let mut watchers: Vec<(PathBuf, RecommendedWatcher)> = Vec::new();
         let mut last_emit = Instant::now()
             .checked_sub(Duration::from_secs(1))
             .unwrap_or_else(Instant::now);
-        let mut _watcher: Option<RecommendedWatcher> = None;
 
         loop {
-            let current_dir = PathBuf::from(state.get_settings().output_dir);
-            // 若输出目录发生变化，重新创建监控器 / If output dir changed, recreate the watcher
-            if current_dir != watched_dir {
-                if let Err(e) = std::fs::create_dir_all(&current_dir) {
-                    tracing::error!("Failed to create watch dir {:?}: {}", current_dir, e);
-                }
-
-                match RecommendedWatcher::new(tx.clone(), Config::default()) {
-                    Ok(mut w) => match w.watch(&current_dir, RecursiveMode::Recursive) {
-                        Ok(()) => {
-                            tracing::info!("Watching recordings dir: {:?}", current_dir);
-                            watched_dir = current_dir;
-                            _watcher = Some(w);
-                        }
+            let settings = state.get_settings();
+            // 最终视频目录与分片目录都需要监控 / Both the video dir and the segment dir need watching
+            let desired: Vec<PathBuf> = settings.video_scan_roots();
+            let watched: Vec<PathBuf> = watchers.iter().map(|(p, _)| p.clone()).collect();
+            // 若监控目录集合发生变化，重新创建监控器 / If the target set changed, recreate the watchers
+            if desired != watched {
+                watchers.clear();
+                for dir in &desired {
+                    if let Err(e) = std::fs::create_dir_all(dir) {
+                        tracing::error!("Failed to create watch dir {:?}: {}", dir, e);
+                    }
+                    match RecommendedWatcher::new(tx.clone(), Config::default()) {
+                        Ok(mut w) => match w.watch(dir, RecursiveMode::Recursive) {
+                            Ok(()) => {
+                                tracing::info!("Watching recordings dir: {:?}", dir);
+                                watchers.push((dir.clone(), w));
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to watch recordings dir {:?}: {}",
+                                    dir,
+                                    e
+                                );
+                            }
+                        },
                         Err(e) => {
-                            tracing::error!(
-                                "Failed to watch recordings dir {:?}: {}",
-                                current_dir,
-                                e
-                            );
+                            tracing::error!("Failed to create watcher: {}", e);
                         }
-                    },
-                    Err(e) => {
-                        tracing::error!("Failed to create watcher: {}", e);
                     }
                 }
             }
 
             match rx.recv_timeout(Duration::from_secs(1)) {
                 Ok(Ok(event)) => {
-                    if watched_dir.as_os_str().is_empty() || !should_emit(&event) {
+                    if watchers.is_empty() || !should_emit(&event) {
                         continue;
                     }
                     // 防抖：400ms 内的多次事件只触发一次 / Debounce: only emit once within 400ms
@@ -97,7 +102,7 @@ pub fn start_recordings_dir_watcher(state: Arc<AppState>, emitter: Arc<dyn Emitt
                     emitter.emit(
                         "recordings-dir-changed",
                         &serde_json::json!({
-                            "outputDir": watched_dir,
+                            "outputDir": settings.videos_root(),
                             "kind": format!("{:?}", event.kind),
                             "paths": event.paths,
                         }),
