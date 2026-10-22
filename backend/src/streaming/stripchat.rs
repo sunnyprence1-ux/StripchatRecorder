@@ -11,9 +11,11 @@
 //! - Parsing Mouflon-encrypted playlists
 
 use crate::core::error::{AppError, Result};
+use crate::streaming::doh::DohResolver;
 use reqwest::{Client, Response};
 use std::collections::HashMap;
 use std::sync::Arc;
+use wreq_util::Profile;
 
 /// 模拟浏览器的 User-Agent / Browser-mimicking User-Agent
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
@@ -49,48 +51,53 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client> {
     Ok(builder.build()?)
 }
 
-/// 构建用于 API 请求的 HTTP 客户端（支持代理，不启用 keepalive）。
-/// Build an HTTP client for API requests (supports proxy, no keepalive).
-fn build_api_client(proxy_url: Option<&str>) -> Result<Client> {
-    // Match the browser headers verified to work without session cookies.
-    let mut headers = reqwest::header::HeaderMap::new();
-    for (name, value) in [
-        (
-            "accept",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        ),
-        ("accept-language", "en-US,en;q=0.6"),
-        ("cache-control", "max-age=0"),
-        ("priority", "u=0, i"),
-        (
-            "sec-ch-ua",
-            "\"Not=A?Brand\";v=\"99\", \"Brave\";v=\"151\", \"Chromium\";v=\"151\"",
-        ),
-        ("sec-ch-ua-mobile", "?0"),
-        ("sec-ch-ua-platform", "\"Linux\""),
-        ("sec-fetch-dest", "document"),
-        ("sec-fetch-mode", "navigate"),
-        ("sec-fetch-site", "none"),
-        ("sec-fetch-user", "?1"),
-        ("sec-gpc", "1"),
-        ("upgrade-insecure-requests", "1"),
-    ] {
-        headers.insert(name, reqwest::header::HeaderValue::from_static(value));
-    }
-    let mut builder = Client::builder()
-        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
-        .default_headers(headers)
+/// 构建用于 API 请求的 HTTP 客户端（支持代理）。
+///
+/// Cloudflare 会按 TLS / HTTP2 指纹（JA3/JA4 + HTTP2 SETTINGS）判定请求来源，
+/// 普通 HTTP 客户端即使带上完整的浏览器请求头也会被返回 403。
+/// 这里使用 wreq 的浏览器指纹模拟（BoringSSL + 浏览器 TLS/HTTP2 参数）通过校验，
+/// 并用 DoH 解析域名，避开被运营商污染的本地 DNS。
+///
+/// Build an HTTP client for API requests (supports proxy).
+///
+/// Cloudflare fingerprints TLS/HTTP2 handshakes (JA3/JA4 + HTTP2 SETTINGS); a plain HTTP client
+/// gets a 403 even with a complete set of browser headers. This uses wreq's browser emulation
+/// (BoringSSL with browser TLS/HTTP2 parameters) to pass that check, and resolves hostnames
+/// through DoH so a poisoned local resolver cannot break the connection.
+fn build_api_client(proxy_url: Option<&str>) -> Result<wreq::Client> {
+    let mut builder = wreq::Client::builder()
+        .emulation(Profile::Chrome136)
         .timeout(std::time::Duration::from_secs(30));
 
     if let Some(proxy) = proxy_url
         && !proxy.is_empty()
     {
-        builder =
-            builder.proxy(reqwest::Proxy::all(proxy).map_err(|e| AppError::Other(e.to_string()))?);
-        return Ok(builder.build()?);
+        // 使用代理时由代理负责域名解析，无需 DoH / The proxy resolves names itself, so DoH is unnecessary
+        builder = builder
+            .proxy(wreq::Proxy::all(proxy).map_err(|e| AppError::Other(e.to_string()))?);
+    } else {
+        // 未配置代理时不读取环境变量里的代理 / Do not pick up proxy env vars when none is configured
+        builder = builder.no_proxy().dns_resolver(DohResolver::new());
     }
-    builder = builder.no_proxy();
+
     Ok(builder.build()?)
+}
+
+/// 把 API 的非 2xx 状态码转换为带排查建议的错误。
+/// Convert a non-2xx API status into an error that carries troubleshooting advice.
+fn api_status_error(status: u16, username: &str) -> AppError {
+    match status {
+        403 | 429 => AppError::Other(format!(
+            "API 返回 {status} ({username})：请求被 Cloudflare 拦截。\
+             当前网络可能被站点限制，请在设置中配置 API 代理后重试 / \
+             Blocked by Cloudflare; configure an API proxy in Settings and retry"
+        )),
+        451 => AppError::Other(format!(
+            "API 返回 451 ({username})：该地区无法访问该站点，请配置代理 / \
+             Not available in this region, configure a proxy"
+        )),
+        _ => AppError::Other(format!("API 返回 {status} ({username})")),
+    }
 }
 
 /// 主播直播状态信息 / Streamer live status information
@@ -114,8 +121,8 @@ pub struct StreamInfo {
 /// Stripchat API 客户端，封装 API 请求和 CDN 分片下载。
 /// Stripchat API client wrapping API requests and CDN segment downloads.
 pub struct StripchatApi {
-    /// API 请求客户端 / API request client
-    api_client: Client,
+    /// API 请求客户端（浏览器 TLS 指纹 + DoH 解析）/ API request client (browser TLS fingerprint + DoH resolution)
+    api_client: wreq::Client,
     /// CDN 分片下载客户端 / CDN segment download client
     cdn_client: Client,
     /// 可选的镜像站域名 / Optional mirror site domain
@@ -300,6 +307,36 @@ impl StripchatApi {
         Err(AppError::Other(format!("All CDN TLDs failed → {}", url)))
     }
 
+    /// 带重试的 API GET。
+    ///
+    /// Cloudflare 偶尔会对个别请求返回 403 / 429（同一客户端下一次请求通常就能通过），
+    /// 直接失败会让「添加主播」随机报错，因此这里做少量退避重试。
+    ///
+    /// API GET with retries.
+    ///
+    /// Cloudflare occasionally answers an individual request with 403 / 429 even though the very
+    /// next request from the same client passes. Failing immediately makes "add streamer" fail at
+    /// random, so a few backed-off retries are performed first.
+    async fn api_get(&self, url: &str, referer: &str) -> Result<wreq::Response> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut attempt = 1;
+        loop {
+            let resp = self
+                .api_client
+                .get(url)
+                .header("Referer", referer)
+                .send()
+                .await?;
+            let status = resp.status().as_u16();
+            if (status != 403 && status != 429) || attempt >= MAX_ATTEMPTS {
+                return Ok(resp);
+            }
+            tracing::warn!("API {status} for {url}, retrying ({attempt}/{MAX_ATTEMPTS})");
+            tokio::time::sleep(std::time::Duration::from_millis(400 * attempt as u64)).await;
+            attempt += 1;
+        }
+    }
+
     /// 查询主播是否处于群组秀状态，并返回群组秀类型（ticket / perMinute）。
     /// Query whether a streamer is in a group show and return the group show type (ticket / perMinute).
     async fn get_group_show_type(&self, username: &str) -> Option<String> {
@@ -310,13 +347,7 @@ impl StripchatApi {
                 "https://stripchat.com/api/front/models?removeShows=false&recInFeatured=false&limit={}&offset={}&primaryTag=girls&filterGroupTags=[[\"groupShow\"]]",
                 LIMIT, offset
             ));
-            let Ok(resp) = self
-                .api_client
-                .get(&url)
-                .header("Referer", self.referer())
-                .send()
-                .await
-            else {
+            let Ok(resp) = self.api_get(&url, &self.referer()).await else {
                 return None;
             };
             let Ok(json) = resp.json::<serde_json::Value>().await else {
@@ -352,22 +383,14 @@ impl StripchatApi {
             username
         ));
 
-        let broadcasts_resp = self
-            .api_client
-            .get(&broadcasts_url)
-            .header("Referer", format!("{}{}", self.referer(), username))
-            .send()
-            .await?;
+        let referer = format!("{}{}", self.referer(), username);
+        let broadcasts_resp = self.api_get(&broadcasts_url, &referer).await?;
 
         if !broadcasts_resp.status().is_success() {
-            if broadcasts_resp.status() == reqwest::StatusCode::NOT_FOUND {
+            if broadcasts_resp.status().as_u16() == 404 {
                 return Err(AppError::UserNotFound(format!("用户 {} 不存在", username)));
             }
-            return Err(AppError::Other(format!(
-                "broadcasts API 返回 {} ({})",
-                broadcasts_resp.status().as_u16(),
-                username
-            )));
+            return Err(api_status_error(broadcasts_resp.status().as_u16(), username));
         }
 
         let broadcasts_json: serde_json::Value = broadcasts_resp.json().await?;
@@ -383,22 +406,13 @@ impl StripchatApi {
             model_id
         ));
 
-        let resp = self
-            .api_client
-            .get(&url)
-            .header("Referer", format!("{}{}", self.referer(), username))
-            .send()
-            .await?;
+        let resp = self.api_get(&url, &referer).await?;
 
         if !resp.status().is_success() {
-            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            if resp.status().as_u16() == 404 {
                 return Err(AppError::UserNotFound(format!("用户 {} 不存在", username)));
             }
-            return Err(AppError::Other(format!(
-                "API 返回 {} ({})",
-                resp.status().as_u16(),
-                username
-            )));
+            return Err(api_status_error(resp.status().as_u16(), username));
         }
 
         let json: serde_json::Value = resp.json().await?;

@@ -58,6 +58,12 @@ impl From<reqwest::Error> for AppError {
     }
 }
 
+impl From<wreq::Error> for AppError {
+    fn from(e: wreq::Error) -> Self {
+        Self::Other(format!("Network error: {e}"))
+    }
+}
+
 impl From<serde_json::Error> for AppError {
     fn from(e: serde_json::Error) -> Self {
         Self::Json(e)
