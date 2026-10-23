@@ -83,7 +83,7 @@ const PROGRESS_SCALE: usize = 10_000;
 /// Module metadata JSON, output via `--describe` argument.
 const DESCRIBE: &str = r#"{
     "id": "notify_telegram",
-    "name": "Telegram 通知 0.4.1",
+    "name": "Telegram 通知 0.4.2",
     "description": "将录制信息、封面图和视频通过 MTProto 发送到 Telegram（支持超过 50MB 的大文件，支持 HTTP/SOCKS5 代理）。可按模特自动创建/复用群组话题（Topic）并把视频发送到对应话题。默认使用已登录的真实账号：可列出话题、避免重复创建，高级会员还能上传 4GB 单文件",
     "testable": true,
     "loginable": true,
@@ -140,6 +140,12 @@ const DESCRIBE: &str = r#"{
         {
         "key": "topic_per_model",
         "label": "为每个模特创建/复用群组话题（Topic），视频发送到对应话题",
+        "type": "boolean",
+        "default": true
+        },
+        {
+        "key": "delete_after_send",
+        "label": "发送成功后删除本地数据（成片、分片、元数据和模块副产物），释放服务器空间",
         "type": "boolean",
         "default": true
         }
@@ -1930,6 +1936,8 @@ struct TgConfig {
     topic_per_model: bool,
     /// 登录方式（机器人 / 用户账号）/ Login mode (bot / user account)
     mode: SessionMode,
+    /// 发送成功后是否请求主程序删除本地数据 / Whether to ask the host to delete local data after sending
+    delete_after_send: bool,
 }
 
 /// 规范化 Chat ID：去掉首尾空格后必须是数字。
@@ -1995,6 +2003,9 @@ fn read_config() -> Result<TgConfig, String> {
         // 是否把每个模特的视频发送到该模特专属的群组话题中
         // Whether to send each model's video into a group forum topic dedicated to that model
         topic_per_model: param_bool("topic_per_model", true),
+        // 上传成功后是否删除本地数据（默认开启，用于释放 VPS 空间）
+        // Whether to delete local data after a successful upload (on by default to free VPS space)
+        delete_after_send: param_bool("delete_after_send", true),
         mode,
     })
 }
@@ -2448,6 +2459,7 @@ fn run() -> Result<(), String> {
         username,
         send_video,
         topic_per_model,
+        delete_after_send,
         mode,
     } = read_config()?;
 
@@ -2516,6 +2528,18 @@ fn run() -> Result<(), String> {
     }
 
     println!("OUTPUT:{}", input.display());
+
+    // 上传成功后请求主程序删除本地数据（成片、分片目录、元数据、模块副产物）。
+    // 必须放在 OUTPUT 之后：主程序只在节点成功时才执行删除请求。
+    //
+    // After a successful upload, ask the host to delete the local data (video, segment
+    // directory, metadata, module side outputs). This must come after OUTPUT, because the
+    // host only honours the request when the node succeeded.
+    if delete_after_send {
+        println!("STATUS:已上传，正在删除本地数据 / uploaded, deleting local data");
+        println!("DELETE_INPUT");
+    }
+
     Ok(())
 }
 
@@ -2756,5 +2780,19 @@ mod tests {
     fn upload_limits_are_two_and_four_gigabytes() {
         assert_eq!(TG_MAX_BYTES_STD, 2 * 1024 * 1024 * 1024);
         assert_eq!(TG_MAX_BYTES_PREMIUM, 4 * 1024 * 1024 * 1024);
+    }
+
+    /// `--describe` 必须声明「发送后删除本地数据」参数，且默认开启。
+    /// `--describe` must declare the delete-after-send parameter, enabled by default.
+    #[test]
+    fn describe_declares_delete_after_send() {
+        let v: serde_json::Value = serde_json::from_str(DESCRIBE).expect("DESCRIBE is valid JSON");
+        let params = v["params"].as_array().expect("params is an array");
+        let p = params
+            .iter()
+            .find(|p| p["key"] == "delete_after_send")
+            .expect("delete_after_send param is declared");
+        assert_eq!(p["type"], "boolean");
+        assert_eq!(p["default"], true);
     }
 }

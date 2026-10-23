@@ -196,6 +196,216 @@ pub fn delete_meta(settings: &Settings, video_path: &Path) {
     }
 }
 
+/// 一次「删除整条录制」操作的结果 / Result of one "delete the whole recording" operation
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurgeReport {
+    /// 实际删除的文件/目录路径 / Paths of the files and directories actually removed
+    pub removed: Vec<String>,
+    /// 释放的字节数（只统计成片、分片和副产物文件）
+    /// Bytes freed (video, segments and side outputs only)
+    pub freed_bytes: u64,
+    /// 删除失败的项目（路径 + 原因）/ Items that could not be removed (path + reason)
+    pub failed: Vec<String>,
+}
+
+impl PurgeReport {
+    /// 是否真的删掉了东西 / Whether anything was actually removed
+    pub fn is_empty(&self) -> bool {
+        self.removed.is_empty() && self.failed.is_empty()
+    }
+}
+
+/// 删除一条录制在服务器上的**全部**数据：成片、`.ts` 分片目录、元数据、模块副产物，
+/// 以及元数据里登记的模块输出文件。用于「上传成功后清空 VPS」。
+///
+/// 只删除确实存在的路径，任何一项失败都不会中断其余项的删除；
+/// 空的模特子目录会被顺手清掉，非空目录则保留。
+///
+/// Delete **all** server-side data of one recording: the merged video, the `.ts` segment
+/// directory, the metadata file, module side outputs, and any module output files recorded
+/// in the metadata. Used for "wipe the VPS after a successful upload".
+///
+/// Only existing paths are touched, one failure never aborts the rest, and now-empty
+/// per-model subdirectories are cleaned up (non-empty ones are kept).
+pub fn purge_recording(settings: &Settings, video_path: &Path) -> PurgeReport {
+    let mut report = PurgeReport::default();
+    let stem = video_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+
+    // 1) 先读元数据：里面登记的模块输出（联系表等）也要一起删
+    // Read the metadata first: module outputs recorded in it (contact sheets etc.) must go too
+    let meta = read_meta(settings, video_path);
+    let module_outputs: Vec<PathBuf> = meta
+        .as_ref()
+        .and_then(|m| m.module_outputs.as_ref())
+        .map(|m| m.values().map(PathBuf::from).collect())
+        .unwrap_or_default();
+
+    // 2) 删除单个文件（带重试：Windows 上 ffmpeg/预览可能短暂占用句柄）
+    // Remove a single file (with retries: on Windows ffmpeg/preview may briefly hold a handle)
+    let remove_file = |p: &Path, report: &mut PurgeReport| {
+        if !p.is_file() {
+            return;
+        }
+        let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        let mut last_err = None;
+        for _ in 0..10 {
+            match std::fs::remove_file(p) {
+                Ok(()) => {
+                    report.removed.push(p.to_string_lossy().to_string());
+                    report.freed_bytes += size;
+                    return;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+            }
+        }
+        report.failed.push(format!(
+            "{}: {}",
+            p.display(),
+            last_err.map(|e| e.to_string()).unwrap_or_default()
+        ));
+    };
+
+    // 3) 成片本体 / The merged video itself
+    remove_file(video_path, &mut report);
+
+    // 4) 同一 stem 的其它扩展名成片（改过 merge_format 时可能残留）
+    // Other extensions of the same stem (left behind after changing merge_format)
+    if let Some(parent) = video_path.parent()
+        && let Ok(entries) = std::fs::read_dir(parent)
+    {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p == video_path || !p.is_file() {
+                continue;
+            }
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with('.') {
+                continue;
+            }
+            if p.file_stem().and_then(|s| s.to_str()) == Some(stem.as_str()) {
+                remove_file(&p, &mut report);
+            }
+        }
+    }
+
+    // 5) 模块副产物：成片目录与输出目录（副产物目录）都要检查
+    // Module side outputs: check both the video dir and the output dir (sidecar dir)
+    if !stem.is_empty() {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Some(parent) = video_path.parent() {
+            dirs.push(parent.to_path_buf());
+        }
+        if let Some(dir) = settings.sidecar_dir_for_video(video_path)
+            && !dirs.contains(&dir)
+        {
+            dirs.push(dir);
+        }
+        for dir in &dirs {
+            for ext in ["webp", "jpg", "jpeg", "png", "json"] {
+                let sidecar = dir.join(format!("{}.{}", stem, ext));
+                remove_file(&sidecar, &mut report);
+            }
+        }
+    }
+
+    // 6) 元数据里登记的模块输出（可能位于任意目录）
+    // Module outputs recorded in the metadata (they may live anywhere)
+    for out in &module_outputs {
+        remove_file(out, &mut report);
+    }
+
+    // 7) 元数据文件本身（标准位置 + 旧布局残留）
+    // The metadata file itself (canonical location + legacy leftovers)
+    let mut meta_paths: Vec<PathBuf> = Vec::new();
+    if let Some(p) = settings.meta_path_for_video(video_path) {
+        meta_paths.push(p);
+    }
+    if let Some(p) = Settings::legacy_meta_path_for_video(video_path)
+        && !meta_paths.contains(&p)
+    {
+        meta_paths.push(p);
+    }
+    for p in &meta_paths {
+        remove_file(p, &mut report);
+    }
+
+    // 8) `.ts` 分片目录（整棵删掉：playlist.m3u8、分片、临时文件）
+    // The `.ts` segment directory (removed wholesale: playlist.m3u8, segments, temp files)
+    let session_dir = settings.session_dir_for_video(video_path);
+    if session_dir.is_dir() {
+        let size = dir_size(&session_dir);
+        match std::fs::remove_dir_all(&session_dir) {
+            Ok(()) => {
+                report.removed.push(session_dir.to_string_lossy().to_string());
+                report.freed_bytes += size;
+            }
+            Err(e) => report.failed.push(format!("{}: {}", session_dir.display(), e)),
+        }
+    }
+
+    // 9) 顺手清掉变空的模特子目录（输出目录与最终视频目录各自检查，非空则保留）
+    // Clean up now-empty per-model subdirectories (checked in both roots; non-empty ones stay)
+    for root in settings.video_scan_roots() {
+        if let Some(parent) = video_path.parent()
+            && parent != root
+            && parent.starts_with(&root)
+            && parent.is_dir()
+            && std::fs::read_dir(parent).map(|mut d| d.next().is_none()).unwrap_or(false)
+        {
+            let _ = std::fs::remove_dir(parent);
+        }
+        if let Some(parent) = session_dir.parent()
+            && parent != root
+            && parent.starts_with(&root)
+            && parent.is_dir()
+            && std::fs::read_dir(parent).map(|mut d| d.next().is_none()).unwrap_or(false)
+        {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+
+    if report.removed.is_empty() && report.failed.is_empty() {
+        tracing::info!("purge_recording: nothing to delete for {:?}", video_path);
+    } else {
+        tracing::info!(
+            "purge_recording: removed {} path(s), freed {} byte(s), {} failure(s) for {:?}",
+            report.removed.len(),
+            report.freed_bytes,
+            report.failed.len(),
+            video_path
+        );
+    }
+    for f in &report.failed {
+        tracing::warn!("purge_recording: failed to remove {}", f);
+    }
+
+    report
+}
+
+/// 递归统计目录占用的字节数 / Recursively total the bytes used by a directory
+fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                total += dir_size(&p);
+            } else if let Ok(m) = std::fs::metadata(&p) {
+                total += m.len();
+            }
+        }
+    }
+    total
+}
+
 /// 将旧布局（视频同目录）中的元数据文件迁移到输出目录。
 /// 标准位置已存在或旧文件不存在时不做任何操作。
 ///

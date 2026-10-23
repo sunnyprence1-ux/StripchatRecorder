@@ -80,6 +80,23 @@
 		return !availableModuleIds.value.has(node.moduleId);
 	}
 
+	/**
+	 * 读取布尔参数的当前值：节点里没有保存时回落到模块声明的默认值。
+	 * 这很重要——例如 `delete_after_send` 默认为 true，若只按「是否存在」判断，
+	 * 开关会显示为关闭，而模块实际仍在删除数据。
+	 *
+	 * Read a boolean parameter's current value, falling back to the module's declared default
+	 * when the node has no stored value. This matters: `delete_after_send` defaults to true, so
+	 * checking mere presence would render the switch as off while the module still deletes data.
+	 */
+	function boolParam(
+		node: PipelineNode,
+		param: { key: string; default: unknown },
+	): boolean {
+		const v = node.params[param.key] ?? param.default;
+		return v === true || v === "true";
+	}
+
 	// 拖拽排序状态 / Drag-and-drop sorting state
 	/** 正在拖拽的节点索引 / Index of the node being dragged */
 	const dragIndex = ref<number | null>(null);
@@ -436,14 +453,14 @@
 
 <template>
 	<div class="flex flex-col gap-6">
-		<header class="flex items-start justify-between">
+		<header class="flex flex-col gap-1 md:flex-row md:items-start md:justify-between">
 			<div>
 				<h1 class="text-xl font-bold mb-0.5">{{ t("postprocess.title") }}</h1>
 				<p class="text-sm text-muted-foreground">
 					{{ t("postprocess.description") }}
 				</p>
 			</div>
-			<span class="text-sm text-muted-foreground mt-0.5">
+			<span class="text-sm text-muted-foreground md:mt-0.5 shrink-0">
 				{{ store.saving ? t("postprocess.saving") : t("postprocess.saved") }}
 			</span>
 		</header>
@@ -469,7 +486,7 @@
 				@dragend="onDragEnd"
 			>
 				<div
-					class="border-2 rounded-xl p-4 bg-card transition-opacity"
+					class="border-2 rounded-xl p-3 md:p-4 bg-card transition-opacity"
 					:class="[
 						!node.enabled && 'opacity-50',
 						dragIndex === idx ? 'opacity-30' : '',
@@ -480,15 +497,16 @@
 								: 'border-transparent',
 					]"
 				>
-					<div class="flex items-center gap-3">
+					<!-- 移动端标题与操作按钮分行显示 / On mobile the title and actions take separate lines -->
+					<div class="flex flex-wrap items-center gap-x-3 gap-y-2">
 						<GripVertical
-							class="cursor-grab text-muted-foreground select-none size-5"
+							class="cursor-grab text-muted-foreground select-none size-5 max-md:hidden"
 							@mousedown="isDraggingHandle = true"
 							@mouseup="isDraggingHandle = false"
 						/>
 
 						<div class="flex-1 min-w-0">
-							<div class="flex items-center gap-2">
+							<div class="flex items-center gap-2 flex-wrap">
 								<span
 									class="font-medium text-sm"
 									:class="isModuleMissing(node) && 'text-destructive'"
@@ -512,7 +530,9 @@
 							</p>
 						</div>
 
-						<div class="flex items-center gap-2 shrink-0">
+						<div
+							class="flex flex-wrap items-center justify-end gap-1.5 md:gap-2 md:shrink-0 max-md:w-full"
+						>
 							<Button
 								v-if="info?.loginable && !isModuleMissing(node)"
 								variant="outline"
@@ -572,7 +592,7 @@
 
 					<div
 						v-if="info?.params.length"
-						class="mt-3 grid grid-cols-2 gap-x-4 gap-y-3"
+						class="mt-3 grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2"
 					>
 						<template
 							v-for="param in info.params"
@@ -583,10 +603,7 @@
 
 								<Switch
 									v-if="param.type === 'boolean'"
-									:model-value="
-										node.params[param.key] === true ||
-										node.params[param.key] === 'true'
-									"
+									:model-value="boolParam(node, param)"
 									@update:model-value="node.params[param.key] = $event"
 								/>
 
@@ -626,7 +643,7 @@
 								<Input
 									v-else
 									:model-value="String(node.params[param.key] ?? param.default)"
-									class="h-8 text-sm"
+									class="h-8 text-sm max-md:h-10"
 									@update:model-value="node.params[param.key] = String($event)"
 								/>
 							</div>
@@ -656,7 +673,7 @@
 		</div>
 
 		<Dialog :open="showPicker" @update:open="showPicker = $event">
-			<DialogContent class="max-w-sm">
+			<DialogContent class="max-w-sm dialog-max-h overflow-y-auto">
 				<DialogHeader>
 					<DialogTitle>{{ t("postprocess.picker.title") }}</DialogTitle>
 					<DialogDescription class="sr-only">{{ t("postprocess.picker.description") }}</DialogDescription>
@@ -698,7 +715,7 @@
 				}
 			"
 		>
-			<DialogContent class="max-w-lg">
+			<DialogContent class="max-w-lg dialog-max-h overflow-y-auto">
 				<DialogHeader>
 					<DialogTitle>
 						{{
@@ -920,7 +937,8 @@
 					</div>
 				</div>
 
-				<div class="flex justify-end gap-2">
+				<!-- 移动端底部按钮固定在对话框底部 / Footer buttons stick to the bottom on mobile -->
+				<div class="flex justify-end gap-2 sticky bottom-0 z-10 bg-background pt-2">
 					<Button variant="ghost" size="sm" @click="closeLogin">
 						{{ t("common.close") }}
 					</Button>
@@ -938,7 +956,7 @@
 		</Dialog>
 
 		<Dialog :open="showTest" @update:open="showTest = $event">
-			<DialogContent class="max-w-2xl">
+			<DialogContent class="max-w-2xl dialog-max-h overflow-y-auto">
 				<DialogHeader>
 					<DialogTitle>
 						{{
@@ -1003,7 +1021,8 @@
 					</div>
 				</template>
 
-				<div class="flex justify-end gap-2">
+				<!-- 移动端底部按钮固定在对话框底部 / Footer buttons stick to the bottom on mobile -->
+				<div class="flex justify-end gap-2 sticky bottom-0 z-10 bg-background pt-2">
 					<Button variant="ghost" size="sm" @click="showTest = false">
 						{{ t("common.close") }}
 					</Button>

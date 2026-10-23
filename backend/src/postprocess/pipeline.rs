@@ -202,6 +202,11 @@ pub struct NodeResult {
 /// - `max_tmp_dir_gb`: tmp 目录最大占用（GB，0 = 不限制）/ Max tmp dir size in GB (0 = unlimited)
 /// - `on_progress`: 进度回调（节点完成数, 总节点数, 模块内进度, 模块总进度, 模块名, 状态文字）/ Progress callback
 /// - `on_log`: 日志回调（模块 ID, 流名称, 行内容）/ Log callback
+/// - `on_delete_input`: 模块请求删除输入时的回调（由调用方执行完整清理）
+///   Callback invoked when a module requests deletion of its input (the caller performs the
+///   full cleanup). The pipeline stops afterwards when the node's output is that same file,
+///   since there is nothing left to feed the next node.
+#[allow(clippy::too_many_arguments)]
 pub fn run_pipeline(
     video_path: &std::path::Path,
     pipeline: &PipelineConfig,
@@ -210,6 +215,7 @@ pub fn run_pipeline(
     settings: &crate::config::settings::Settings,
     on_progress: impl Fn(usize, usize, u32, u32, &str, &str),
     on_log: impl Fn(&str, &str, &str),
+    on_delete_input: impl Fn(&std::path::Path),
 ) -> Vec<NodeResult> {
     let mut results = Vec::new();
     let mut current_input = video_path.to_path_buf();
@@ -280,20 +286,22 @@ pub fn run_pipeline(
         done += 1;
         on_progress(done, total, 0, 0, &module_name, "");
 
-        // 若模块请求删除其输入文件，由主程序执行删除（同时清理对应的 meta 文件）
-        // If the module requested deletion of its input file, the host performs the deletion
-        // (also cleaning up the corresponding meta file)
+        // 若模块请求删除其输入文件，由主程序执行完整清理（成片、分片、元数据、副产物）
+        // If the module requested deletion of its input file, the host performs the full
+        // cleanup (video, segments, metadata, side outputs)
         if result.delete_input {
-            if let Err(e) = std::fs::remove_file(&current_input) {
-                tracing::warn!("DELETE_INPUT: failed to remove {:?}: {}", current_input, e);
-            } else {
-                tracing::info!("DELETE_INPUT: removed {:?}", current_input);
-                crate::recording::meta::delete_meta(settings, &current_input);
-            }
+            on_delete_input(&current_input);
         }
 
         match &result.output {
             Some(out) => {
+                // 输入已被删除且节点输出就是该输入：后面没有可用的文件，流水线结束
+                // The input was deleted and the node's output is that same file: nothing is
+                // left for the next node, so the pipeline ends here
+                if result.delete_input && out == &current_input {
+                    results.push(result);
+                    break;
+                }
                 // 节点有输出，继续执行下一个节点 / Node has output, continue to next node
                 current_input = out.clone();
                 results.push(result);
@@ -567,6 +575,55 @@ fn run_node(
         output: if success { output_path } else { None },
         delete_input: success && delete_input,
     }
+}
+
+// ─── 单个模块的一次性执行 / One-off execution of a single module ─────────────
+
+/// 单独运行一个模块一次（不经过流水线），用于「手动发送到 Telegram」这类按需操作。
+/// 参数合并后的 `PP_PARAM_*`、进度协议、`OUTPUT:` / `DELETE_INPUT` 解析与流水线节点完全一致。
+///
+/// Run a single module once, outside the pipeline. Used for on-demand actions such as
+/// "send to Telegram manually". Parameter mapping, progress protocol and `OUTPUT:` /
+/// `DELETE_INPUT` parsing behave exactly like a pipeline node.
+///
+/// # 参数 / Parameters
+/// - `module`: 要运行的模块 / The module to run
+/// - `params`: 参数值（已合并默认值与用户覆盖值）/ Parameter values (defaults already merged with overrides)
+/// - `input`: 输入文件路径 / Input file path
+/// - `cancel`: 可选的取消标志 / Optional cancel flag
+/// - `settings`: 用于确定副产物目录与 tmp 上限 / Used for the sidecar dir and tmp cap
+/// - `on_progress`: 模块内进度回调 / Module-level progress callback
+/// - `on_status`: 状态文字回调 / Status text callback
+/// - `on_log`: 日志行回调 / Log line callback
+#[allow(clippy::too_many_arguments)]
+pub fn run_module_once(
+    module: &ModuleInfo,
+    params: &HashMap<String, serde_json::Value>,
+    input: &std::path::Path,
+    cancel: Option<Arc<AtomicBool>>,
+    settings: &crate::config::settings::Settings,
+    on_progress: &dyn Fn(u32, u32),
+    on_status: &dyn Fn(&str),
+    on_log: &dyn Fn(&str, &str),
+) -> NodeResult {
+    let node = PipelineNode {
+        node_id: "manual".to_string(),
+        module_id: module.id.clone(),
+        params: params.clone(),
+        enabled: true,
+    };
+    let sidecar = settings.sidecar_dir_for_video(input);
+    run_node(
+        module,
+        &node,
+        input,
+        cancel,
+        settings.max_tmp_dir_gb,
+        sidecar.as_deref(),
+        on_progress,
+        on_log,
+        on_status,
+    )
 }
 
 // ─── 模块自检 / Module self-test ─────────────────────────────────────────────

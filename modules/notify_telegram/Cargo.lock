@@ -1184,7 +1184,7 @@ dependencies = [
 
 [[package]]
 name = "notify_telegram"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "dirs",
  "futures",
@@ -1193,6 +1193,7 @@ dependencies = [
  "grammers-session",
  "md5",
  "pp_utils",
+ "serde_json",
  "tokio",
 ]
 

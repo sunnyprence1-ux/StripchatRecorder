@@ -206,6 +206,32 @@ pub fn run_postprocess_for_path_inner(
                 }),
             );
         },
+        // 删除回调：模块（如 notify_telegram）在上传成功后请求清空本地数据。
+        // 删除整条录制的全部数据：成片、.ts 分片目录、元数据、模块副产物。
+        //
+        // Delete callback: a module (e.g. notify_telegram) asks to wipe the local data after
+        // a successful upload. Removes everything for the recording: video, .ts segments,
+        // metadata and module side outputs.
+        |deleted_path| {
+            let report = crate::recording::meta::purge_recording(&settings, deleted_path);
+            let deleted_str = deleted_path.to_string_lossy().to_string();
+            {
+                let mut data = state.data.write();
+                data.pp_results.retain(|p| p != &deleted_str);
+            }
+            let _ = state.save();
+            state.pp_tasks.write().remove(&deleted_str);
+            emitter.emit(
+                "recording-purged",
+                &serde_json::json!({
+                    "path": deleted_str,
+                    "removed": report.removed,
+                    "freedBytes": report.freed_bytes,
+                    "failed": report.failed,
+                    "reason": "uploaded",
+                }),
+            );
+        },
     );
 
     state.pp_task_clear_cancel_flag(&path_str);

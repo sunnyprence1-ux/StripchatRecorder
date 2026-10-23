@@ -1,10 +1,10 @@
 [package]
 name = "notify_telegram"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 
 [[bin]]
-name = "notify_telegram_v041"
+name = "notify_telegram_v042"
 path = "src/main.rs"
 
 [dependencies]
@@ -16,3 +16,6 @@ futures  = "0.3"
 tokio    = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "io-std", "io-util"] }
 dirs = "6"
 md5 = "0.8"
+
+[dev-dependencies]
+serde_json = "1"
