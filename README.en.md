@@ -28,8 +28,8 @@ A self-hosted Stripchat live stream recorder with a web-based management UI. Sup
   - **contact_sheet** — generates a tiled preview image with timestamps
   - **filter_short** — deletes recordings below a minimum duration
   - **notify_discord** — sends recording info and cover image to a Discord Webhook
-  - **notify_telegram** — sends recording info, cover image, and video via MTProto (supports files >2 GB, HTTP/SOCKS5 proxy); can create/reuse one group forum topic per model and upload the video into it
-- **Manual send to Telegram**: pick any finished video (or several at once) on the recordings page and upload it right away, without running the whole pipeline — group id, per-model topics, and the video toggle can all be overridden per send
+  - **notify_telegram** — sends videos via MTProto (supports files >2 GB, HTTP/SOCKS5 proxy); video only by default, with no text at all — the caption and cover image each have their own switch; can create/reuse one group forum topic per model and upload the video into it
+- **Manual send to Telegram**: pick any finished video (or several at once) on the recordings page and upload it right away, without running the whole pipeline — group id, per-model topics, the video toggle, the caption toggle and the cover-image toggle can all be overridden per send
 - **Delete after upload**: once Telegram accepts the video, the recording's video, `.ts` segments, metadata and side files are removed from the server, so a small VPS doesn't fill up
 - Disk space monitoring on the recordings page, with a warning highlight when less than 5 GB remains
 - Dual runtime: Tauri desktop app or headless server accessible via browser
@@ -184,13 +184,26 @@ A user account can list forum topics, so existing topics are reused reliably and
 - **Private groups have no username**: leave `username` empty and use the Chat ID only (`-100xxxxxxxxxx` for supergroups). A channel id written as `-<channel_id>`, or without the minus sign, is also understood — the module retries it as a supergroup when the first interpretation does not resolve.
 - Topics are optional: turn "Create/reuse a group topic per model" off and messages go straight into the group's main chat (basic groups work fine that way).
 
+### Video only (no text)
+
+"Attach text caption" (the `send_caption` parameter) is **off by default**: the uploaded video message
+carries no text at all — no more `ModelName / Timestamp / Duration / FileName / FileSize` block. Turn it
+on from the pipeline node or the send dialog when you want it.
+
+"Also send the cover image" (`send_cover`, on by default) controls whether the album includes the
+contact-sheet preview. Switch that off too and the group receives a single, bare video message.
+
+> The video, the cover image and the caption cannot all be off at once — with all three disabled the
+> module fails immediately with `nothing to send` instead of connecting first and finding out later.
+
 ### Manual sending and delete-after-upload
 
 Every row on the recordings page has a **Send to Telegram** button (and selecting several files adds one
 to the batch bars), so a finished video can be uploaded immediately without waiting for the pipeline:
 
-- The dialog pre-fills the group id, group username, per-model topics and the video toggle from the
-  pipeline node. Changes apply to that one send only and are never written back to the pipeline config.
+- The dialog pre-fills the group id, group username, per-model topics, the video toggle, the caption
+  toggle and the cover-image toggle from the pipeline node. Changes apply to that one send only and are
+  never written back to the pipeline config.
 - Upload progress, speed and the module's output are shown live, and the send can be cancelled.
 - Multiple files are queued and uploaded one at a time, so the uplink isn't fragmented and Telegram's
   rate limits aren't tripped.

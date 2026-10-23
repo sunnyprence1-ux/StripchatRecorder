@@ -577,7 +577,10 @@ The project ships four modules under `modules/`, which are automatically copied 
 | `username`   | string  | `""`    | Group username, optional — public groups only, without `@`; leave empty for private groups |
 | `proxy`      | string  | `""`    | Proxy address; supports `http://` and `socks5://`              |
 | `send_video` | boolean | `true`  | Also send the video file                                       |
+| `send_caption` | boolean | `false` | Attach a text caption (model name, timestamp, duration, file name, size). Off by default: the video is posted with no text at all |
+| `send_cover` | boolean | `true`  | Also send the cover image (contact-sheet preview). With it off the album holds the video only |
 | `topic_per_model` | boolean | `true` | Create/reuse one forum topic per model and post the video into it; the group must be a forum and the bot needs "Manage Topics" |
+| `delete_after_send` | boolean | `true` | Ask the host to delete local data after a successful send (video, segment directory, metadata, module side outputs) to free server space |
 
 ---
 

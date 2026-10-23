@@ -575,7 +575,10 @@ chmod +x ./data/modules/copy_to_dir
 | `username`    | string  | `""`    | 群组 Username，可选（仅公开群组，不含 `@`；私有群组留空） |
 | `proxy`       | string  | `""`    | 代理地址，支持 `http://`、`socks5://`             |
 | `send_video`  | boolean | `true`  | 是否同时发送视频文件                              |
+| `send_caption` | boolean | `false` | 是否在视频消息里附带文字说明（模特名、时间、时长、文件名、大小）。默认关闭：只发视频，消息里没有任何文字 |
+| `send_cover`  | boolean | `true`  | 是否同时发送封面图（联系表截图）。关闭后相册里只有视频 |
 | `topic_per_model` | boolean | `true` | 按模特名自动创建/复用群组话题（Topic），视频发送到对应话题；群组需为论坛模式且 Bot 具备「管理话题」权限 |
+| `delete_after_send` | boolean | `true` | 发送成功后请求主程序删除本地数据（成片、分片目录、元数据、模块副产物），释放服务器空间 |
 
 ---
 
