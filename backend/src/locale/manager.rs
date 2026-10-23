@@ -8,7 +8,7 @@
 //! support overriding built-in translations.
 //!
 //! # 目录结构 / Directory Structure
-//! ```
+//! ```text
 //! <exe_dir>/
 //! └── locale/
 //!     ├── app/

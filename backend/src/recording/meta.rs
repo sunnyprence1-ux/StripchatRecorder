@@ -18,7 +18,7 @@
 //!
 //! ## Status 状态流转 / Status lifecycle
 //!
-//! ```
+//! ```text
 //! recording → merging_waiting → merging → pp_waiting → pp_running → finish
 //!                                       ↘ finish (no pipeline)    ↘ pp_error
 //! ```
