@@ -1,5 +1,5 @@
 {
-  "name": "Telegram Notification 0.4.3",
+  "name": "Telegram Notification 0.5.0",
   "description": "Send finished videos to Telegram via MTProto (files over 50 MB and HTTP/SOCKS5 proxies supported). Posts the video only by default — no text at all; the text caption and the cover image each have their own switch. Can create/reuse one group forum topic per model and post the video into it. Uses your signed-in account by default: it can list existing topics (no duplicates) and premium accounts can upload single files up to 4 GB",
   "params": {
     "account": {
@@ -31,6 +31,9 @@
     },
     "send_cover": {
       "label": "Also send the cover image (contact-sheet preview). With this off the album holds the video only"
+    },
+    "cover_first": {
+      "label": "Post the cover image on its own first, then upload and send the video. With this off the cover and the video go out together as one album message"
     },
     "topic_per_model": {
       "label": "Create/reuse a group topic per model and upload into it"

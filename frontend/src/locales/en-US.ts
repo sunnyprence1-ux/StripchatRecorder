@@ -398,6 +398,9 @@ export default {
 		sendVideo: "Also send the video file",
 		sendCover: "Also send the cover image",
 		sendCoverHint: "The contact-sheet preview image. Turn it off to post the video on its own.",
+		coverFirst: "Post the cover image first, then the video",
+		coverFirstHint:
+			"The contact sheet goes out as its own image message, then the video follows as a separate message. Off: both are posted together as one album.",
 		sendCaption: "Attach text caption",
 		sendCaptionHint:
 			"Model name, timestamp, duration, file name and size. Off by default — the video is posted with no text at all.",

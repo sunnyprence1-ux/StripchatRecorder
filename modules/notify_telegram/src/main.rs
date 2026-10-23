@@ -87,7 +87,7 @@ const PROGRESS_SCALE: usize = 10_000;
 /// Module metadata JSON, output via `--describe` argument.
 const DESCRIBE: &str = r#"{
     "id": "notify_telegram",
-    "name": "Telegram 通知 0.4.4",
+    "name": "Telegram 通知 0.5.0",
     "description": "把录制好的视频通过 MTProto 发送到 Telegram（支持超过 50MB 的大文件，支持 HTTP/SOCKS5 代理）。默认只发视频、不带任何文字；文字说明和封面图都可以单独开关。可按模特自动创建/复用群组话题（Topic）并把视频发送到对应话题。默认使用已登录的真实账号：可列出话题、避免重复创建，高级会员还能上传 4GB 单文件",
     "testable": true,
     "loginable": true,
@@ -150,6 +150,12 @@ const DESCRIBE: &str = r#"{
         {
         "key": "send_cover",
         "label": "同时发送封面图（联系表截图）。关闭后相册里只有视频",
+        "type": "boolean",
+        "default": true
+        },
+        {
+        "key": "cover_first",
+        "label": "先把封面图单独作为一条图片消息发出去，再上传并发送视频。关闭后封面图和视频合在同一条相册消息里",
         "type": "boolean",
         "default": true
         },
@@ -1775,6 +1781,56 @@ async fn resolve_topic_id(
     }
 }
 
+/// 把已固化的封面图作为一条独立的图片消息发送（不放进相册），带重试。
+///
+/// Send an already-committed cover image as a standalone photo message (not part of an
+/// album), with retry.
+///
+/// # 参数 / Parameters
+/// - `media`: 已通过 `messages.UploadMedia` 固化的封面图 / Cover committed via `UploadMedia`
+/// - `topic_id`: 目标话题（`None` = 群组主聊天）/ Target topic (`None` = the group's main chat)
+async fn send_standalone_photo(
+    client: &Client,
+    peer: PeerRef,
+    media: &grammers_client::media::Media,
+    topic_id: Option<i32>,
+) -> Result<(), String> {
+    const MAX_SEND: u32 = 5;
+    const SEND_RETRY_DELAY: Duration = Duration::from_secs(30);
+    let mut send_attempt = 0u32;
+    loop {
+        let msg = InputMessage::new()
+            .copy_media(media)
+            .reply_to(topic_id);
+        match client.send_message(peer, msg).await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                send_attempt += 1;
+                let err = format!("send_message (cover photo) failed: {}", e);
+                if send_attempt >= MAX_SEND {
+                    return Err(err);
+                }
+                eprintln!("cover photo send failed (attempt {}/{}): {}. retrying in {:?}…",
+                    send_attempt, MAX_SEND, err, SEND_RETRY_DELAY);
+                tokio::time::sleep(SEND_RETRY_DELAY).await;
+            }
+        }
+    }
+}
+
+/// 封面图是否单独发一条消息（而不是放进视频相册）。
+///
+/// 只有「同时发视频」「发封面图」「先发封面图」三项都开启时才单独发送：
+/// 只发图片时本来就只有一条图片消息，不需要再拆。
+///
+/// Whether the cover is posted as its own message instead of inside the video album.
+///
+/// It only splits when the video, the cover and the "cover first" switch are all on; when
+/// the video is off the cover already is a message of its own.
+fn cover_sent_separately(send_video: bool, has_cover: bool, cover_first: bool) -> bool {
+    send_video && has_cover && cover_first
+}
+
 /// 上传单个文件后立即调用 `messages.UploadMedia` 固化到服务端，带重试。
 /// 固化后的 Media 不受上传 session TTL 限制（约 10 分钟），可安全地在之后发送。
 ///
@@ -1819,20 +1875,26 @@ async fn commit_media(
 /// 1. 解析目标会话
 /// 2. 转换封面图格式（若需要）
 /// 3. 转换/重封装视频格式（若需要）
-/// 4. 并行上传封面图、视频缩略图和视频文件
-/// 5. 以相册形式发送（封面图 + 视频，每批最多 10 条）
+/// 4. 上传封面图并立即固化
+/// 5. 解析/创建话题
+/// 6. `cover_first` 开启时，先把封面图单独作为一条图片消息发出
+/// 7. 并行上传视频缩略图和视频文件，再以相册形式发送视频（每批最多 10 条）
 ///
 /// 封面图和文字说明都可单独关闭：两者都关时相册里只有视频，消息里没有任何文字。
+/// `cover_first` 关闭时封面图和视频回到同一条相册消息里（旧行为）。
 ///
 /// Flow:
 /// 1. Resolve the target peer
 /// 2. Convert cover image format if needed
 /// 3. Convert/remux video format if needed
-/// 4. Upload cover image, video thumbnails, and video files
-/// 5. Send as album (cover + videos, up to 10 per batch)
+/// 4. Upload the cover image and commit it immediately
+/// 5. Resolve/create the topic
+/// 6. With `cover_first` on, post the cover as its own photo message first
+/// 7. Upload video thumbnails and files, then send the videos as an album (max 10 per batch)
 ///
 /// The cover image and the text caption can each be switched off; with both off the album holds
-/// the videos only and the message carries no text at all.
+/// the videos only and the message carries no text at all. With `cover_first` off the cover
+/// goes back inside the video album (the previous behaviour).
 #[allow(clippy::too_many_arguments)]
 async fn upload_and_send(
     client: &Client, mode: SessionMode,
@@ -1841,7 +1903,7 @@ async fn upload_and_send(
     file_name: &str, file_size_str: &str,
     input: &Path, cover: Option<&Path>, send_video: bool,
     topic_per_model: bool, video_parts: &[PathBuf],
-    send_caption: bool, send_cover: bool,
+    send_caption: bool, send_cover: bool, cover_first: bool,
 ) -> Result<(), String> {
     // 文字说明是可选的：关闭后消息里不含任何文字，只有视频（或图片）
     // The caption is optional: when off the message carries no text at all, only media
@@ -1978,6 +2040,24 @@ async fn upload_and_send(
         if let Some(ref tmp) = converted_cover { let _ = fs::remove_file(tmp); }
         if let Some(ref tmp) = resized_cover { let _ = fs::remove_file(tmp); }
 
+        // 解析/创建该模特对应的群组话题；失败时退化为普通发送，不影响视频上传
+        // Resolve/create the group topic for this model; on failure fall back to a normal send
+        let topic_id = resolve_topic_id(client, &target, chat_id, model_name, topic_per_model, mode).await;
+
+        // 先发封面图：把联系表作为一条独立的图片消息发出去，然后才上传视频。
+        // 这样群里立刻能看到预览图，不必等大文件传完；视频随后作为单独的消息到达。
+        //
+        // Cover first: post the contact sheet as its own photo message, then upload the video,
+        // so the preview shows up immediately instead of waiting for the big upload.
+        let cover_in_album =
+            !cover_sent_separately(send_video, committed_cover.is_some(), cover_first);
+        if let Some(ref cover_media) = committed_cover
+            && !cover_in_album
+        {
+            send_standalone_photo(client, peer, cover_media, topic_id).await?;
+            println!("      cover image sent as its own message, uploading the video next…");
+        }
+
         // 串行上传每个视频片段及其缩略图，上传后立即固化。
         // Serial upload + immediate commit for each video part and its thumbnail.
         let do_upload_and_commit = |done: Arc<AtomicUsize>| {
@@ -2041,9 +2121,10 @@ async fn upload_and_send(
 
         let total_parts = committed_parts.len();
 
-        // 解析/创建该模特对应的群组话题；失败时退化为普通发送，不影响视频上传
-        // Resolve/create the group topic for this model; on failure fall back to a normal send
-        let topic_id = resolve_topic_id(client, &target, chat_id, model_name, topic_per_model, mode).await;
+        // 相册里要放的封面图：已经单独发过时为 None（视频相册里不再重复）
+        // The cover to include in the album: `None` once it has been posted on its own
+        let album_cover: Option<grammers_client::media::Media> =
+            if cover_in_album { committed_cover.clone() } else { None };
 
         // 辅助函数：从固化的 Media 重建 InputMedia 列表（用于发送重试）
         // Helper: rebuild InputMedia list from committed Media (for send retry)
@@ -2076,7 +2157,7 @@ async fn upload_and_send(
 
         let mut reupload_count = 0u32;
         loop {
-            let n_batches = build_items(&committed_cover, &committed_parts).len().div_ceil(MAX_ALBUM);
+            let n_batches = build_items(&album_cover, &committed_parts).len().div_ceil(MAX_ALBUM);
             let mut need_reupload = false;
             let mut send_err = String::new();
 
@@ -2084,7 +2165,7 @@ async fn upload_and_send(
                 let start = batch_idx * MAX_ALBUM;
                 let mut send_attempt = 0u32;
                 loop {
-                    let mut batch: Vec<InputMedia> = build_items(&committed_cover, &committed_parts)
+                    let mut batch: Vec<InputMedia> = build_items(&album_cover, &committed_parts)
                         .into_iter().skip(start).take(MAX_ALBUM).collect();
                     // 话题模式：每批相册都作为该话题内的消息发送（send_album 只使用首项的 reply_to）
                     // Topic mode: every album batch is posted inside the topic
@@ -2213,6 +2294,8 @@ struct TgConfig {
     send_caption: bool,
     /// 是否同时发送封面图 / Whether to also send the cover image
     send_cover: bool,
+    /// 封面图是否先单独作为一条消息发出（再发视频）/ Whether the cover is posted on its own first
+    cover_first: bool,
     topic_per_model: bool,
     /// 登录方式（机器人 / 用户账号）/ Login mode (bot / user account)
     mode: SessionMode,
@@ -2299,6 +2382,8 @@ fn read_config() -> Result<TgConfig, String> {
     let send_caption = param_bool("send_caption", false);
     // 封面图默认开启 / The cover image is on by default
     let send_cover = param_bool("send_cover", true);
+    // 默认先把封面图单独发出去，再上传视频 / By default the cover is posted on its own first
+    let cover_first = param_bool("cover_first", true);
     // 三项全关 = 没有任何内容可发，提前报错而不是连上 Telegram 后才发现
     // All three off means there is nothing to send; fail early instead of after connecting
     validate_payload_flags(send_video, send_caption, send_cover)?;
@@ -2313,6 +2398,7 @@ fn read_config() -> Result<TgConfig, String> {
         send_video,
         send_caption,
         send_cover,
+        cover_first,
         // 是否把每个模特的视频发送到该模特专属的群组话题中
         // Whether to send each model's video into a group forum topic dedicated to that model
         topic_per_model: param_bool("topic_per_model", true),
@@ -2393,6 +2479,27 @@ fn make_test_clip() -> Result<PathBuf, String> {
         }
     }
     Err("ffmpeg failed to generate the test clip".to_string())
+}
+
+/// 自检用的封面图：从测试视频里截一帧，验证「先发封面图」链路。
+/// Cover image used by the self-test: one frame of the test clip, so the "cover first" path is
+/// actually exercised by the Test button.
+fn make_test_cover(clip: &Path) -> Result<PathBuf, String> {
+    let out = tmp_dir().join("telegram_selftest_cover.png");
+    let _ = fs::remove_file(&out);
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-ss", "1", "-i"])
+        .arg(clip)
+        .args(["-frames:v", "1"])
+        .arg(&out)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("ffmpeg not found: {}", e))?;
+    if !status.success() || !out.exists() {
+        return Err("ffmpeg failed to generate the test cover image".to_string());
+    }
+    Ok(out)
 }
 
 /// 自检主流程：连接 → 解析目标会话 → 解析/创建话题 → 上传并发送测试视频（或文字）。
@@ -2477,8 +2584,39 @@ async fn self_test(cfg: &TgConfig) -> Result<(), String> {
             .map(|m| m.len() as usize)
             .unwrap_or(0);
 
-        let total = size + thumb_size;
+        // 封面图：send_cover 开启时截一帧，cover_first 开启时先单独把它发出去，
+        // 与真实发送流程完全一致（这样「测试」按钮也能验证新链路）。
+        //
+        // Cover: grab one frame when send_cover is on, and with cover_first on post it on its
+        // own first — exactly like a real send, so the Test button covers the new path too.
+        let cover_path = if cfg.send_cover { make_test_cover(&clip).ok() } else { None };
+        let cover_size = cover_path
+            .as_ref()
+            .and_then(|p| fs::metadata(p).ok())
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+
+        let total = size + thumb_size + cover_size;
         let done = Arc::new(AtomicUsize::new(0));
+
+        if let Some(ref cp) = cover_path
+            && cover_sent_separately(true, true, cfg.cover_first)
+        {
+            println!("[5/5] uploading the cover image first ({})…", format_bytes(cover_size as u64));
+            let uploaded =
+                upload_with_progress(&client, cp, Arc::clone(&done), total).await?;
+            let raw: tl::enums::InputMedia = tl::types::InputMediaUploadedPhoto {
+                spoiler: false,
+                file: uploaded.raw,
+                stickers: None,
+                ttl_seconds: None,
+            }.into();
+            let media = commit_media(&client, &peer, raw).await?;
+            let msg = InputMessage::new().copy_media(&media).reply_to(topic_id);
+            client.send_message(peer, msg).await
+                .map_err(|e| format!("send_message (cover) failed: {}", e))?;
+            println!("      test cover image sent first (cover_first is on)");
+        }
 
         println!("[5/5] uploading {} ({})…", clip.display(), format_bytes(size as u64));
         let thumb_uploaded = match thumb_path.as_ref() {
@@ -2537,6 +2675,7 @@ async fn self_test(cfg: &TgConfig) -> Result<(), String> {
 
         let _ = fs::remove_file(&clip);
         if let Some(tp) = thumb_path { let _ = fs::remove_file(tp); }
+        if let Some(cp) = cover_path { let _ = fs::remove_file(cp); }
     } else if let Some(text) = caption {
         println!("[4/5] video upload is off, sending a text message…");
         let msg = InputMessage::new().reply_to(topic_id).text(text);
@@ -2569,6 +2708,7 @@ fn run_test() -> Result<(), String> {
     // Clean up the generated test files either way (nothing is left behind on failure)
     let _ = fs::remove_file(tmp_dir().join("telegram_selftest.mp4"));
     let _ = fs::remove_file(tmp_dir().join("telegram_selftest.tg_thumb.png"));
+    let _ = fs::remove_file(tmp_dir().join("telegram_selftest_cover.png"));
 
     result?;
     println!("SELF-TEST PASSED");
@@ -2791,6 +2931,7 @@ fn run() -> Result<(), String> {
         send_video,
         send_caption,
         send_cover,
+        cover_first,
         topic_per_model,
         delete_after_send,
         mode,
@@ -2837,7 +2978,7 @@ fn run() -> Result<(), String> {
                 &client, mode, chat_id, &username,
                 &model_name, &ts_str, &dur_str, &name_str, &size_str,
                 &input, cover.as_deref(), send_video, topic_per_model, &video_parts,
-                send_caption, send_cover,
+                send_caption, send_cover, cover_first,
             ).await;
             match result {
                 Ok(()) => break Ok(()),
@@ -3175,6 +3316,39 @@ mod tests {
             .expect("send_cover param is declared");
         assert_eq!(cover["type"], "boolean");
         assert_eq!(cover["default"], true);
+    }
+
+    /// 封面图默认先单独发一条，再发视频：`cover_first` 必须存在且默认开启。
+    /// The cover is posted on its own before the video by default: `cover_first` must exist
+    /// and default to on.
+    #[test]
+    fn describe_declares_cover_first() {
+        let v: serde_json::Value = serde_json::from_str(DESCRIBE).expect("DESCRIBE is valid JSON");
+        let params = v["params"].as_array().expect("params is an array");
+        let p = params
+            .iter()
+            .find(|p| p["key"] == "cover_first")
+            .expect("cover_first param is declared");
+        assert_eq!(p["type"], "boolean");
+        assert_eq!(p["default"], true);
+    }
+
+    /// 封面图单独发送的判定：只有在同时发视频时才需要拆成两条消息。
+    /// Whether the cover gets its own message: only worth splitting when the video is sent too.
+    #[test]
+    fn the_cover_is_split_off_only_alongside_a_video() {
+        // 视频 + 封面图 + 先发封面图 = 两条消息（图片在前，视频在后）
+        // video + cover + cover-first = two messages (image first, then the video)
+        assert!(cover_sent_separately(true, true, true));
+        // 关闭 cover_first 回到「封面图放进视频相册」
+        // Turning cover_first off puts the cover back inside the video album
+        assert!(!cover_sent_separately(true, true, false));
+        // 没有封面图时没什么可拆的 / Nothing to split when there is no cover
+        assert!(!cover_sent_separately(true, false, true));
+        // 只发图片时本来就只有一条图片消息，不需要再拆
+        // Without the video the cover already is the only message
+        assert!(!cover_sent_separately(false, true, true));
+        assert!(!cover_sent_separately(false, false, true));
     }
 
     /// 关掉文字说明后仍然要能发出去：视频 / 封面图 / 文字至少留一样。

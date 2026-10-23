@@ -50,6 +50,9 @@ pub struct SendRequest {
     /// 覆盖「同时发送封面图」/ `send_cover` override
     #[serde(default)]
     pub send_cover: Option<bool>,
+    /// 覆盖「先单独发封面图」/ `cover_first` override
+    #[serde(default)]
+    pub cover_first: Option<bool>,
 }
 
 /// 手动发送界面需要的默认值（来自流水线节点，供前端预填表单）。
@@ -75,6 +78,8 @@ pub struct SendDefaults {
     pub send_caption: bool,
     /// 默认「同时发送封面图」/ Default `send_cover`
     pub send_cover: bool,
+    /// 默认「先单独发封面图，再发视频」/ Default `cover_first`
+    pub cover_first: bool,
     /// 登录方式（auto / user / bot）/ Login mode
     pub account: String,
     /// 是否已有可用账号（已登录用户会话或机器人 Token）
@@ -166,6 +171,9 @@ pub fn send_defaults(state: &AppState) -> SendDefaults {
         // Match the module: the caption is off by default, so only the video is uploaded
         send_caption: param_bool(&params, "send_caption", false),
         send_cover: param_bool(&params, "send_cover", true),
+        // 与模块保持一致：默认先把联系表作为图片发出去，再发视频
+        // Match the module: the contact sheet is posted as an image before the video by default
+        cover_first: param_bool(&params, "cover_first", true),
         account,
         has_account,
         in_pipeline,
@@ -228,6 +236,7 @@ fn build_params(
         ("send_video", req.send_video),
         ("send_caption", req.send_caption),
         ("send_cover", req.send_cover),
+        ("cover_first", req.cover_first),
     ] {
         if let Some(v) = value {
             params.insert(key.to_string(), serde_json::Value::Bool(v));
@@ -555,6 +564,7 @@ mod tests {
             send_video: param_bool(params, "send_video", true),
             send_caption: param_bool(params, "send_caption", false),
             send_cover: param_bool(params, "send_cover", true),
+            cover_first: param_bool(params, "cover_first", true),
             account: "auto".to_string(),
             has_account: false,
             in_pipeline: !params.is_empty(),
@@ -583,6 +593,7 @@ mod tests {
             "sendVideo": false,
             "sendCaption": true,
             "sendCover": false,
+            "coverFirst": false,
         }))
         .expect("deserialize");
         assert_eq!(req.chat_id.as_deref(), Some("-1001"));
@@ -591,6 +602,7 @@ mod tests {
         assert_eq!(req.send_video, Some(false));
         assert_eq!(req.send_caption, Some(true));
         assert_eq!(req.send_cover, Some(false));
+        assert_eq!(req.cover_first, Some(false));
     }
 
     /// 文字说明默认关闭：节点里没有这个键时必须按「不发文字」处理，
@@ -627,6 +639,38 @@ mod tests {
             Some(&serde_json::Value::Bool(false))
         );
         assert_eq!(merged.get("send_cover"), Some(&serde_json::Value::Bool(false)));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// 封面图默认先单独发一条：界面的默认值必须和模块一致，否则用户看到的开关是反的。
+    /// The cover is posted on its own first by default: the UI default must match the module,
+    /// otherwise the switch shows the opposite of what happens.
+    #[test]
+    fn cover_first_defaults_to_true() {
+        assert!(param_bool(&HashMap::new(), "cover_first", true));
+        let d = send_defaults_from(&HashMap::new());
+        assert!(d.cover_first, "the cover goes out first by default");
+    }
+
+    /// 对话框里关掉「先发封面图」必须传到模块，回到「封面图放进相册」的旧行为。
+    /// Turning "cover first" off in the dialog must reach the module and restore the old
+    /// "cover inside the album" behaviour.
+    #[test]
+    fn cover_first_override_reaches_the_module() {
+        let d = defaults(&[("chat_id", serde_json::json!("-100222"))]);
+        let tmp = temp_video("tg_cmd_cover_first_test.mp4");
+        let req = SendRequest {
+            path: tmp.to_string_lossy().to_string(),
+            cover_first: Some(false),
+            ..Default::default()
+        };
+        let (merged, _) = build_params(&d, &req).expect("params");
+        assert_eq!(
+            merged.get("cover_first"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        // 没提到的参数保持节点里的值 / Parameters not mentioned keep the node's value
+        assert_eq!(merged.get("send_cover"), None);
         let _ = std::fs::remove_file(&tmp);
     }
 }

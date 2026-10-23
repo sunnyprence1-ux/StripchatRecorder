@@ -144,6 +144,8 @@ export interface TgSendOptions {
 	sendCaption?: boolean;
 	/** 同时发送封面图 / Also send the cover image */
 	sendCover?: boolean;
+	/** 先把封面图单独发出去，再发视频 / Post the cover image on its own before the video */
+	coverFirst?: boolean;
 }
 
 /**
@@ -160,6 +162,7 @@ export interface TgSendDefaults {
 	sendVideo: boolean;
 	sendCaption: boolean;
 	sendCover: boolean;
+	coverFirst: boolean;
 	account: string;
 	hasAccount: boolean;
 	inPipeline: boolean;

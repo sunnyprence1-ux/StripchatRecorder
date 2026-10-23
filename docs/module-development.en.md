@@ -579,6 +579,7 @@ The project ships four modules under `modules/`, which are automatically copied 
 | `send_video` | boolean | `true`  | Also send the video file                                       |
 | `send_caption` | boolean | `false` | Attach a text caption (model name, timestamp, duration, file name, size). Off by default: the video is posted with no text at all |
 | `send_cover` | boolean | `true`  | Also send the cover image (contact-sheet preview). With it off the album holds the video only |
+| `cover_first` | boolean | `true`  | Post the cover image as its own message first, then upload and send the video. With it off the cover and the video go out together as one album |
 | `topic_per_model` | boolean | `true` | Create/reuse one forum topic per model and post the video into it; the group must be a forum and the bot needs "Manage Topics" |
 | `delete_after_send` | boolean | `true` | Ask the host to delete local data after a successful send (video, segment directory, metadata, module side outputs) to free server space |
 | `upload_workers` | number | `8` | How many 512KB parts the built-in uploader sends concurrently (max 16; `0` = default). Serial uploads wait for the server to acknowledge every part, so this is where the speedup comes from |

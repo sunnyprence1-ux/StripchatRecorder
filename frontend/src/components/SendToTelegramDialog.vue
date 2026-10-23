@@ -51,6 +51,7 @@
 		sendVideo: true,
 		sendCaption: false,
 		sendCover: true,
+		coverFirst: true,
 	});
 
 	/** 是否正在加载默认值 / Whether the defaults are loading */
@@ -125,6 +126,7 @@
 			form.sendVideo = d.sendVideo;
 			form.sendCaption = d.sendCaption ?? false;
 			form.sendCover = d.sendCover ?? true;
+			form.coverFirst = d.coverFirst ?? true;
 		} catch {
 			// 读取默认值失败不阻塞发送：用户仍可手动填写群组 ID
 			// Failing to read defaults doesn't block sending: the user can still type a chat id
@@ -166,6 +168,7 @@
 			sendVideo: form.sendVideo,
 			sendCaption: form.sendCaption,
 			sendCover: form.sendCover,
+			coverFirst: form.coverFirst,
 		});
 	}
 
@@ -334,6 +337,13 @@
 								<p class="text-[11px] text-muted-foreground">{{ t("telegram.sendCoverHint") }}</p>
 							</div>
 							<Switch id="tg-send-cover" v-model="form.sendCover" class="shrink-0" />
+						</div>
+						<div v-if="form.sendVideo && form.sendCover" class="flex items-start justify-between gap-3">
+							<div class="flex flex-col gap-0.5">
+								<Label for="tg-cover-first" class="text-xs">{{ t("telegram.coverFirst") }}</Label>
+								<p class="text-[11px] text-muted-foreground">{{ t("telegram.coverFirstHint") }}</p>
+							</div>
+							<Switch id="tg-cover-first" v-model="form.coverFirst" class="shrink-0" />
 						</div>
 						<div class="flex items-start justify-between gap-3">
 							<div class="flex flex-col gap-0.5">

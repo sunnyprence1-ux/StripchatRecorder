@@ -153,19 +153,49 @@ pub fn parse_stem(stem: &str) -> (String, String) {
     (stem.to_string(), String::new())
 }
 
-/// 在视频文件同目录下查找对应的封面图（支持 jpg/jpeg/webp/png）。
-/// Find the cover image for a video in the same directory (supports jpg/jpeg/webp/png).
+/// 后端传入的副产物目录（`PP_SIDECAR_DIR`），未设置或为空时返回 `None`。
+/// The side-output directory handed over by the host (`PP_SIDECAR_DIR`), `None` when unset/blank.
+pub fn sidecar_dir() -> Option<PathBuf> {
+    env::var("PP_SIDECAR_DIR")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// 查找视频对应的封面图（支持 jpg/jpeg/webp/png）。
+///
+/// 查找顺序：视频所在目录，然后是后端指定的副产物目录（`PP_SIDECAR_DIR`）。
+/// 成片与副产物分开存放时（`final_video_dir` 与输出目录不同），联系表截图只存在于
+/// 副产物目录里，只看视频同目录会漏掉它。
+///
+/// Find the cover image for a video (supports jpg/jpeg/webp/png).
+///
+/// Search order: the video's own directory first, then the host-provided side-output
+/// directory (`PP_SIDECAR_DIR`). When finished videos and side outputs live apart
+/// (`final_video_dir` differs from the output directory) the contact sheet only exists in
+/// the side-output directory, so looking beside the video alone would miss it.
 ///
 /// # 返回值 / Returns
 /// 封面图路径，未找到时返回 `None`。
 /// Cover image path, or `None` if not found.
 pub fn find_cover(video: &Path) -> Option<PathBuf> {
     let stem = video.file_stem()?.to_str()?;
-    let dir = video.parent()?;
-    for ext in &["jpg", "jpeg", "webp", "png"] {
-        let p = dir.join(format!("{}.{}", stem, ext));
-        if p.exists() {
-            return Some(p);
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = video.parent() {
+        dirs.push(dir.to_path_buf());
+    }
+    if let Some(sidecar) = sidecar_dir()
+        && !dirs.contains(&sidecar)
+    {
+        dirs.push(sidecar);
+    }
+    for dir in dirs {
+        for ext in &["jpg", "jpeg", "webp", "png"] {
+            let p = dir.join(format!("{}.{}", stem, ext));
+            if p.exists() {
+                return Some(p);
+            }
         }
     }
     None
@@ -337,4 +367,101 @@ pub fn emit_progress_step(step: u32, total_steps: u32) {
             .min(PROGRESS_SCALE as u64) as u32
     };
     println!("PROGRESS:{}/{}", scaled, PROGRESS_SCALE);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 在指定目录下创建一个空文件 / Create an empty file inside `dir`
+    fn touch(dir: &Path, name: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, b"x").unwrap();
+        p
+    }
+
+    /// 临时目录（每个测试一个，避免相互影响）/ Temp dir (one per test, so they never collide)
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pp_utils_test_{}_{}_{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 封面图默认在视频同目录：布局未分离时必须仍然找得到。
+    /// The cover normally sits beside the video: it must still be found in the flat layout.
+    #[test]
+    fn cover_beside_the_video_is_found() {
+        let dir = temp_dir("beside");
+        let video = touch(&dir, "alice_20260101_000000.mp4");
+        let cover = touch(&dir, "alice_20260101_000000.webp");
+        assert_eq!(find_cover(&video), Some(cover));
+    }
+
+    /// 成片与副产物分开存放时，联系表只在副产物目录里，也必须找得到。
+    /// With videos and side outputs split apart the contact sheet only lives in the sidecar
+    /// dir, and it must still be found.
+    #[test]
+    fn cover_in_the_sidecar_dir_is_found() {
+        let root = temp_dir("sidecar");
+        let final_dir = root.join("final");
+        let sidecar = root.join("recordings");
+        let video = touch(&final_dir, "alice_20260101_000000.mp4");
+        let cover = touch(&sidecar, "alice_20260101_000000.webp");
+
+        // SAFETY: 本 crate 里只有这个测试读写 PP_SIDECAR_DIR
+        // SAFETY: this is the only test in the crate that touches PP_SIDECAR_DIR
+        unsafe { env::set_var("PP_SIDECAR_DIR", &sidecar) };
+        let found = find_cover(&video);
+        unsafe { env::remove_var("PP_SIDECAR_DIR") };
+
+        assert_eq!(found, Some(cover));
+    }
+
+    /// 视频同目录优先于副产物目录 / The video's own directory wins over the sidecar dir
+    #[test]
+    fn the_video_directory_wins_when_both_have_a_cover() {
+        let root = temp_dir("both");
+        let final_dir = root.join("final");
+        let sidecar = root.join("recordings");
+        let video = touch(&final_dir, "alice_20260101_000000.mp4");
+        let beside = touch(&final_dir, "alice_20260101_000000.webp");
+        touch(&sidecar, "alice_20260101_000000.webp");
+
+        // SAFETY: 同上，只有这个测试改 PP_SIDECAR_DIR
+        // SAFETY: as above, this is the only test that mutates PP_SIDECAR_DIR
+        unsafe { env::set_var("PP_SIDECAR_DIR", &sidecar) };
+        let found = find_cover(&video);
+        unsafe { env::remove_var("PP_SIDECAR_DIR") };
+
+        assert_eq!(found, Some(beside));
+    }
+
+    /// 没有封面图时返回 None，不能凭空造一个路径。
+    /// No cover anywhere means None — never a path that does not exist.
+    #[test]
+    fn missing_cover_is_none() {
+        let dir = temp_dir("missing");
+        let video = touch(&dir, "alice_20260101_000000.mp4");
+        assert_eq!(find_cover(&video), None);
+    }
+
+    /// 空白的 PP_SIDECAR_DIR 视为未设置 / A blank PP_SIDECAR_DIR counts as unset
+    #[test]
+    fn blank_sidecar_dir_is_ignored() {
+        // SAFETY: 只有这个测试改 PP_SIDECAR_DIR
+        // SAFETY: only this test mutates PP_SIDECAR_DIR
+        unsafe { env::set_var("PP_SIDECAR_DIR", "   ") };
+        let parsed = sidecar_dir();
+        unsafe { env::remove_var("PP_SIDECAR_DIR") };
+        assert_eq!(parsed, None);
+    }
 }
