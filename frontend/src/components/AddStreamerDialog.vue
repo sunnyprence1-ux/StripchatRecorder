@@ -75,7 +75,7 @@
 
 <template>
 	<Dialog :open="true" @update:open="(v) => !v && emit('close')">
-		<DialogContent class="sm:max-w-95">
+		<DialogContent class="sm:max-w-95 dialog-max-h overflow-y-auto">
 			<DialogHeader>
 				<DialogTitle>{{ t("addStreamer.title") }}</DialogTitle>
 				<DialogDescription class="sr-only">{{ t("addStreamer.description") }}</DialogDescription>

@@ -431,7 +431,7 @@ async function openSimilarDialog(m: ModelResult) {
     </header>
 
     <!-- Tabs -->
-    <div class="flex gap-1 border-b border-border">
+    <div class="flex gap-1 border-b border-border overflow-x-auto">
       <Button
         v-for="tab in [{ key: 'face', label: t('finder.tabs.face') }, { key: 'name', label: t('finder.tabs.name') }]"
         :key="tab.key"
@@ -460,7 +460,7 @@ async function openSimilarDialog(m: ModelResult) {
       >
         <input ref="fileInput" type="file" accept="image/*" class="hidden" @change="onFileInput" />
 
-        <div v-if="!previewUrl" class="flex flex-col items-center gap-2 py-12 text-muted-foreground">
+        <div v-if="!previewUrl" class="flex flex-col items-center gap-2 py-8 md:py-12 text-muted-foreground">
           <ImageIcon class="w-10 h-10 opacity-40" />
           <p class="text-sm">{{ t("finder.face.dropzone") }}</p>
           <p class="text-xs opacity-60">{{ t("finder.face.dropzoneHint") }}</p>
@@ -471,7 +471,7 @@ async function openSimilarDialog(m: ModelResult) {
           <Button
             variant="outline"
             size="icon"
-            class="absolute top-2 right-2 w-6 h-6 rounded-full bg-background/80 text-xs hover:bg-destructive hover:text-destructive-foreground"
+            class="absolute top-2 right-2 w-6 h-6 max-md:w-9 max-md:h-9 rounded-full bg-background/80 text-xs hover:bg-destructive hover:text-destructive-foreground"
             @click.stop="clearFace"
           ><X class="size-3" /></Button>
         </div>
@@ -498,7 +498,7 @@ async function openSimilarDialog(m: ModelResult) {
       <!-- Face results -->
       <template v-if="faceResults.length > 0">
         <p class="text-sm text-muted-foreground">{{ t("finder.face.results", { count: faceResults.length }) }}</p>
-        <div class="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-3">
+        <div class="grid grid-cols-[repeat(auto-fill,minmax(min(100%,240px),1fr))] gap-3">
           <div
             v-for="(p, i) in faceResults"
             :key="i"
@@ -588,7 +588,7 @@ async function openSimilarDialog(m: ModelResult) {
       <!-- Name results -->
       <template v-if="nameResults.length > 0">
         <p class="text-sm text-muted-foreground">{{ t("finder.name.results", { count: nameResults.length }) }}</p>
-        <div class="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-3">
+        <div class="grid grid-cols-[repeat(auto-fill,minmax(min(100%,240px),1fr))] gap-3">
           <Button
             v-for="(m, i) in nameResults"
             :key="i"
@@ -631,34 +631,37 @@ async function openSimilarDialog(m: ModelResult) {
 
     <!-- ── Similar Face Dialog ── -->
     <Dialog v-model:open="dialogOpen">
+      <!-- 手机端接近全屏并上下堆叠；桌面端保持 16:9 左右分栏
+           Near full-screen and stacked on phones; 16:9 side-by-side layout on desktop -->
       <DialogContent
-        class="p-0 flex flex-col overflow-hidden"
-        style="height: 90vh; width: calc(90vh * 16 / 9); max-width: 96vw;"
+        class="p-0 flex flex-col overflow-hidden w-[calc(100vw-1rem)] h-[85dvh] max-w-[calc(100vw-1rem)] md:w-[calc(90vh*16/9)] md:h-[90vh] md:max-w-[96vw]"
       >
         <!-- Header -->
-        <div class="flex items-center gap-3 px-5 py-3 border-b border-border shrink-0">
+        <div class="flex items-center gap-3 px-3 py-2.5 md:px-5 md:py-3 border-b border-border shrink-0">
           <img
             v-if="dialogFaceImage"
             :src="dialogFaceImage"
             class="w-8 h-8 rounded object-cover border border-border shrink-0"
             alt=""
           />
-          <DialogTitle class="font-semibold text-sm">{{ t("finder.dialog.title", { name: dialogModel?.name }) }}</DialogTitle>
+          <DialogTitle class="font-semibold text-sm truncate">{{ t("finder.dialog.title", { name: dialogModel?.name }) }}</DialogTitle>
           <DialogDescription class="sr-only">{{ t("finder.dialog.description") }}</DialogDescription>
         </div>
 
-        <!-- Body -->
-        <div class="flex flex-1 min-h-0">
+        <!-- Body：手机端上下堆叠，桌面端左右分栏 / Body: stacked on phones, side-by-side on desktop -->
+        <div class="flex flex-col md:flex-row flex-1 min-h-0">
           <!-- Left: source model info -->
-          <div class="w-52 shrink-0 border-r border-border flex flex-col gap-3 p-4">
+          <div
+            class="flex flex-row md:flex-col items-center md:items-stretch flex-wrap md:flex-nowrap gap-3 p-3 md:p-4 w-full md:w-52 shrink-0 border-b md:border-b-0 md:border-r border-border"
+          >
             <img
               v-if="dialogFaceImage"
               :src="dialogFaceImage"
-              class="w-full aspect-square rounded object-cover border border-border"
+              class="w-14 h-14 md:w-full md:h-auto aspect-square rounded object-cover border border-border shrink-0"
               alt=""
             />
-            <div v-if="dialogModel" class="flex flex-col gap-1">
-              <span class="font-semibold text-sm">{{ dialogModel.name }}</span>
+            <div v-if="dialogModel" class="flex flex-col gap-1 min-w-0 flex-1 md:flex-none">
+              <span class="font-semibold text-sm truncate">{{ dialogModel.name }}</span>
               <span class="text-xs px-1.5 py-0.5 rounded bg-muted text-muted-foreground w-fit">
                 {{ platformLabel(dialogModel.platform) }}
               </span>
@@ -673,7 +676,7 @@ async function openSimilarDialog(m: ModelResult) {
             </div>
             <Button
               variant="outline"
-              class="mt-auto flex items-center gap-1.5 text-xs px-2 py-1 w-fit h-auto"
+              class="md:mt-auto shrink-0 flex items-center gap-1.5 text-xs px-2 py-1 w-fit h-auto"
               :class="bgMode ? 'border-primary bg-primary/10 text-primary' : ''"
               @click="bgMode = !bgMode"
             >
@@ -701,7 +704,7 @@ async function openSimilarDialog(m: ModelResult) {
                 {{ t("finder.dialog.results", { count: dialogResults.length }) }}
               </div>
               <div ref="dialogScrollEl" class="overflow-y-auto flex-1 px-4 pb-4 scrollbar-overlay">
-                <div class="grid grid-cols-[repeat(auto-fill,minmax(180px,1fr))] gap-2">
+                <div class="grid grid-cols-[repeat(auto-fill,minmax(min(100%,180px),1fr))] gap-2">
                   <div
                     v-for="(p, i) in dialogResults"
                     :key="i"

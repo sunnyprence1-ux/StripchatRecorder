@@ -122,6 +122,118 @@
   [data-slot="number-field-decrement"] {
     cursor: pointer;
   }
+
+  /* 移动端基础适配 / Mobile base adaptations */
+  html {
+    /* 禁止横屏时自动放大文字 / Prevent text auto-resize in landscape */
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+    /* 去掉 iOS 点击时的灰色高亮 / Remove the grey tap highlight on iOS */
+    -webkit-tap-highlight-color: transparent;
+    /* 纵向越界滚动不传递给浏览器（避免误触发下拉刷新）
+     * Don't chain vertical overscroll to the browser (avoids accidental pull-to-refresh) */
+    overscroll-behavior-y: none;
+  }
+  body {
+    /* 兜底防止意外横向溢出；需要横向滚动的表格各自声明 overflow-x-auto
+     * Last-resort guard against horizontal overflow; scrollable tables declare their own overflow-x-auto */
+    overflow-x: hidden;
+    overscroll-behavior-x: none;
+  }
+}
+
+/* iOS 上输入框字号小于 16px 会触发自动放大
+ * 放在 @layer 之外，才能覆盖组件上的 text-xs / text-sm 工具类。
+ *
+ * iOS auto-zooms inputs whose font-size is below 16px.
+ * Kept outside @layer so it can override text-xs / text-sm utilities on components.
+ */
+@media (max-width: 767px) {
+  input,
+  select,
+  textarea {
+    font-size: 16px;
+  }
+}
+
+/* 移动端视口单位 dvh 的回退 / Fallbacks for the dvh viewport unit
+ *
+ * dvh 在移动端浏览器工具栏显示时更准确；不支持 dvh 的旧浏览器会忽略第二条声明，
+ * 自动回退到等价的 vh 值，避免布局塌陷。
+ * dvh is more accurate while mobile browser toolbars are visible; browsers without dvh
+ * ignore the second declaration and fall back to the equivalent vh value instead of collapsing.
+ */
+.app-shell-height {
+  height: 100vh;
+  height: 100dvh;
+}
+.dialog-max-h {
+  max-height: 90vh;
+  max-height: 90dvh;
+}
+
+/* 触屏设备 / Touch devices
+ *
+ * 1. 文本按钮、下拉触发器至少 44px 高，方便手指点按；
+ *    图标按钮（data-size 以 icon 开头）保持原尺寸，由调用处按需放大，避免撑破紧凑工具栏。
+ * 2. 复选框与开关用透明伪元素扩大点击区域，不改变视觉尺寸。
+ *
+ * 1. Text buttons and select triggers are at least 44px tall for comfortable tapping;
+ *    icon buttons (data-size starting with "icon") keep their size and are enlarged at call sites
+ *    so compact toolbars are not broken.
+ * 2. Checkboxes and switches get a transparent pseudo-element hit area without visual changes.
+ */
+@media (pointer: coarse) and (max-width: 767px) {
+  [data-slot="button"]:not([data-size^="icon"]),
+  [data-slot="select-trigger"] {
+    min-height: 2.75rem;
+  }
+  [data-slot="checkbox"],
+  [data-slot="switch"] {
+    position: relative;
+  }
+  [data-slot="checkbox"]::after {
+    content: "";
+    position: absolute;
+    inset: -0.7rem -0.45rem;
+  }
+  /* 开关横向只扩展一点点，避免盖住紧邻的按钮 / The switch only grows slightly sideways so it can't cover a neighbouring button */
+  [data-slot="switch"]::after {
+    content: "";
+    position: absolute;
+    inset: -0.75rem -0.25rem;
+  }
+  /* 对话框右上角的关闭按钮同样需要足够的点击区域
+   * The dialog close button in the top-right corner also needs a bigger tap area */
+  [data-slot="dialog-close"] {
+    padding: 0.65rem;
+    top: 0.6rem;
+    right: 0.6rem;
+  }
+}
+
+/* 没有 hover 的设备（触屏）/ Devices without hover (touch)
+ *
+ * 去掉 300ms 点击延迟。注意：本项目的行操作、预览按钮等均常显，
+ * 不存在只在 hover 时才出现的操作入口。
+ * Removes the 300ms tap delay. Note: row actions and preview buttons in this app are
+ * always visible — there are no hover-only action affordances.
+ */
+@media (hover: none) {
+  button,
+  [role="button"],
+  a,
+  label,
+  summary {
+    touch-action: manipulation;
+  }
+}
+
+/* 移动端 Toast 抬高到底部标签栏之上 / Lift toasts above the mobile bottom tab bar */
+@media (max-width: 767px) {
+  [data-sonner-toaster][data-y-position="bottom"] {
+    bottom: calc(3.5rem + env(safe-area-inset-bottom) + 0.75rem) !important;
+  }
 }
 
 /* 隐藏式滚动条 / Overlay scrollbar

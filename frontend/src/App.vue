@@ -20,6 +20,7 @@
 	import { RouterView, useRouter, useRoute } from "vue-router";
 	import NotifyLayer from "./components/NotifyLayer.vue";
 	import { Button } from "@/components/ui/button";
+	import { Users, Video, Workflow, Radio, Search, Settings } from "@lucide/vue";
 	import { call, on, onSseReconnect, onSseDisconnect } from "@/lib/api";
 	import { useNotify } from "@/composables/useNotify";
 	import { toast as sonnerToast } from "vue-sonner";
@@ -41,14 +42,19 @@
 	const mainScrollEl = ref<HTMLElement | null>(null);
 	useScrollbar(mainScrollEl);
 
-	/** 侧边栏导航项配置 / Sidebar navigation items configuration */
+	/**
+	 * 导航项配置 / Navigation items configuration
+	 *
+	 * 桌面端侧边栏只用文字，移动端底部标签栏使用「图标 + 小号文字」。
+	 * Desktop sidebar uses text only; the mobile bottom tab bar uses icon + tiny label.
+	 */
 	const navItems = [
-		{ to: "/", labelKey: "nav.streamers" },
-		{ to: "/recordings", labelKey: "nav.recordings" },
-		{ to: "/postprocess", labelKey: "nav.postprocess" },
-		{ to: "/relay", labelKey: "nav.relay" },
-		{ to: "/finder", labelKey: "nav.finder" },
-		{ to: "/settings", labelKey: "nav.settings" },
+		{ to: "/", labelKey: "nav.streamers", icon: Users },
+		{ to: "/recordings", labelKey: "nav.recordings", icon: Video },
+		{ to: "/postprocess", labelKey: "nav.postprocess", icon: Workflow },
+		{ to: "/relay", labelKey: "nav.relay", icon: Radio },
+		{ to: "/finder", labelKey: "nav.finder", icon: Search },
+		{ to: "/settings", labelKey: "nav.settings", icon: Settings },
 	];
 
 	/**
@@ -232,10 +238,12 @@
 			<NotifyLayer />
 		</div>
 
-		<!-- 正常布局：侧边栏 + 内容区 / Normal layout: sidebar + content -->
-		<div v-else key="main" class="flex h-screen overflow-hidden">
+		<!-- 正常布局：侧边栏（≥md）+ 内容区 + 移动端底部标签栏
+		     Normal layout: sidebar (≥md) + content + mobile bottom tab bar -->
+		<div v-else key="main" class="flex app-shell-height overflow-hidden">
+			<!-- 桌面端侧边栏，移动端隐藏 / Desktop sidebar, hidden on mobile -->
 			<aside
-				class="w-44 shrink-0 bg-sidebar border-r border-sidebar-border flex flex-col p-3 gap-1"
+				class="hidden md:flex w-44 shrink-0 bg-sidebar border-r border-sidebar-border flex-col p-3 gap-1"
 			>
 				<div
 					class="flex items-center gap-2 px-1 py-4 mb-1 border-b border-sidebar-border"
@@ -262,8 +270,13 @@
 					</Button>
 				</nav>
 			</aside>
-			<main class="flex-1 overflow-hidden">
-				<div ref="mainScrollEl" class="h-full overflow-y-scroll p-6 scrollbar-overlay">
+			<main class="flex-1 min-w-0 overflow-hidden">
+				<!-- 底部留出标签栏 + 安全区高度，避免内容被遮挡
+				     Bottom padding leaves room for the tab bar + safe area -->
+				<div
+					ref="mainScrollEl"
+					class="h-full overflow-y-scroll overflow-x-hidden p-4 md:p-6 pb-[calc(4.5rem+env(safe-area-inset-bottom))] md:pb-6 scrollbar-overlay"
+				>
 					<RouterView v-slot="{ Component }">
 						<Transition name="page" mode="out-in">
 							<component :is="Component" :key="route.path" />
@@ -271,6 +284,38 @@
 					</RouterView>
 				</div>
 			</main>
+
+			<!-- 移动端底部标签栏（<md），固定在安全区之上 / Mobile bottom tab bar (<md), above the safe area -->
+			<nav
+				class="md:hidden fixed inset-x-0 bottom-0 z-40 border-t border-border bg-sidebar/95 backdrop-blur-sm"
+				:style="{
+					paddingBottom: 'env(safe-area-inset-bottom)',
+					paddingLeft: 'env(safe-area-inset-left)',
+					paddingRight: 'env(safe-area-inset-right)',
+				}"
+			>
+				<div class="flex items-stretch">
+					<button
+						v-for="item in navItems"
+						:key="item.to"
+						type="button"
+						class="flex flex-1 min-w-0 h-14 flex-col items-center justify-center gap-0.5 px-0 text-[10px] leading-tight tracking-tight transition-colors"
+						:class="
+							route.path === item.to
+								? 'text-primary font-semibold'
+								: 'text-muted-foreground active:text-foreground'
+						"
+						:aria-current="route.path === item.to ? 'page' : undefined"
+						:aria-label="t(item.labelKey)"
+						@click="router.push(item.to)"
+					>
+						<component :is="item.icon" class="size-5 shrink-0" />
+						<span class="w-full truncate text-center">{{
+							t(item.labelKey)
+						}}</span>
+					</button>
+				</div>
+			</nav>
 			<NotifyLayer />
 		</div>
 

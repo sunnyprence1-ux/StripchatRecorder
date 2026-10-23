@@ -347,7 +347,7 @@
 					<Label>{{ t("settings.language.label") }}</Label>
 					<RadioGroup
 						:model-value="String(locale)"
-						class="flex flex-row gap-4"
+						class="flex flex-wrap gap-x-4 gap-y-2"
 						@update:model-value="(v) => v && setLocale(String(v))"
 					>
 						<div
@@ -404,7 +404,7 @@
 						:min="0"
 						:max="Number.MAX_SAFE_INTEGER"
 						:step="1"
-						class="w-40"
+						class="w-40 max-md:w-full"
 						@update:model-value="(v) => v !== undefined && Number.isSafeInteger(v) && (form.max_recording_duration_secs = Math.max(0, v))"
 					>
 						<NumberFieldContent>
@@ -422,7 +422,7 @@
 						:model-value="form.max_concurrent"
 						:min="0"
 						:max="50"
-						class="w-32"
+						class="w-32 max-md:w-full"
 						@update:model-value="
 							(v) => v !== undefined && (form.max_concurrent = v)
 						"
@@ -442,7 +442,7 @@
 						:model-value="form.poll_interval_secs"
 						:min="10"
 						:max="300"
-						class="w-32"
+						class="w-32 max-md:w-full"
 						@update:model-value="
 							(v) => v !== undefined && (form.poll_interval_secs = v)
 						"
@@ -461,7 +461,7 @@
 						:model-value="String(form.preferred_resolution)"
 						@update:model-value="form.preferred_resolution = Number($event ?? 0)"
 					>
-						<SelectTrigger class="w-48">
+						<SelectTrigger class="w-48 max-md:w-full">
 							<SelectValue />
 						</SelectTrigger>
 						<SelectContent>
@@ -484,7 +484,7 @@
 					<Label>{{ t("settings.resolutionPreference.label") }}</Label>
 					<RadioGroup
 						:model-value="form.resolution_preference"
-						class="flex flex-row gap-4"
+						class="flex flex-wrap gap-x-4 gap-y-2"
 						@update:model-value="
 							(v) => v && (form.resolution_preference = v as 'lower' | 'higher')
 						"
@@ -505,7 +505,7 @@
 					<Label>{{ t("settings.mergeFormat.label") }}</Label>
 					<RadioGroup
 						:model-value="form.merge_format"
-						class="flex flex-row gap-4"
+						class="flex flex-wrap gap-x-4 gap-y-2"
 						@update:model-value="(v) => v && (form.merge_format = v as string)"
 					>
 						<div
@@ -530,7 +530,7 @@
 						:model-value="form.max_tmp_dir_gb"
 						:min="0"
 						:step="0.5"
-						class="w-36"
+						class="w-36 max-md:w-full"
 						@update:model-value="
 							(v) => v !== undefined && (form.max_tmp_dir_gb = v)
 						"
@@ -640,7 +640,7 @@
 				</div>
 
 				<!-- 同步状态 + 手动同步按钮 / Sync status + manual sync button -->
-				<div class="flex items-center justify-between gap-4 text-xs text-muted-foreground">
+				<div class="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
 					<div class="flex flex-col gap-0.5">
 						<span>{{ t("settings.mouflonAutoSyncedAt") }}{{ formatTs(mouflonStore.auto_synced_at) }}</span>
 						<span>{{ t("settings.mouflonManualUpdatedAt") }}{{ formatTs(mouflonStore.manual_updated_at) }}</span>
@@ -656,48 +656,48 @@
 					</Button>
 				</div>
 
-				<table
-					v-if="Object.keys(mouflonStore.keys).length"
-					class="w-full text-xs border-collapse"
-				>
-					<thead>
-						<tr>
-							<th
-								class="text-left px-2 py-1.5 border-b text-muted-foreground font-semibold"
-							>
-								{{ t("settings.mouflonTable.pkey") }}
-							</th>
-							<th
-								class="text-left px-2 py-1.5 border-b text-muted-foreground font-semibold"
-							>
-								{{ t("settings.mouflonTable.pdkey") }}
-							</th>
-							<th class="border-b"></th>
-						</tr>
-					</thead>
-					<tbody>
-						<tr v-for="(pdkey, pkey) in mouflonStore.keys" :key="pkey">
-							<td class="px-2 py-1.5 border-b font-mono">{{ pkey }}</td>
-							<td class="px-2 py-1.5 border-b font-mono max-w-60 truncate">
-								{{ pdkey }}
-							</td>
-							<td class="px-2 py-1.5 border-b">
-								<Button
-									type="button"
-									variant="destructive"
-									size="sm"
-									class="h-6 text-xs px-2"
-									@click="removeKey(pkey)"
+				<!-- 窄屏时表格横向滚动，避免挤压列宽 / The table scrolls horizontally on narrow screens -->
+				<div v-if="Object.keys(mouflonStore.keys).length" class="overflow-x-auto">
+					<table class="w-full text-xs border-collapse">
+						<thead>
+							<tr>
+								<th
+									class="text-left px-2 py-1.5 border-b text-muted-foreground font-semibold"
 								>
-									{{ t("common.delete") }}
-								</Button>
-							</td>
-						</tr>
-					</tbody>
-				</table>
+									{{ t("settings.mouflonTable.pkey") }}
+								</th>
+								<th
+									class="text-left px-2 py-1.5 border-b text-muted-foreground font-semibold"
+								>
+									{{ t("settings.mouflonTable.pdkey") }}
+								</th>
+								<th class="border-b"></th>
+							</tr>
+						</thead>
+						<tbody>
+							<tr v-for="(pdkey, pkey) in mouflonStore.keys" :key="pkey">
+								<td class="px-2 py-1.5 border-b font-mono">{{ pkey }}</td>
+								<td class="px-2 py-1.5 border-b font-mono max-w-60 truncate">
+									{{ pdkey }}
+								</td>
+								<td class="px-2 py-1.5 border-b">
+									<Button
+										type="button"
+										variant="destructive"
+										size="sm"
+										class="h-6 text-xs px-2"
+										@click="removeKey(pkey)"
+									>
+										{{ t("common.delete") }}
+									</Button>
+								</td>
+							</tr>
+						</tbody>
+					</table>
+				</div>
 				<p v-else class="text-xs text-muted-foreground">{{ t("settings.noKeys") }}</p>
 
-				<div class="flex gap-2 items-center">
+				<div class="flex flex-col gap-2 sm:flex-row sm:items-center">
 					<Input
 						v-model="newPkey"
 						placeholder="pkey"
@@ -710,7 +710,7 @@
 						autocomplete="off"
 						class="flex-2 font-mono text-xs"
 					/>
-					<Button type="button" variant="outline" @click="addKey">{{ t("settings.addKey") }}</Button>
+					<Button type="button" variant="outline" class="max-md:w-full" @click="addKey">{{ t("settings.addKey") }}</Button>
 				</div>
 				<p v-if="keyError" class="text-xs text-destructive">{{ keyError }}</p>
 			</section>

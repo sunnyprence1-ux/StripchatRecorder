@@ -38,7 +38,7 @@
 	<Toaster position="bottom-right" rich-colors />
 
 	<Dialog :open="!!dialog" @update:open="(v) => !v && _resolveDialog(false)">
-		<DialogContent class="sm:max-w-95">
+		<DialogContent class="sm:max-w-95 dialog-max-h overflow-y-auto">
 			<DialogHeader>
 				<DialogTitle>{{ dialog?.title }}</DialogTitle>
 			</DialogHeader>

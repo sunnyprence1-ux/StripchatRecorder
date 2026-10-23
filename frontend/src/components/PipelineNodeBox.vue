@@ -27,9 +27,9 @@
 		:class="fixed ? 'border-primary/40 bg-primary/5' : ''"
 	>
 		<div v-if="fixed" class="w-2 h-2 rounded-full bg-primary shrink-0" />
-		<div>
-			<div class="text-sm font-medium">{{ label }}</div>
-			<div v-if="description" class="text-xs text-muted-foreground">
+		<div class="min-w-0">
+			<div class="text-sm font-medium break-words">{{ label }}</div>
+			<div v-if="description" class="text-xs text-muted-foreground break-words">
 				{{ description }}
 			</div>
 		</div>

@@ -108,7 +108,7 @@
 				<Button
 					variant="ghost"
 					size="icon"
-					class="h-6 w-6 shrink-0 text-muted-foreground hover:text-destructive"
+					class="h-6 w-6 max-md:h-9 max-md:w-9 shrink-0 text-muted-foreground hover:text-destructive"
 					:title="t('streamerCard.removeTitle')"
 					@click="emit('remove')"
 				>
@@ -168,7 +168,7 @@
 			<!-- 转发流地址（始终显示）/ Stream URL (always shown) -->
 			<div class="flex items-center gap-2">
 				<div
-					class="flex-1 text-xs font-mono text-blue-400/60 bg-blue-950/10 rounded px-2 py-1 truncate select-all"
+					class="flex-1 min-w-0 text-xs font-mono text-blue-400/60 bg-blue-950/10 rounded px-2 py-2 md:py-1 truncate select-all"
 					:title="t('streamerCard.streamUrlHint')"
 				>
 					{{ streamUrl }}
@@ -176,7 +176,7 @@
 				<Button
 					size="sm"
 					variant="ghost"
-					class="shrink-0 px-2 h-6 text-muted-foreground hover:text-blue-300"
+					class="shrink-0 px-2 h-6 max-md:h-9 max-md:w-9 text-muted-foreground hover:text-blue-300"
 					:title="t('streamerCard.copyStreamUrl')"
 					@click="copyStreamUrl"
 				>

@@ -137,8 +137,10 @@ async function finish() {
 </script>
 
 <template>
-	<div class="min-h-screen flex items-center justify-center bg-background p-6">
-		<div class="w-full max-w-lg flex flex-col gap-8">
+	<!-- 全屏向导：移动端用 dvh + 安全区内边距，内容可正常滚动
+	     Full-screen wizard: dvh + safe-area padding on mobile, content stays scrollable -->
+	<div class="min-h-dvh flex items-center justify-center bg-background px-4 py-8 pb-[calc(2rem+env(safe-area-inset-bottom))] md:p-6">
+		<div class="w-full max-w-lg flex flex-col gap-6 md:gap-8">
 
 			<!-- 标题 / Title -->
 			<div class="flex flex-col gap-1.5">
@@ -251,20 +253,20 @@ async function finish() {
 			<!-- 错误提示 / Error message -->
 			<p v-if="error" class="text-sm text-destructive -mt-2">{{ error }}</p>
 
-			<!-- 导航按钮 / Navigation buttons -->
-			<div class="flex items-center justify-between">
+			<!-- 导航按钮：窄屏时换行，主按钮保持可点 / Navigation buttons: they wrap on narrow screens -->
+			<div class="flex flex-wrap items-center justify-between gap-2">
 				<Button variant="ghost" :disabled="step === 1" @click="back">
 					{{ t("setup.back") }}
 				</Button>
 
-				<div class="flex items-center gap-3">
+				<div class="flex flex-wrap items-center gap-2 md:gap-3">
 					<Button v-if="step === 3" variant="ghost" :disabled="saving" @click="finish">
 						{{ t("setup.skip") }}
 					</Button>
-					<Button v-if="step < TOTAL_STEPS" :disabled="!canNext" @click="next">
+					<Button v-if="step < TOTAL_STEPS" class="max-md:flex-1" :disabled="!canNext" @click="next">
 						{{ t("setup.next") }}
 					</Button>
-					<Button v-if="step === TOTAL_STEPS" :disabled="saving" @click="finish">
+					<Button v-if="step === TOTAL_STEPS" class="max-md:flex-1" :disabled="saving" @click="finish">
 						{{ saving ? t("setup.saving") : t("setup.finish") }}
 					</Button>
 				</div>

@@ -129,14 +129,15 @@
 
 <template>
 	<div class="flex flex-col gap-5">
-		<header class="flex items-start justify-between">
-			<div>
+		<!-- 标题与「添加主播」按钮：窄屏时按钮自动换行到下一行 / Title and add button: the button wraps below on narrow screens -->
+		<header class="flex flex-wrap items-start justify-between gap-3">
+			<div class="min-w-0">
 				<h1 class="text-xl font-bold mb-0.5">{{ t("home.title") }}</h1>
 				<p class="text-sm text-muted-foreground">
 					{{ t("home.subtitle", { total: store.streamers.length, recording: store.streamers.filter((s) => s.is_recording).length }) }}
 				</p>
 			</div>
-			<Button @click="showAdd = true">{{ t("home.addStreamer") }}</Button>
+			<Button class="shrink-0" @click="showAdd = true">{{ t("home.addStreamer") }}</Button>
 		</header>
 
 		<div
@@ -156,7 +157,7 @@
 
 		<div
 			v-else
-			class="grid grid-cols-[repeat(auto-fill,minmax(260px,1fr))] gap-3.5"
+			class="grid grid-cols-[repeat(auto-fill,minmax(min(100%,260px),1fr))] gap-3.5"
 		>
 			<StreamerCard
 				v-for="s in [...store.streamers].sort((a, b) =>

@@ -189,8 +189,8 @@
 
 <template>
 	<div class="flex flex-col gap-5">
-		<header class="flex items-start justify-between">
-			<div>
+		<header class="flex flex-wrap items-start justify-between gap-3">
+			<div class="min-w-0">
 				<h1 class="text-xl font-bold mb-0.5">{{ t("relay.title") }}</h1>
 				<p class="text-sm text-muted-foreground">
 					{{ t("relay.subtitle", { streams: sessions.length, connections: totalConnections }) }}
@@ -201,7 +201,7 @@
 		<!-- 转发流提示 / Relay hint -->
 		<div class="rounded-lg border border-blue-900/40 bg-blue-950/20 px-4 py-3 text-sm text-blue-300/80">
 			<p>{{ t("relay.hint") }}</p>
-			<p class="mt-1 font-mono text-xs text-blue-400/60">
+			<p class="mt-1 font-mono text-xs text-blue-400/60 break-all">
 				{{ exampleUrl }}
 			</p>
 		</div>
@@ -221,7 +221,7 @@
 
 		<div
 			v-else
-			class="grid grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-3.5"
+			class="grid grid-cols-[repeat(auto-fill,minmax(min(100%,300px),1fr))] gap-3.5"
 		>
 			<Card
 				v-for="session in [...sessions].sort((a, b) => a.username.localeCompare(b.username))"
@@ -235,7 +235,7 @@
 			>
 				<CardContent class="p-4 flex flex-col gap-3">
 					<!-- 主播名 + 状态 / Username + state -->
-					<div class="flex items-center justify-between gap-2">
+					<div class="flex flex-wrap items-center justify-between gap-2">
 						<div class="flex items-center gap-2 min-w-0">
 							<!-- 状态图标 / State icon -->
 							<component
@@ -281,7 +281,7 @@
 					<!-- 流地址 + 复制按钮 / Stream URL + copy button -->
 					<div class="flex items-center gap-2">
 						<div
-							class="flex-1 text-xs font-mono text-blue-400/70 bg-blue-950/20 rounded px-2 py-1.5 truncate select-all"
+							class="flex-1 min-w-0 text-xs font-mono text-blue-400/70 bg-blue-950/20 rounded px-2 py-2 md:py-1.5 truncate select-all"
 							:title="getStreamUrl(session)"
 						>
 							{{ getStreamUrl(session) }}
@@ -289,7 +289,7 @@
 						<Button
 							size="sm"
 							variant="ghost"
-							class="shrink-0 px-2 h-7 text-muted-foreground hover:text-blue-300"
+							class="shrink-0 px-2 h-7 max-md:h-9 text-muted-foreground hover:text-blue-300"
 							:title="t('relay.copyUrl')"
 							@click="copyUrl(session.username, getStreamUrl(session))"
 						>
@@ -299,7 +299,7 @@
 						<Button
 							size="sm"
 							variant="ghost"
-							class="shrink-0 px-2 h-7 text-muted-foreground hover:text-red-400"
+							class="shrink-0 px-2 h-7 max-md:h-9 text-muted-foreground hover:text-red-400"
 							:title="t('relay.stopRelay')"
 							:disabled="stoppingMap[session.username]"
 							@click="stopRelay(session.username)"

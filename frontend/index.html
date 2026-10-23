@@ -3,7 +3,23 @@
 	<head>
 		<meta charset="UTF-8" />
 		<link rel="icon" type="image/svg+xml" href="/vite.svg" />
-		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<!--
+			移动端视口：viewport-fit=cover 让页面延伸到刘海屏安全区域（配合 env(safe-area-inset-*) 使用），
+			不设置 user-scalable=no，保留用户缩放能力。
+			Mobile viewport: viewport-fit=cover lets the page extend into notch safe areas
+			(used together with env(safe-area-inset-*)); user zoom is intentionally left enabled.
+		-->
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+		<!-- 主题色跟随浅色/深色模式（与 style.css 中的 --background 一致）/ theme-color follows light/dark (matches --background) -->
+		<meta name="theme-color" media="(prefers-color-scheme: light)" content="#ffffff" />
+		<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#252525" />
+		<meta name="color-scheme" content="light dark" />
+		<!-- 添加到主屏幕后的独立窗口体验 / Standalone (add-to-home-screen) experience -->
+		<meta name="apple-mobile-web-app-capable" content="yes" />
+		<meta name="mobile-web-app-capable" content="yes" />
+		<meta name="apple-mobile-web-app-title" content="StripchatRecorder" />
+		<!-- 避免 iOS 把目录/时间识别成电话号码 / Keep iOS from auto-linking paths and numbers -->
+		<meta name="format-detection" content="telephone=no" />
 		<title>StripchatRecorder</title>
 	</head>
 
@@ -12,4 +28,3 @@
 		<script type="module" src="/src/main.ts"></script>
 	</body>
 </html>
-
