@@ -27,10 +27,12 @@
 	import { useRecordings } from "@/composables/useRecordings";
 	import { usePostprocess, makePpProgress } from "@/composables/usePostprocess";
 	import { useImagePreview } from "@/composables/useImagePreview";
+	import { useTelegramSend } from "@/composables/useTelegramSend";
+	import SendToTelegramDialog from "@/components/SendToTelegramDialog.vue";
 	import { Button } from "@/components/ui/button";
 	import { Badge } from "@/components/ui/badge";
 	import { Checkbox } from "@/components/ui/checkbox";
-	import { Loader2, Image } from "@lucide/vue";
+	import { Loader2, Image, Send } from "@lucide/vue";
 	import { Progress } from "@/components/ui/progress";
 	import {
 		Dialog,
@@ -92,6 +94,42 @@
 	const mergeProgress = ref<Record<string, { out_bytes: number; total_bytes: number }>>({});
 
 	const rec = useRecordings();
+	const tg = useTelegramSend();
+
+	/** 待发送到 Telegram 的文件路径（null = 对话框关闭）/ Paths queued for a Telegram send (null = dialog closed) */
+	const tgDialogPaths = ref<string[] | null>(null);
+
+	/**
+	 * 打开「发送到 Telegram」对话框。
+	 * Open the "send to Telegram" dialog.
+	 *
+	 * @param paths - 要发送的视频路径 / Video paths to send
+	 */
+	function openTelegramSend(paths: string[]) {
+		if (paths.length === 0) return;
+		tgDialogPaths.value = paths;
+	}
+
+	/** 已选中且可发送到 Telegram 的文件路径 / Selected files eligible for a Telegram send */
+	const tgSelectablePaths = computed(() =>
+		[...selected.value].filter(
+			(p) =>
+				!files.value.find((f) => f.path === p)?.is_recording &&
+				!files.value.find((f) => f.path === p)?.status?.startsWith("merging") &&
+				!tg.isSending(p),
+		),
+	);
+
+	/**
+	 * 把已选中的文件加入发送队列。
+	 * Queue the selected files for sending.
+	 */
+	function sendSelectedToTelegram() {
+		const paths = tgSelectablePaths.value;
+		if (paths.length === 0) return;
+		selected.value.clear();
+		openTelegramSend(paths);
+	}
 	const {
 		files,
 		loading,
@@ -115,6 +153,23 @@
 		getAllChecked,
 		setAllChecked,
 	} = rec;
+
+	/**
+	 * 移动端排序条的可排序列。
+	 * 移动端隐藏表头，排序入口改为列表上方的一排按钮，保证排序功能不丢失。
+	 *
+	 * Sortable columns for the mobile sort bar.
+	 * The table header is hidden on mobile, so sorting moves to a button row above the list
+	 * to keep the functionality available.
+	 */
+	const sortableColumns: {
+		key: "size_bytes" | "started_at" | "video_duration_secs";
+		labelKey: string;
+	}[] = [
+		{ key: "size_bytes", labelKey: "recordings.table.size" },
+		{ key: "started_at", labelKey: "recordings.table.startTime" },
+		{ key: "video_duration_secs", labelKey: "recordings.table.videoDuration" },
+	];
 
 	const pp = usePostprocess();
 	const {
@@ -335,6 +390,9 @@
 		await load();
 		startTick();
 		await refreshDiskSpace();
+		// 恢复仍在进行的手动发送，刷新页面后按钮上的进度不会丢
+		// Restore in-flight manual sends so the row spinner survives a page reload
+		tg.restore();
 		const diskTimer = setInterval(refreshDiskSpace, 30_000);
 		unlisteners.push(() => clearInterval(diskTimer));
 		if (!ppStore.pipeline?.nodes?.length) await ppStore.fetchPipeline();
@@ -585,6 +643,26 @@
 				);
 			}),
 		);
+
+		// 上传成功后服务器上的数据被清空：把该行从列表里移除并提示释放的空间
+		// The server data was wiped after a successful upload: drop the row and report the space freed
+		unlisteners.push(
+			tg.onPurged((path, freedBytes) => {
+				files.value = files.value.filter((r) => r.path !== path);
+				delete elapsed.value[path];
+				selected.value.delete(path);
+				ppRemoveFile(path);
+				tg.clear(path);
+				toast(
+					t("telegram.purged", {
+						name: path.split(/[\\/]/).pop() ?? path,
+						size: formatSize(freedBytes),
+					}),
+					"success",
+				);
+				load();
+			}),
+		);
 	});
 
 	onUnmounted(() => {
@@ -611,22 +689,29 @@
 
 <template>
 	<div class="flex flex-col">
+		<!-- 手动发送到 Telegram / Manual send to Telegram -->
+		<SendToTelegramDialog
+			v-if="tgDialogPaths"
+			:paths="tgDialogPaths"
+			@close="tgDialogPaths = null"
+		/>
 		<Dialog :open="previewOpen" @update:open="previewOpen = $event">
+			<!-- 手机端接近全屏，桌面端按图片比例自适应 / Near full-screen on phones, sized to the image on desktop -->
 			<DialogContent
-				class="p-0 overflow-hidden flex flex-col w-fit"
-				style="max-width: 90vw; max-height: 90vh"
+				class="p-0 overflow-y-auto overflow-x-hidden flex flex-col w-fit max-w-[calc(100vw-1rem)] dialog-max-h md:max-w-[90vw]"
 			>
-				<DialogHeader class="px-4 pt-4 pb-2 shrink-0">
-					<DialogTitle class="text-sm font-mono truncate">{{
+				<DialogHeader class="px-3 pt-3 pb-2 md:px-4 md:pt-4 shrink-0">
+					<DialogTitle class="text-sm font-mono truncate pr-8">{{
 						previewTitle
 					}}</DialogTitle>
 				</DialogHeader>
 				<div
 					ref="previewViewportRef"
-					class="relative overflow-hidden flex items-center justify-center bg-black/5 px-4 pb-4"
+					class="relative overflow-hidden flex items-center justify-center bg-black/5 px-2 pb-2 md:px-4 md:pb-4"
 					:style="{
 						width: viewportSize.width,
 						height: viewportSize.height,
+						maxWidth: '100%',
 						cursor: isDragging
 							? 'grabbing'
 							: previewScale > 1
@@ -671,7 +756,7 @@
 
 		<header
 			ref="headerEl"
-			class="flex items-start justify-between gap-4 shrink-0 pb-4 bg-background sticky top-0 z-20"
+			class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between md:gap-4 shrink-0 pb-4 bg-background sticky top-0 z-20"
 		>
 			<div class="flex-1 min-w-0">
 				<h1 class="text-xl font-bold mb-0.5">{{ t("recordings.title") }}</h1>
@@ -717,7 +802,8 @@
 					</span>
 				</div>
 			</div>
-			<div class="flex gap-2 shrink-0">
+			<!-- 桌面端批量操作；移动端改用底部固定操作栏 / Desktop batch actions; mobile uses the fixed bottom bar -->
+			<div class="hidden md:flex gap-2 shrink-0">
 				<Button
 					v-if="selectedCount > 0"
 					variant="outline"
@@ -726,6 +812,17 @@
 					@click="postProcessSelected"
 				>
 					{{ t("recordings.batchPostprocess", { count: ppSelectableCount }) }}
+				</Button>
+				<Button
+					v-if="selectedCount > 0"
+					variant="outline"
+					size="sm"
+					class="gap-1.5"
+					:disabled="tgSelectablePaths.length === 0"
+					@click="sendSelectedToTelegram"
+				>
+					<Send class="size-3.5" />
+					{{ t("telegram.sendSelected", { count: tgSelectablePaths.length }) }}
 				</Button>
 				<Button
 					v-if="selectedCount > 0"
@@ -738,7 +835,75 @@
 			</div>
 		</header>
 
-		<div class="pb-6">
+		<!-- 移动端工具栏：全选 + 排序（表头在移动端隐藏）/ Mobile toolbar: select all + sorting (header hidden on mobile) -->
+		<div
+			v-if="files.length > 0"
+			class="md:hidden flex flex-wrap items-center gap-x-2 gap-y-1 pb-3"
+		>
+			<!-- label 包裹复选框：整块可点，高度 44px / Label wraps the checkbox: whole block tappable, 44px tall -->
+			<label
+				class="flex items-center gap-2 shrink-0 min-h-11 pr-2 cursor-pointer select-none"
+			>
+				<Checkbox
+					:model-value="getAllChecked()"
+					class="size-5"
+					@update:model-value="setAllChecked"
+				/>
+				<span class="text-xs text-muted-foreground">{{
+					t("recordings.selectAll")
+				}}</span>
+			</label>
+			<Button
+				v-for="col in sortableColumns"
+				:key="col.key"
+				variant="outline"
+				size="sm"
+				class="shrink-0 gap-1 text-xs px-2"
+				@click="toggleSort(col.key)"
+			>
+				{{ t(col.labelKey) }}
+				<component :is="sortIcon(col.key)" class="size-3.5" />
+			</Button>
+		</div>
+
+		<!-- 移动端批量操作栏（选中文件时出现，位于底部标签栏之上）
+		     Mobile batch bar (shown when files are selected, sits above the bottom tab bar) -->
+		<Transition name="fade">
+			<div
+				v-if="selectedCount > 0"
+				class="md:hidden fixed inset-x-0 bottom-[calc(3.5rem_+_env(safe-area-inset-bottom))] z-30 flex gap-2 border-t border-border bg-background/95 px-3 py-2 backdrop-blur-sm"
+			>
+				<Button
+					variant="outline"
+					size="sm"
+					class="flex-1 text-xs px-2"
+					:disabled="ppSelectableCount === 0"
+					@click="postProcessSelected"
+				>
+					{{ t("recordings.batchPostprocess", { count: ppSelectableCount }) }}
+				</Button>
+				<Button
+					variant="outline"
+					size="sm"
+					class="flex-1 text-xs px-2 gap-1"
+					:disabled="tgSelectablePaths.length === 0"
+					@click="sendSelectedToTelegram"
+				>
+					<Send class="size-3.5 shrink-0" />
+					<span class="truncate">{{ t("telegram.sendShort") }}</span>
+				</Button>
+				<Button
+					variant="destructive"
+					size="sm"
+					class="flex-1 text-xs px-2"
+					@click="deleteSelected"
+				>
+					{{ t("recordings.deleteSelected", { count: selectedCount }) }}
+				</Button>
+			</div>
+		</Transition>
+
+		<div :class="selectedCount > 0 ? 'pb-24 md:pb-6' : 'pb-6'">
 			<div
 				v-if="loading && files.length === 0"
 				class="text-center text-muted-foreground py-16"
@@ -752,9 +917,15 @@
 				{{ t("recordings.empty") }}
 			</div>
 
-			<Table v-else>
+			<!--
+				桌面端为普通表格；移动端（<md）把 table/tr/td 改为块级网格，
+				每行渲染成一张卡片，无需重复一套标记。
+				Desktop renders a normal table; on mobile (<md) table/tr/td switch to a block grid
+				so each row becomes a card without duplicating the markup.
+			-->
+			<Table v-else class="max-md:block">
 				<TableHeader
-					class="sticky z-10 bg-background"
+					class="sticky z-10 bg-background max-md:hidden"
 					:style="{ top: `${headerHeight}px` }"
 				>
 					<TableRow>
@@ -805,19 +976,23 @@
 						<TableHead>{{ t("recordings.table.actions") }}</TableHead>
 					</TableRow>
 				</TableHeader>
-				<TableBody>
+				<TableBody class="max-md:block max-md:space-y-3">
 					<template v-for="group in groups" :key="group.username">
+						<!-- 分组标题行 / Group header row -->
 						<TableRow
-							class="bg-muted/40 hover:bg-muted/60 cursor-pointer"
+							class="bg-muted/40 hover:bg-muted/60 cursor-pointer max-md:flex max-md:flex-wrap max-md:items-center max-md:gap-x-2 max-md:rounded-lg max-md:border max-md:px-2 max-md:py-1"
 							@click="toggleGroup(group.username)"
 						>
-							<TableCell class="w-8" @click.stop>
+							<TableCell class="w-8 max-md:w-auto max-md:p-0" @click.stop>
 								<Checkbox
 									:model-value="getGroupChecked(group)"
 									@update:model-value="setGroupChecked(group)"
 								/>
 							</TableCell>
-							<TableCell colspan="7" class="font-semibold">
+							<TableCell
+								colspan="7"
+								class="font-semibold max-md:flex-1 max-md:min-w-0 max-md:p-0 max-md:py-1 max-md:whitespace-normal"
+							>
 								<span class="mr-2 text-muted-foreground text-xs">{{
 									collapsedGroups.has(group.username) ? "▶" : "▼"
 								}}</span>
@@ -838,18 +1013,24 @@
 									{{ formatSize(group.totalSize) }}
 								</span>
 							</TableCell>
-							<TableCell />
+							<TableCell class="max-md:hidden" />
 						</TableRow>
 
 						<template v-if="!collapsedGroups.has(group.username)">
-							<TableRow v-for="f in group.files" :key="f.path" class="relative">
+							<TableRow
+								v-for="f in group.files"
+								:key="f.path"
+								class="relative max-md:grid max-md:grid-cols-[auto_1fr] max-md:items-center max-md:gap-x-3 max-md:gap-y-1 max-md:rounded-lg max-md:border max-md:bg-card max-md:p-3"
+							>
 								<template v-if="f.status === 'merging_waiting' || f.status === 'merging'">
-									<TableCell class="w-8">
+									<TableCell class="w-8 max-md:w-auto max-md:p-0">
 										<Checkbox :model-value="false" :disabled="true" />
 									</TableCell>
-									<TableCell class="font-medium w-px whitespace-nowrap pl-7">
+									<TableCell
+										class="font-medium w-px whitespace-nowrap pl-7 max-md:w-auto max-md:pl-0 max-md:whitespace-normal"
+									>
 										<div class="flex items-center gap-1.5">
-											<span>{{ f.name }}</span>
+											<span class="max-md:break-all">{{ f.name }}</span>
 											<Badge variant="outline" class="text-[10px] shrink-0">{{
 												f.status === 'merging_waiting'
 													? t("recordings.status.waitingMerge")
@@ -857,8 +1038,13 @@
 											}}</Badge>
 										</div>
 									</TableCell>
-									<td colspan="7" class="p-2 align-middle w-full">
-										<div class="flex items-center gap-3 h-9 w-full">
+									<td
+										colspan="7"
+										class="p-2 align-middle w-full max-md:col-span-2 max-md:w-auto max-md:p-0"
+									>
+										<div
+											class="flex items-center gap-3 h-9 w-full max-md:h-auto max-md:flex-wrap max-md:gap-2"
+										>
 											<Loader2
 												class="size-4 animate-spin shrink-0 text-muted-foreground"
 											/>
@@ -891,14 +1077,16 @@
 								</template>
 
 								<template v-else>
-									<TableCell class="w-8">
+									<TableCell class="w-8 max-md:w-auto max-md:p-0">
 										<Checkbox
 											:model-value="getFileChecked(f.path)"
 											:disabled="f.is_recording"
 											@update:model-value="setFileChecked(f.path)"
 										/>
 									</TableCell>
-									<TableCell class="font-medium w-px whitespace-nowrap pl-7">
+									<TableCell
+										class="font-medium w-px whitespace-nowrap pl-7 max-md:w-auto max-md:pl-0 max-md:whitespace-normal max-md:break-all"
+									>
 										{{ f.name }}
 										<Badge
 											v-if="f.is_recording"
@@ -907,25 +1095,48 @@
 											>{{ t("recordings.status.recording") }}</Badge
 										>
 									</TableCell>
-									<TableCell class="tabular-nums">{{
-										formatSize(f.size_bytes)
-									}}</TableCell>
-									<TableCell class="tabular-nums text-muted-foreground">{{
-										new Date(f.started_at).toLocaleString()
-									}}</TableCell>
-									<TableCell class="tabular-nums">
+									<TableCell
+										class="tabular-nums max-md:col-span-2 max-md:p-0 max-md:text-xs"
+									>
+										<span class="md:hidden text-muted-foreground"
+											>{{ t("recordings.table.size") }}: </span
+										>{{ formatSize(f.size_bytes) }}
+									</TableCell>
+									<TableCell
+										class="tabular-nums text-muted-foreground max-md:col-span-2 max-md:p-0 max-md:text-xs"
+									>
+										<span class="md:hidden"
+											>{{ t("recordings.table.startTime") }}: </span
+										>{{ new Date(f.started_at).toLocaleString() }}
+									</TableCell>
+									<TableCell
+										class="tabular-nums max-md:col-span-2 max-md:p-0 max-md:text-xs"
+									>
+										<span class="md:hidden text-muted-foreground"
+											>{{ t("recordings.table.recordDuration") }}: </span
+										>
 										<span v-if="f.is_recording" class="text-destructive">{{
 											formatDuration(elapsed[f.path] ?? 0)
 										}}</span>
 										<span v-else class="text-muted-foreground">—</span>
 									</TableCell>
-									<TableCell class="tabular-nums">
+									<TableCell
+										class="tabular-nums max-md:col-span-2 max-md:p-0 max-md:text-xs"
+									>
+										<span class="md:hidden text-muted-foreground"
+											>{{ t("recordings.table.videoDuration") }}: </span
+										>
 										<span v-if="f.video_duration_secs != null">{{
 											formatDuration(f.video_duration_secs)
 										}}</span>
 										<span v-else class="text-muted-foreground">—</span>
 									</TableCell>
-									<TableCell class="tabular-nums">
+									<TableCell
+										class="tabular-nums max-md:col-span-2 max-md:p-0 max-md:text-xs"
+									>
+										<span class="md:hidden text-muted-foreground"
+											>{{ t("recordings.table.speed") }}: </span
+										>
 										<span
 											v-if="f.is_recording && recordingSpeed[f.path] != null"
 											class="text-xs"
@@ -934,7 +1145,10 @@
 										</span>
 										<span v-else class="text-muted-foreground">—</span>
 									</TableCell>
-									<TableCell class="min-w-45">
+									<TableCell class="min-w-45 max-md:col-span-2 max-md:min-w-0 max-md:p-0">
+										<div class="md:hidden text-xs text-muted-foreground mb-1">{{
+											t("recordings.table.postprocess")
+										}}</div>
 										<div v-if="!f.is_recording">
 											<div
 												v-if="
@@ -1021,10 +1235,14 @@
 												>—</span
 											>
 										</div>
-										<span v-else class="text-xs text-muted-foreground">—</span>
+										<span
+											v-if="f.is_recording"
+											class="text-xs text-muted-foreground"
+											>—</span
+										>
 									</TableCell>
-									<TableCell>
-										<div class="flex gap-1.5">
+									<TableCell class="max-md:col-span-2 max-md:p-0 max-md:pt-1">
+										<div class="flex flex-wrap gap-1.5">
 											<Button
 												size="sm"
 												variant="outline"
@@ -1041,7 +1259,8 @@
 												v-if="moduleOutputs[f.path]?.['contact_sheet']"
 												size="sm"
 												variant="outline"
-												title="查看 Contact Sheet 预览图"
+												:title="t('recordings.actions.preview')"
+												:aria-label="t('recordings.actions.preview')"
 												@click="openModuleOutput(f.path, 'contact_sheet')"
 											>
 												<Image class="size-3.5" />
@@ -1066,6 +1285,24 @@
 												<span v-else>{{
 													t("recordings.actions.postprocess")
 												}}</span>
+											</Button>
+											<Button
+												size="sm"
+												variant="outline"
+												:title="t('telegram.sendOne')"
+												:aria-label="t('telegram.sendOne')"
+												:disabled="
+													f.is_recording ||
+													f.status?.startsWith('merging') ||
+													tg.isSending(f.path)
+												"
+												@click="openTelegramSend([f.path])"
+											>
+												<Loader2
+													v-if="tg.isSending(f.path)"
+													class="size-3.5 animate-spin"
+												/>
+												<Send v-else class="size-3.5" />
 											</Button>
 											<Button
 												size="sm"

@@ -245,6 +245,31 @@ const COMMAND_MAP: Record<
 		url: () => "/api/recordings/module-outputs",
 		body: (a) => ({ path: a.path }),
 	},
+	// 手动发送到 Telegram / Manual send to Telegram
+	telegram_defaults: { method: "GET", url: () => "/api/telegram/defaults" },
+	telegram_send: {
+		method: "POST",
+		url: () => "/api/telegram/send",
+		body: (a) => ({
+			path: a.path,
+			chatId: a.chatId,
+			username: a.username,
+			topicPerModel: a.topicPerModel,
+			deleteAfterSend: a.deleteAfterSend,
+			sendVideo: a.sendVideo,
+		}),
+	},
+	telegram_send_cancel: {
+		method: "POST",
+		url: () => "/api/telegram/send/cancel",
+		body: (a) => ({ path: a.path }),
+	},
+	telegram_tasks: { method: "GET", url: () => "/api/telegram/tasks" },
+	telegram_tasks_dismiss: {
+		method: "POST",
+		url: () => "/api/telegram/tasks/dismiss",
+		body: (a) => ({ path: a.path }),
+	},
 	list_relay_sessions: {
 		method: "GET",
 		url: () => "/api/relay/sessions",

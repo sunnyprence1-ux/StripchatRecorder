@@ -59,6 +59,29 @@ pub struct PpTaskStatus {
     pub from_memory: bool,
 }
 
+/// 手动发送任务状态快照（序列化后发送给前端）。
+/// Manual-send task status snapshot (serialized and sent to the frontend).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TgSendStatus {
+    /// 视频文件路径 / Video file path
+    pub path: String,
+    /// 任务状态（"running" / "done" / "error" / "cancelled"）/ Task status
+    pub status: String,
+    /// 进度百分比（0.0 - 100.0）/ Progress percentage (0.0 - 100.0)
+    pub pct: f64,
+    /// 状态文字（上传速度等）/ Status text (upload speed etc.)
+    pub status_text: String,
+    /// 结果消息 / Result message
+    pub message: String,
+    /// 任务开始时间（RFC 3339）/ Task start time (RFC 3339)
+    pub started_at: String,
+    /// 成功后是否删除本地数据 / Whether local data is deleted on success
+    pub delete_after_send: bool,
+    /// 实际使用的群组 ID / Group id actually used
+    pub chat_id: String,
+}
+
 /// 用户可配置的录制器设置 / User-configurable recorder settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -435,6 +458,16 @@ pub struct AppState {
     /// 通知 Mouflon 同步调度器立即触发同步的发送端（可选，启动后注入）
     /// Sender to notify the Mouflon sync scheduler to trigger an immediate sync (optional, injected after startup)
     pub mouflon_sync_notify_tx: RwLock<Option<tokio::sync::mpsc::Sender<()>>>,
+    /// 手动发送到 Telegram 的任务状态表（视频路径 -> 状态）
+    /// Manual "send to Telegram" task map (video path -> status)
+    pub tg_tasks: RwLock<HashMap<String, TgSendStatus>>,
+    /// 手动发送的取消标志（视频路径 -> 原子布尔）
+    /// Manual-send cancel flags (video path -> atomic bool)
+    pub tg_cancel_flags: RwLock<HashMap<String, Arc<AtomicBool>>>,
+    /// 手动发送串行锁：同一时刻只跑一个上传，避免多个大文件同时挤占带宽
+    /// Serial lock for manual sends: one upload at a time so concurrent large files
+    /// don't fight over the uplink
+    pub tg_lock: std::sync::Mutex<()>,
 }
 
 impl AppState {
@@ -495,6 +528,9 @@ impl AppState {
             startup_lock: std::sync::Mutex::new(()),
             poll_interval_notify_tx: RwLock::new(None),
             mouflon_sync_notify_tx: RwLock::new(None),
+            tg_tasks: RwLock::new(HashMap::new()),
+            tg_cancel_flags: RwLock::new(HashMap::new()),
+            tg_lock: std::sync::Mutex::new(()),
         }))
     }
 
@@ -737,6 +773,132 @@ impl AppState {
         self.data.read().pipeline.clone()
     }
 
+    // ─── 手动发送到 Telegram 的任务表 / Manual "send to Telegram" task table ───
+
+    /// 登记一个新的手动发送任务（若该路径已在运行则不覆盖）。
+    /// 返回 false 表示该文件已经在发送中。
+    ///
+    /// Register a new manual-send task (does not overwrite a running one).
+    /// Returns false when that file is already being sent.
+    pub fn tg_task_start(
+        &self,
+        path: &str,
+        chat_id: &str,
+        delete_after_send: bool,
+    ) -> bool {
+        let mut tasks = self.tg_tasks.write();
+        if tasks.get(path).is_some_and(|t| t.status == "running") {
+            return false;
+        }
+        tasks.insert(
+            path.to_string(),
+            TgSendStatus {
+                path: path.to_string(),
+                status: "running".to_string(),
+                pct: 0.0,
+                status_text: String::new(),
+                message: String::new(),
+                started_at: chrono::Local::now().to_rfc3339(),
+                delete_after_send,
+                chat_id: chat_id.to_string(),
+            },
+        );
+        // 重置（或创建）取消标志 / Reset (or create) the cancel flag
+        self.tg_cancel_flags
+            .write()
+            .insert(path.to_string(), Arc::new(AtomicBool::new(false)));
+        true
+    }
+
+    /// 取回（必要时创建）指定路径的手动发送取消标志。
+    /// Get (creating if needed) the manual-send cancel flag for a path.
+    pub fn tg_task_make_cancel_flag(&self, path: &str) -> Arc<AtomicBool> {
+        let mut flags = self.tg_cancel_flags.write();
+        if let Some(existing) = flags.get(path) {
+            return Arc::clone(existing);
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        flags.insert(path.to_string(), Arc::clone(&flag));
+        flag
+    }
+
+    /// 请求中止指定路径的手动发送。
+    /// Request cancellation of the manual send for a path.
+    pub fn tg_task_cancel(&self, path: &str) {
+        if let Some(flag) = self.tg_cancel_flags.read().get(path) {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// 更新手动发送进度 / Update manual-send progress
+    pub fn tg_task_progress(&self, path: &str, pct: f64) {
+        if let Some(t) = self.tg_tasks.write().get_mut(path) {
+            t.pct = pct;
+        }
+    }
+
+    /// 更新手动发送的状态文字（上传速度等），进度保持不变。
+    /// Update the manual-send status text (upload speed etc.), leaving progress untouched.
+    pub fn tg_task_status_text(&self, path: &str, status_text: &str) {
+        if let Some(t) = self.tg_tasks.write().get_mut(path) {
+            t.status_text = status_text.to_string();
+        }
+    }
+
+    /// 结束手动发送任务（成功 / 失败 / 取消）。
+    /// Finish a manual-send task (success / failure / cancelled).
+    pub fn tg_task_finish(&self, path: &str, status: &str, message: &str) {
+        if let Some(t) = self.tg_tasks.write().get_mut(path) {
+            t.status = status.to_string();
+            t.message = message.to_string();
+            if status == "done" {
+                t.pct = 100.0;
+            }
+        }
+        self.tg_cancel_flags.write().remove(path);
+    }
+
+    /// 记录一次「还没开始就失败」的手动发送（例如视频不存在、没配置群组 ID）。
+    /// 任务记录会被创建出来，这样界面上仍能看到失败原因，而不是什么都没发生。
+    ///
+    /// Record a manual send that failed before it could start (e.g. the video is missing or no
+    /// chat id is configured). The task record is created anyway, so the UI can show why it
+    /// failed instead of appearing to do nothing.
+    pub fn tg_task_fail(&self, path: &str, message: &str, chat_id: &str, delete_after_send: bool) {
+        let mut tasks = self.tg_tasks.write();
+        let entry = tasks.entry(path.to_string()).or_insert_with(|| TgSendStatus {
+            path: path.to_string(),
+            status: "error".to_string(),
+            pct: 0.0,
+            status_text: String::new(),
+            message: String::new(),
+            started_at: chrono::Local::now().to_rfc3339(),
+            delete_after_send,
+            chat_id: chat_id.to_string(),
+        });
+        entry.status = "error".to_string();
+        entry.message = message.to_string();
+        self.tg_cancel_flags.write().remove(path);
+    }
+
+    /// 列出全部手动发送任务（运行中优先，其次按开始时间倒序）。
+    /// List all manual-send tasks (running first, then newest first).
+    pub fn get_tg_tasks(&self) -> Vec<TgSendStatus> {
+        let mut list: Vec<TgSendStatus> = self.tg_tasks.read().values().cloned().collect();
+        list.sort_by(|a, b| {
+            let ra = a.status == "running";
+            let rb = b.status == "running";
+            rb.cmp(&ra).then_with(|| b.started_at.cmp(&a.started_at))
+        });
+        list
+    }
+
+    /// 删除任务记录（例如文件被手动删除后）。
+    /// Drop a task record (e.g. after the file was deleted by hand).
+    pub fn tg_task_remove(&self, path: &str) {
+        self.tg_tasks.write().remove(path);
+        self.tg_cancel_flags.write().remove(path);
+    }
     /// 更新流水线配置并保存到磁盘。
     /// Update the pipeline configuration and save to disk.
     pub fn update_pipeline(&self, pipeline: crate::postprocess::pipeline::PipelineConfig) -> Result<()> {

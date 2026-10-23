@@ -151,6 +151,12 @@ pub fn build_router(state: ServerState) -> Router {
         .route("/api/modules/login/cancel", post(login_cancel))
         .route("/api/postprocess-tasks", get(get_postprocess_tasks))
         .route("/api/recordings/module-outputs", post(get_module_outputs))
+        // 手动发送到 Telegram / Manual send to Telegram
+        .route("/api/telegram/defaults", get(telegram_defaults))
+        .route("/api/telegram/send", post(telegram_send))
+        .route("/api/telegram/send/cancel", post(telegram_send_cancel))
+        .route("/api/telegram/tasks", get(telegram_tasks))
+        .route("/api/telegram/tasks/dismiss", post(telegram_tasks_dismiss))
         .route("/api/locale/{locale_code}", get(get_locale_handler))
         .route("/api/locales", get(list_locales_handler))
         .route("/api/files", get(serve_output_file))
@@ -794,6 +800,62 @@ async fn get_pipeline(
     AxumState(s): AxumState<ServerState>,
 ) -> ApiResult<crate::postprocess::pipeline::PipelineConfig> {
     Ok(Json(s.app_state.get_pipeline()))
+}
+
+// ─── 手动发送到 Telegram / Manual send to Telegram ───────────────────────────
+
+/// 返回手动发送对话框需要的默认值（群组 ID、话题开关等）。
+/// Return the defaults the manual-send dialog needs (chat id, topic toggles, …).
+async fn telegram_defaults(
+    AxumState(s): AxumState<ServerState>,
+) -> ApiResult<serde_json::Value> {
+    let state = Arc::clone(&s.app_state);
+    let defaults = tokio::task::spawn_blocking(move || {
+        crate::commands::telegram_cmd::send_defaults(&state)
+    })
+    .await
+    .map_err(|e| ApiError(e.to_string()))?;
+    Ok(Json(serde_json::to_value(defaults).unwrap_or_default()))
+}
+
+/// 立即把指定成片发送到 Telegram 群组（不走整条后处理流水线）。
+/// Send the given video to the Telegram group right away (without the whole pipeline).
+async fn telegram_send(
+    AxumState(s): AxumState<ServerState>,
+    Json(body): Json<crate::commands::telegram_cmd::SendRequest>,
+) -> ApiResult<serde_json::Value> {
+    let emitter = Arc::clone(&s.emitter);
+    let state = Arc::clone(&s.app_state);
+    let path = body.path.trim().to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::commands::telegram_cmd::send_inner(body, &emitter, &state)
+    });
+    Ok(Json(serde_json::json!({ "ok": true, "path": path })))
+}
+
+/// 取消正在进行的发送 / Cancel an in-flight manual send
+async fn telegram_send_cancel(
+    AxumState(s): AxumState<ServerState>,
+    Json(body): Json<PathBody>,
+) -> ApiResult<serde_json::Value> {
+    s.app_state.tg_task_cancel(&body.path);
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// 列出手动发送任务（运行中优先）/ List manual-send tasks (running first)
+async fn telegram_tasks(AxumState(s): AxumState<ServerState>) -> ApiResult<serde_json::Value> {
+    Ok(Json(serde_json::json!({
+        "tasks": s.app_state.get_tg_tasks(),
+    })))
+}
+
+/// 移除一条已完成的任务记录（不清除文件）/ Drop a finished task record (files untouched)
+async fn telegram_tasks_dismiss(
+    AxumState(s): AxumState<ServerState>,
+    Json(body): Json<PathBody>,
+) -> ApiResult<serde_json::Value> {
+    s.app_state.tg_task_remove(&body.path);
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn save_pipeline(
