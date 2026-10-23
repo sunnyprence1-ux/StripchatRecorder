@@ -44,6 +44,12 @@ pub struct SendRequest {
     /// 覆盖「同时发送视频文件」/ `send_video` override
     #[serde(default)]
     pub send_video: Option<bool>,
+    /// 覆盖「附带文字说明」/ `send_caption` override
+    #[serde(default)]
+    pub send_caption: Option<bool>,
+    /// 覆盖「同时发送封面图」/ `send_cover` override
+    #[serde(default)]
+    pub send_cover: Option<bool>,
 }
 
 /// 手动发送界面需要的默认值（来自流水线节点，供前端预填表单）。
@@ -65,6 +71,10 @@ pub struct SendDefaults {
     pub delete_after_send: bool,
     /// 默认「同时发送视频文件」/ Default `send_video`
     pub send_video: bool,
+    /// 默认「附带文字说明」/ Default `send_caption`
+    pub send_caption: bool,
+    /// 默认「同时发送封面图」/ Default `send_cover`
+    pub send_cover: bool,
     /// 登录方式（auto / user / bot）/ Login mode
     pub account: String,
     /// 是否已有可用账号（已登录用户会话或机器人 Token）
@@ -152,6 +162,10 @@ pub fn send_defaults(state: &AppState) -> SendDefaults {
         topic_per_model: param_bool(&params, "topic_per_model", true),
         delete_after_send: param_bool(&params, "delete_after_send", true),
         send_video: param_bool(&params, "send_video", true),
+        // 与模块保持一致：文字说明默认关闭，只上传视频
+        // Match the module: the caption is off by default, so only the video is uploaded
+        send_caption: param_bool(&params, "send_caption", false),
+        send_cover: param_bool(&params, "send_cover", true),
         account,
         has_account,
         in_pipeline,
@@ -212,6 +226,8 @@ fn build_params(
         ("topic_per_model", req.topic_per_model),
         ("delete_after_send", req.delete_after_send),
         ("send_video", req.send_video),
+        ("send_caption", req.send_caption),
+        ("send_cover", req.send_cover),
     ] {
         if let Some(v) = value {
             params.insert(key.to_string(), serde_json::Value::Bool(v));
@@ -537,6 +553,8 @@ mod tests {
             topic_per_model: param_bool(params, "topic_per_model", true),
             delete_after_send: param_bool(params, "delete_after_send", true),
             send_video: param_bool(params, "send_video", true),
+            send_caption: param_bool(params, "send_caption", false),
+            send_cover: param_bool(params, "send_cover", true),
             account: "auto".to_string(),
             has_account: false,
             in_pipeline: !params.is_empty(),
@@ -563,11 +581,52 @@ mod tests {
             "topicPerModel": false,
             "deleteAfterSend": true,
             "sendVideo": false,
+            "sendCaption": true,
+            "sendCover": false,
         }))
         .expect("deserialize");
         assert_eq!(req.chat_id.as_deref(), Some("-1001"));
         assert_eq!(req.topic_per_model, Some(false));
         assert_eq!(req.delete_after_send, Some(true));
         assert_eq!(req.send_video, Some(false));
+        assert_eq!(req.send_caption, Some(true));
+        assert_eq!(req.send_cover, Some(false));
+    }
+
+    /// 文字说明默认关闭：节点里没有这个键时必须按「不发文字」处理，
+    /// 否则界面会显示已关闭、模块却照旧发文字。
+    ///
+    /// The caption defaults to off: a node without the key must be treated as "no text",
+    /// otherwise the UI would show it off while the module still posted a caption.
+    #[test]
+    fn caption_defaults_to_off() {
+        assert!(!param_bool(&HashMap::new(), "send_caption", false));
+        let d = send_defaults_from(&HashMap::new());
+        assert!(!d.send_caption, "caption must be off by default");
+        assert!(d.send_cover, "the cover image stays on by default");
+        assert!(d.send_video, "the video stays on by default");
+    }
+
+    /// 对话框里的「只发视频」组合必须原样传给模块。
+    /// The dialog's "video only" combination must reach the module unchanged.
+    #[test]
+    fn video_only_overrides_reach_the_module() {
+        let d = defaults(&[("chat_id", serde_json::json!("-100111"))]);
+        let tmp = temp_video("tg_cmd_video_only_test.mp4");
+        let req = SendRequest {
+            path: tmp.to_string_lossy().to_string(),
+            send_video: Some(true),
+            send_caption: Some(false),
+            send_cover: Some(false),
+            ..Default::default()
+        };
+        let (merged, _) = build_params(&d, &req).expect("params");
+        assert_eq!(merged.get("send_video"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(
+            merged.get("send_caption"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        assert_eq!(merged.get("send_cover"), Some(&serde_json::Value::Bool(false)));
+        let _ = std::fs::remove_file(&tmp);
     }
 }

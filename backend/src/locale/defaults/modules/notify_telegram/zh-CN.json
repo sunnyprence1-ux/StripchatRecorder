@@ -1,15 +1,42 @@
 {
-  "name": "Telegram 通知 0.4.1",
-  "description": "将录制信息、封面图和视频通过 MTProto 发送到 Telegram（支持超过 50MB 的大文件，支持 HTTP/SOCKS5 代理）。可按模特自动创建/复用群组话题（Topic）并把视频发送到对应话题。默认使用已登录的真实账号：可列出话题、避免重复创建，高级会员还能上传 4GB 单文件",
+  "name": "Telegram 通知 0.4.3",
+  "description": "把录制好的视频通过 MTProto 发送到 Telegram（支持超过 50MB 的大文件，支持 HTTP/SOCKS5 代理）。默认只发视频、不带任何文字；文字说明和封面图都可以单独开关。可按模特自动创建/复用群组话题（Topic）并把视频发送到对应话题。默认使用已登录的真实账号：可列出话题、避免重复创建，高级会员还能上传 4GB 单文件",
   "params": {
-    "account": { "label": "登录方式（auto = 已登录的真实账号优先 / user = 只用用户账号 / bot = 只用机器人）" },
-    "api_id": { "label": "API ID（从 my.telegram.org 获取）" },
-    "api_hash": { "label": "API Hash（仅机器人账号需要，用户账号可留空）" },
-    "bot_token": { "label": "Bot Token（从 @BotFather 获取，仅机器人账号需要）" },
-    "chat_id": { "label": "Chat ID（群组/超级群组填 -100xxxxxxxxxx 格式；私有群组没有 username，只能填 ID）" },
-    "username": { "label": "群组 Username（可选：公开群组才填，如 mygroupname，不含 @；私有群组留空，改用 Chat ID）" },
-    "proxy": { "label": "代理地址（支持 http://、socks5://）" },
-    "send_video": { "label": "同时发送视频文件" },
-    "topic_per_model": { "label": "为每个模特创建/复用群组话题（Topic），视频发送到对应话题" }
+    "account": {
+      "label": "登录方式（auto = 已登录的真实账号优先 / user = 只用用户账号 / bot = 只用机器人）"
+    },
+    "api_id": {
+      "label": "API ID（从 my.telegram.org 获取）"
+    },
+    "api_hash": {
+      "label": "API Hash（仅机器人账号需要，用户账号可留空）"
+    },
+    "bot_token": {
+      "label": "Bot Token（从 @BotFather 获取，仅机器人账号需要）"
+    },
+    "chat_id": {
+      "label": "Chat ID（群组/超级群组填 -100xxxxxxxxxx 格式；私有群组没有 username，只能填 ID）"
+    },
+    "username": {
+      "label": "群组 Username（可选：公开群组才填，如 mygroupname，不含 @；私有群组留空，改用 Chat ID）"
+    },
+    "proxy": {
+      "label": "代理地址（支持 http://、socks5://）"
+    },
+    "send_video": {
+      "label": "同时发送视频文件"
+    },
+    "send_caption": {
+      "label": "附带文字说明（模特名、时间、时长、文件名、大小）。关闭后消息里没有任何文字，只有视频"
+    },
+    "send_cover": {
+      "label": "同时发送封面图（联系表截图）。关闭后相册里只有视频"
+    },
+    "topic_per_model": {
+      "label": "为每个模特创建/复用群组话题（Topic），视频发送到对应话题"
+    },
+    "delete_after_send": {
+      "label": "发送成功后删除本地数据（成片、分片、元数据和模块副产物），释放服务器空间"
+    }
   }
 }

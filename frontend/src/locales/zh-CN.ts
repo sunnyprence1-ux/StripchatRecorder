@@ -393,6 +393,12 @@ export default {
 		username: "群组 Username",
 		usernamePlaceholder: "mygroup（仅公开群组）",
 		sendVideo: "同时发送视频文件",
+		sendCover: "同时发送封面图",
+		sendCoverHint: "即联系表预览图。关闭后只发视频本身。",
+		sendCaption: "附带文字说明",
+		sendCaptionHint:
+			"模特名、时间、时长、文件名和大小。默认关闭——视频消息里不带任何文字。",
+		nothingToSend: "没有可发送的内容：请至少打开视频、封面图或文字说明中的一个。",
 		topicPerModel: "为每个模特创建话题",
 		deleteAfterSend: "发送成功后删除服务器数据",
 		deleteAfterSendHint: "Telegram 接收成功后，成片、.ts 分片、元数据和副产物都会被删除。",

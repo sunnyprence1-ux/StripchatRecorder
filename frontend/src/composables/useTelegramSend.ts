@@ -140,6 +140,10 @@ export interface TgSendOptions {
 	deleteAfterSend?: boolean;
 	/** 同时发送视频文件 / Also send the video file */
 	sendVideo?: boolean;
+	/** 附带文字说明（模特名、时间、时长、大小）/ Attach the text caption */
+	sendCaption?: boolean;
+	/** 同时发送封面图 / Also send the cover image */
+	sendCover?: boolean;
 }
 
 /**
@@ -154,6 +158,8 @@ export interface TgSendDefaults {
 	topicPerModel: boolean;
 	deleteAfterSend: boolean;
 	sendVideo: boolean;
+	sendCaption: boolean;
+	sendCover: boolean;
 	account: string;
 	hasAccount: boolean;
 	inPipeline: boolean;

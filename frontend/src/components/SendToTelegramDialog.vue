@@ -2,11 +2,13 @@
     发送到 Telegram 对话框 / Send to Telegram Dialog
 
     手动把一个或多个成片发送到 Telegram 群组：群组 ID、是否按模特分话题、是否发送视频文件、
-    以及「发送成功后删除本地数据」都可以在这里覆盖，不必修改后处理流水线。
+    是否附带文字说明、是否发送封面图，以及「发送成功后删除本地数据」都可以在这里覆盖，
+    不必修改后处理流水线。
 
     Manually send one or more finished videos to a Telegram group. The group id, the
-    one-topic-per-model toggle, whether to send the video file, and "delete local data after
-    a successful send" can all be overridden here without touching the post-processing pipeline.
+    one-topic-per-model toggle, whether to send the video file, whether to attach the text
+    caption, whether to send the cover image, and "delete local data after a successful send"
+    can all be overridden here without touching the post-processing pipeline.
 
     Props:
         paths - 要发送的视频路径列表 / Video paths to send
@@ -47,6 +49,8 @@
 		topicPerModel: true,
 		deleteAfterSend: true,
 		sendVideo: true,
+		sendCaption: false,
+		sendCover: true,
 	});
 
 	/** 是否正在加载默认值 / Whether the defaults are loading */
@@ -119,6 +123,8 @@
 			form.topicPerModel = d.topicPerModel;
 			form.deleteAfterSend = d.deleteAfterSend;
 			form.sendVideo = d.sendVideo;
+			form.sendCaption = d.sendCaption ?? false;
+			form.sendCover = d.sendCover ?? true;
 		} catch {
 			// 读取默认值失败不阻塞发送：用户仍可手动填写群组 ID
 			// Failing to read defaults doesn't block sending: the user can still type a chat id
@@ -130,12 +136,18 @@
 	/** 是否正在发送 / Whether a send is in progress */
 	const sending = computed(() => states.value.some((s) => s.status === "running"));
 
+	/** 是否至少选择了一种内容（视频 / 文字 / 封面图）/ Whether at least one payload is selected */
+	const hasPayload = computed(
+		() => form.sendVideo || form.sendCaption || form.sendCover,
+	);
+
 	/** 是否可以提交 / Whether the form can be submitted */
 	const canSubmit = computed(
 		() =>
 			!loading.value &&
 			available.value &&
 			!sending.value &&
+			hasPayload.value &&
 			(form.chatId.trim() !== "" || form.username.trim() !== ""),
 	);
 
@@ -152,6 +164,8 @@
 			topicPerModel: form.topicPerModel,
 			deleteAfterSend: form.deleteAfterSend,
 			sendVideo: form.sendVideo,
+			sendCaption: form.sendCaption,
+			sendCover: form.sendCover,
 		});
 	}
 
@@ -314,10 +328,33 @@
 							<Label for="tg-send-video" class="text-xs">{{ t("telegram.sendVideo") }}</Label>
 							<Switch id="tg-send-video" v-model="form.sendVideo" />
 						</div>
+						<div class="flex items-start justify-between gap-3">
+							<div class="flex flex-col gap-0.5">
+								<Label for="tg-send-cover" class="text-xs">{{ t("telegram.sendCover") }}</Label>
+								<p class="text-[11px] text-muted-foreground">{{ t("telegram.sendCoverHint") }}</p>
+							</div>
+							<Switch id="tg-send-cover" v-model="form.sendCover" class="shrink-0" />
+						</div>
+						<div class="flex items-start justify-between gap-3">
+							<div class="flex flex-col gap-0.5">
+								<Label for="tg-send-caption" class="text-xs">{{ t("telegram.sendCaption") }}</Label>
+								<p class="text-[11px] text-muted-foreground">{{ t("telegram.sendCaptionHint") }}</p>
+							</div>
+							<Switch id="tg-send-caption" v-model="form.sendCaption" class="shrink-0" />
+						</div>
 						<div class="flex items-center justify-between gap-3">
 							<Label for="tg-topic" class="text-xs">{{ t("telegram.topicPerModel") }}</Label>
 							<Switch id="tg-topic" v-model="form.topicPerModel" />
 						</div>
+					</div>
+
+					<!-- 视频 / 文字 / 封面图全关时没有内容可发 / Nothing to send when all three are off -->
+					<div
+						v-if="!hasPayload"
+						class="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-[11px] text-destructive"
+					>
+						<TriangleAlert class="size-4 shrink-0 mt-0.5" />
+						<span>{{ t("telegram.nothingToSend") }}</span>
 					</div>
 
 					<div class="flex items-start justify-between gap-3 rounded-md border p-3">

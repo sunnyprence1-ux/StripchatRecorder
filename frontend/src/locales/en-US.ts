@@ -396,6 +396,12 @@ export default {
 		username: "Group username",
 		usernamePlaceholder: "mygroup (public groups only)",
 		sendVideo: "Also send the video file",
+		sendCover: "Also send the cover image",
+		sendCoverHint: "The contact-sheet preview image. Turn it off to post the video on its own.",
+		sendCaption: "Attach text caption",
+		sendCaptionHint:
+			"Model name, timestamp, duration, file name and size. Off by default — the video is posted with no text at all.",
+		nothingToSend: "Nothing to send: turn on the video, the cover image or the caption.",
 		topicPerModel: "One topic per model",
 		deleteAfterSend: "Delete server data after sending",
 		deleteAfterSendHint: "The video, its .ts segments, metadata and side files are removed once Telegram accepts the upload.",

@@ -83,8 +83,8 @@ const PROGRESS_SCALE: usize = 10_000;
 /// Module metadata JSON, output via `--describe` argument.
 const DESCRIBE: &str = r#"{
     "id": "notify_telegram",
-    "name": "Telegram 通知 0.4.2",
-    "description": "将录制信息、封面图和视频通过 MTProto 发送到 Telegram（支持超过 50MB 的大文件，支持 HTTP/SOCKS5 代理）。可按模特自动创建/复用群组话题（Topic）并把视频发送到对应话题。默认使用已登录的真实账号：可列出话题、避免重复创建，高级会员还能上传 4GB 单文件",
+    "name": "Telegram 通知 0.4.3",
+    "description": "把录制好的视频通过 MTProto 发送到 Telegram（支持超过 50MB 的大文件，支持 HTTP/SOCKS5 代理）。默认只发视频、不带任何文字；文字说明和封面图都可以单独开关。可按模特自动创建/复用群组话题（Topic）并把视频发送到对应话题。默认使用已登录的真实账号：可列出话题、避免重复创建，高级会员还能上传 4GB 单文件",
     "testable": true,
     "loginable": true,
     "params": [
@@ -134,6 +134,18 @@ const DESCRIBE: &str = r#"{
         {
         "key": "send_video",
         "label": "同时发送视频文件",
+        "type": "boolean",
+        "default": true
+        },
+        {
+        "key": "send_caption",
+        "label": "附带文字说明（模特名、时间、时长、文件名、大小）。关闭后消息里没有任何文字，只有视频",
+        "type": "boolean",
+        "default": false
+        },
+        {
+        "key": "send_cover",
+        "label": "同时发送封面图（联系表截图）。关闭后相册里只有视频",
         "type": "boolean",
         "default": true
         },
@@ -1571,12 +1583,17 @@ async fn commit_media(
 /// 4. 并行上传封面图、视频缩略图和视频文件
 /// 5. 以相册形式发送（封面图 + 视频，每批最多 10 条）
 ///
+/// 封面图和文字说明都可单独关闭：两者都关时相册里只有视频，消息里没有任何文字。
+///
 /// Flow:
 /// 1. Resolve the target peer
 /// 2. Convert cover image format if needed
 /// 3. Convert/remux video format if needed
 /// 4. Upload cover image, video thumbnails, and video files
 /// 5. Send as album (cover + videos, up to 10 per batch)
+///
+/// The cover image and the text caption can each be switched off; with both off the album holds
+/// the videos only and the message carries no text at all.
 #[allow(clippy::too_many_arguments)]
 async fn upload_and_send(
     client: &Client, mode: SessionMode,
@@ -1585,9 +1602,19 @@ async fn upload_and_send(
     file_name: &str, file_size_str: &str,
     input: &Path, cover: Option<&Path>, send_video: bool,
     topic_per_model: bool, video_parts: &[PathBuf],
+    send_caption: bool, send_cover: bool,
 ) -> Result<(), String> {
-    let (base_caption_text, base_caption_entities) =
-        build_caption(model_name, timestamp, duration_str, file_name, file_size_str, None);
+    // 文字说明是可选的：关闭后消息里不含任何文字，只有视频（或图片）
+    // The caption is optional: when off the message carries no text at all, only media
+    let caption: Option<(String, Vec<tl::enums::MessageEntity>)> = if send_caption {
+        Some(build_caption(model_name, timestamp, duration_str, file_name, file_size_str, None))
+    } else {
+        None
+    };
+
+    // 关闭封面图时直接当作「没有封面」，上传、相册和「只发图」分支都不再涉及它
+    // With the cover switched off, treat it as absent everywhere: upload, album and photo branch
+    let cover = if send_cover { cover } else { None };
 
     let target = resolve_target(client, chat_id, username).await?;
     let peer = target.peer;
@@ -1789,8 +1816,10 @@ async fn upload_and_send(
             }
             for (idx, part) in parts.iter().enumerate() {
                 let mut item = InputMedia::new().copy_media(&part.media);
-                if idx == total_parts - 1 {
-                    item = item.fmt_entities(base_caption_entities.clone()).caption(base_caption_text.clone());
+                if let Some((text, entities)) = &caption
+                    && idx == total_parts - 1
+                {
+                    item = item.fmt_entities(entities.clone()).caption(text.clone());
                 }
                 items.push(item);
             }
@@ -1861,7 +1890,8 @@ async fn upload_and_send(
             committed_parts = do_upload_and_commit(Arc::clone(&done)).await?;
         }
     } else if let Some(img) = effective_cover {
-        // 仅发送封面图和说明文字 / Send cover image with caption only
+        // 仅发送封面图（文字说明关闭时就是一张纯图片）
+        // Send the cover image only (a bare photo when the caption is off)
         let uploaded = upload_with_progress(client, img, Arc::clone(&done), upload_total).await?;
         if let Some(ref tmp) = converted_cover { let _ = fs::remove_file(tmp); }
         if let Some(ref tmp) = resized_cover { let _ = fs::remove_file(tmp); }
@@ -1870,11 +1900,12 @@ async fn upload_and_send(
         const SEND_RETRY_DELAY: Duration = Duration::from_secs(30);
         let mut send_attempt = 0u32;
         loop {
-            let msg = InputMessage::new()
+            let mut msg = InputMessage::new()
                 .photo(uploaded.clone())
-                .fmt_entities(base_caption_entities.clone())
-                .reply_to(topic_id)
-                .text(base_caption_text.clone());
+                .reply_to(topic_id);
+            if let Some((text, entities)) = &caption {
+                msg = msg.fmt_entities(entities.clone()).text(text.clone());
+            }
             match client.send_message(peer, msg).await {
                 Ok(_) => break,
                 Err(e) => {
@@ -1890,18 +1921,18 @@ async fn upload_and_send(
                 }
             }
         }
-    } else {
-        // 无封面图：仅发送文字消息，发送失败立即重试（不重新上传）
-        // No cover image: send text message only; retry send on failure without re-uploading
+    } else if let Some((text, entities)) = &caption {
+        // 无视频、无封面图：只发送文字消息，发送失败立即重试（不重新上传）
+        // No video and no cover: send the text message only; retry without re-uploading
         let topic_id = resolve_topic_id(client, &target, chat_id, model_name, topic_per_model, mode).await;
         const MAX_SEND: u32 = 3;
         const SEND_RETRY_DELAY: Duration = Duration::from_secs(30);
         let mut send_attempt = 0u32;
         loop {
             let msg = InputMessage::new()
-                .fmt_entities(base_caption_entities.clone())
+                .fmt_entities(entities.clone())
                 .reply_to(topic_id)
-                .text(base_caption_text.clone());
+                .text(text.clone());
             match client.send_message(peer, msg).await {
                 Ok(_) => break,
                 Err(e) => {
@@ -1917,6 +1948,12 @@ async fn upload_and_send(
                 }
             }
         }
+    } else {
+        // 视频、封面图和文字全关：没有任何内容可发（read_config 已提前拦截，这里兜底）
+        // Video, cover and caption all off: nothing to send (read_config catches this first)
+        return Err(
+            "nothing to send: send_video, send_cover and send_caption are all off".to_string()
+        );
     }
 
     Ok(())
@@ -1933,6 +1970,10 @@ struct TgConfig {
     proxy: String,
     username: String,
     send_video: bool,
+    /// 是否附带文字说明 / Whether to attach the text caption
+    send_caption: bool,
+    /// 是否同时发送封面图 / Whether to also send the cover image
+    send_cover: bool,
     topic_per_model: bool,
     /// 登录方式（机器人 / 用户账号）/ Login mode (bot / user account)
     mode: SessionMode,
@@ -1964,6 +2005,26 @@ fn normalize_username(raw: &str) -> String {
     raw.trim().trim_start_matches('@').to_string()
 }
 
+/// 校验「至少要有一样东西可发」：视频、封面图、文字说明不能同时关闭。
+/// 纯函数，方便单元测试（`read_config` 读的是环境变量）。
+///
+/// Validate that there is at least one thing to send: the video, the cover image and the text
+/// caption cannot all be off. Pure so it can be unit tested (`read_config` reads env vars).
+fn validate_payload_flags(
+    send_video: bool,
+    send_caption: bool,
+    send_cover: bool,
+) -> Result<(), String> {
+    if !send_video && !send_caption && !send_cover {
+        return Err(
+            "nothing to send: send_video, send_caption and send_cover are all off — turn on at \
+             least one of them"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// 读取并验证所有模块参数（正常模式与自检模式共用）。
 /// Read and validate all module parameters (shared by normal and self-test mode).
 fn read_config() -> Result<TgConfig, String> {
@@ -1992,6 +2053,17 @@ fn read_config() -> Result<TgConfig, String> {
         }
     }
     let chat_id: i64 = normalize_chat_id(&param("chat_id", ""))?;
+
+    let send_video = param_bool("send_video", true);
+    // 文字说明默认关闭：只上传视频，不往群里发任何文字
+    // The text caption is off by default: upload the video, post no text at all
+    let send_caption = param_bool("send_caption", false);
+    // 封面图默认开启 / The cover image is on by default
+    let send_cover = param_bool("send_cover", true);
+    // 三项全关 = 没有任何内容可发，提前报错而不是连上 Telegram 后才发现
+    // All three off means there is nothing to send; fail early instead of after connecting
+    validate_payload_flags(send_video, send_caption, send_cover)?;
+
     Ok(TgConfig {
         api_id,
         api_hash,
@@ -1999,7 +2071,9 @@ fn read_config() -> Result<TgConfig, String> {
         chat_id,
         proxy: param("proxy", ""),
         username: normalize_username(&param("username", "")),
-        send_video: param_bool("send_video", true),
+        send_video,
+        send_caption,
+        send_cover,
         // 是否把每个模特的视频发送到该模特专属的群组话题中
         // Whether to send each model's video into a group forum topic dedicated to that model
         topic_per_model: param_bool("topic_per_model", true),
@@ -2138,14 +2212,19 @@ async fn self_test(cfg: &TgConfig) -> Result<(), String> {
         None
     };
 
-    let caption = format!(
-        "🧪 Test message from StripchatRecorder\n\n\
-         If you can read this, the {} can post to this chat{}.\n\
-         Mode: {}",
-        if cfg.mode == SessionMode::User { "account" } else { "bot" },
-        if topic_id.is_some() { " and create/reuse forum topics" } else { "" },
-        if cfg.send_video { "text + video upload" } else { "text only (send_video is off)" },
-    );
+    // 自检消息同样遵守 send_caption：关闭时不带任何文字，这样自检就能验证「只发视频」
+    // The self-test honours send_caption too: with it off no text is posted, so a passing
+    // self-test proves video-only sending works end to end.
+    let caption = cfg.send_caption.then(|| {
+        format!(
+            "🧪 Test message from StripchatRecorder\n\n\
+             If you can read this, the {} can post to this chat{}.\n\
+             Mode: {}",
+            if cfg.mode == SessionMode::User { "account" } else { "bot" },
+            if topic_id.is_some() { " and create/reuse forum topics" } else { "" },
+            if cfg.send_video { "text + video upload" } else { "text only (send_video is off)" },
+        )
+    });
 
     if cfg.send_video {
         println!("[4/5] generating a 3-second test clip…");
@@ -2202,22 +2281,35 @@ async fn self_test(cfg: &TgConfig) -> Result<(), String> {
 
         let committed = commit_media(&client, &peer, raw_media).await?;
 
-        let mut item = InputMedia::new().copy_media(&committed).caption(caption);
+        let mut item = InputMedia::new().copy_media(&committed);
+        if let Some(text) = &caption {
+            item = item.caption(text.clone());
+        }
         if let Some(tid) = topic_id {
             item = item.reply_to(Some(tid));
         }
         client.send_album(peer, vec![item]).await
             .map_err(|e| format!("send_album failed: {}", e))?;
-        println!("      test video sent");
+        if caption.is_some() {
+            println!("      test video sent");
+        } else {
+            println!("      test video sent (no caption: send_caption is off)");
+        }
 
         let _ = fs::remove_file(&clip);
         if let Some(tp) = thumb_path { let _ = fs::remove_file(tp); }
-    } else {
+    } else if let Some(text) = caption {
         println!("[4/5] video upload is off, sending a text message…");
-        let msg = InputMessage::new().reply_to(topic_id).text(caption);
+        let msg = InputMessage::new().reply_to(topic_id).text(text);
         client.send_message(peer, msg).await
             .map_err(|e| format!("send_message failed: {}", e))?;
         println!("      test message sent");
+    } else {
+        // 视频和文字都关：自检没有任何东西可发
+        // Video and caption both off: the self-test has nothing to send
+        return Err(
+            "nothing to send in the self-test: send_video and send_caption are both off".to_string()
+        );
     }
 
     Ok(())
@@ -2458,6 +2550,8 @@ fn run() -> Result<(), String> {
         proxy,
         username,
         send_video,
+        send_caption,
+        send_cover,
         topic_per_model,
         delete_after_send,
         mode,
@@ -2504,6 +2598,7 @@ fn run() -> Result<(), String> {
                 &client, mode, chat_id, &username,
                 &model_name, &ts_str, &dur_str, &name_str, &size_str,
                 &input, cover.as_deref(), send_video, topic_per_model, &video_parts,
+                send_caption, send_cover,
             ).await;
             match result {
                 Ok(()) => break Ok(()),
@@ -2794,5 +2889,41 @@ mod tests {
             .expect("delete_after_send param is declared");
         assert_eq!(p["type"], "boolean");
         assert_eq!(p["default"], true);
+    }
+
+    /// 默认只上传视频、不带任何文字：`send_caption` 必须存在且默认关闭。
+    /// Video-only by default: `send_caption` must exist and default to off.
+    #[test]
+    fn describe_declares_caption_off_by_default() {
+        let v: serde_json::Value = serde_json::from_str(DESCRIBE).expect("DESCRIBE is valid JSON");
+        let params = v["params"].as_array().expect("params is an array");
+        let caption = params
+            .iter()
+            .find(|p| p["key"] == "send_caption")
+            .expect("send_caption param is declared");
+        assert_eq!(caption["type"], "boolean");
+        assert_eq!(caption["default"], false);
+        let cover = params
+            .iter()
+            .find(|p| p["key"] == "send_cover")
+            .expect("send_cover param is declared");
+        assert_eq!(cover["type"], "boolean");
+        assert_eq!(cover["default"], true);
+    }
+
+    /// 关掉文字说明后仍然要能发出去：视频 / 封面图 / 文字至少留一样。
+    /// With the caption off there must still be a payload: at least one of video / cover / text.
+    #[test]
+    fn payload_flags_need_one_enabled_item() {
+        // 只发视频（用户要的行为）/ Video only (what the user asked for)
+        assert!(validate_payload_flags(true, false, false).is_ok());
+        assert!(validate_payload_flags(true, false, true).is_ok());
+        assert!(validate_payload_flags(true, true, true).is_ok());
+        // 全关必须报错，而不是连上 Telegram 后才发现没东西可发
+        // All off must fail instead of connecting first and discovering nothing to send
+        let err = validate_payload_flags(false, false, false).unwrap_err();
+        assert!(err.contains("nothing to send"), "unexpected message: {}", err);
+        // 纯文字 / text only
+        assert!(validate_payload_flags(false, true, false).is_ok());
     }
 }
