@@ -26,3 +26,6 @@ dist-ssr
 # Build output
 build/
 build_tmp/
+# Cargo target dirs — the project builds into build_tmp/, but running `cargo test`
+# inside a crate directory creates a target/ next to it
+target/
