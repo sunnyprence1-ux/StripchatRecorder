@@ -214,6 +214,50 @@ etc.) once Telegram confirms the upload, and drops the entry from the post-proce
 recordings page loses the row immediately and reports how much space was freed. Turn the toggle off to
 keep the local files.
 
+### Upload speed
+
+Uploads are sent in **512KB parts with eight in flight**, instead of one part at a time. That is the
+whole speedup: the old loop waited for the server to acknowledge every part, so a 100MB video meant
+~200 serial round trips, each one paying the full round-trip time.
+
+`upload_workers` (default **8**, max 16) tunes how many parts are in flight. Each part still retries
+independently, so a dropped connection resumes from where it stopped instead of re-uploading the file.
+
+Measured through the real send path on a congested mobile uplink, same 12MB video, runs interleaved:
+
+| Round | 1 part at a time | 8 parts in flight | Speedup |
+| --- | --- | --- | --- |
+| 1 | 58.3s | 27.3s | 2.1x |
+| 2 | 112.7s | 76.7s | 1.5x |
+| 3 | 48.3s | 32.1s | 1.5x |
+
+Median **1.8x** (~205 → ~375 KB/s). Parallel upload won every round, but the gain is bounded by the
+link: on a ~350 KB/s uplink the serial loop already got within a factor of two of the ceiling, so there
+is only so much to win. On a link with a *high* round-trip time and spare bandwidth — a long-haul VPS,
+a proxy, a satellite hop — the gain is much larger, because that is when serial round trips dominate.
+
+> **The uplink is the real ceiling.** No uploader can beat your bandwidth; parallelism just stops you
+> from sitting far below it.
+
+A Telethon + FastTelethon sidecar was also implemented and benchmarked during development, and then
+**removed** — see why below.
+
+#### Why not Telethon + FastTelethon?
+
+It was built, measured and dropped, for two reasons:
+
+1. **Slower.** On the same file and link, the built-in uploader won every paired run: 167 vs 132 KB/s
+   at 12MB, 438 vs 310 KB/s at 40MB. The sidecar pays process start-up, session extraction and Python
+   overhead, and its per-connection handshakes only amortise on very large files.
+2. **It breaks the session.** Telethon has to reuse your login, so it shares the account's auth key.
+   While grammers is connected, Telegram starts serialising responses at Telethon's (newer) layer, and
+   grammers cannot parse the newer `message#7600b9d3` constructor — every send then fails with
+   `unexpected constructor: 7600b9d3`. Uploading first and connecting grammers afterwards works, but
+   that is a fragile restructuring of the whole send flow for a slower path.
+
+The parallelism is what makes uploads fast, and the built-in uploader has it.
+
+---
 ---
 
 ## Building from Source

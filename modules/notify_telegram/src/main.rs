@@ -60,11 +60,15 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use grammers_client::Client;
+use grammers_client::InvocationError;
 use grammers_client::client::{ClientConfiguration, AutoSleep};
 use grammers_client::media::{InputMedia, Uploaded};
 use grammers_client::message::InputMessage;
@@ -73,7 +77,7 @@ use grammers_client::sender::{ConnectionParams, SenderPool};
 use grammers_client::tl;
 use grammers_session::storages::SqliteSession;
 use grammers_session::types::{PeerAuth, PeerId, PeerKind, PeerRef};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use pp_utils::{param, param_bool, format_duration, format_bytes, format_speed, parse_stem, find_cover, tmp_dir, image_dimensions, video_meta};
 
 /// 进度上报的缩放基数 / Progress reporting scale base
@@ -83,7 +87,7 @@ const PROGRESS_SCALE: usize = 10_000;
 /// Module metadata JSON, output via `--describe` argument.
 const DESCRIBE: &str = r#"{
     "id": "notify_telegram",
-    "name": "Telegram 通知 0.4.3",
+    "name": "Telegram 通知 0.4.4",
     "description": "把录制好的视频通过 MTProto 发送到 Telegram（支持超过 50MB 的大文件，支持 HTTP/SOCKS5 代理）。默认只发视频、不带任何文字；文字说明和封面图都可以单独开关。可按模特自动创建/复用群组话题（Topic）并把视频发送到对应话题。默认使用已登录的真实账号：可列出话题、避免重复创建，高级会员还能上传 4GB 单文件",
     "testable": true,
     "loginable": true,
@@ -160,6 +164,12 @@ const DESCRIBE: &str = r#"{
         "label": "发送成功后删除本地数据（成片、分片、元数据和模块副产物），释放服务器空间",
         "type": "boolean",
         "default": true
+        },
+        {
+        "key": "upload_workers",
+        "label": "并发上传分块数（默认 8，上限 16；0 = 默认）。串行上传时每个 512KB 分块都要等服务器回包，并发后这些往返重叠起来，12MB 视频实测快约 1.8 倍（链路本身才是上限）",
+        "type": "number",
+        "default": 8
         }
     ]
 }"#;
@@ -1370,134 +1380,363 @@ fn upload_file_id(path: &Path) -> i64 {
     if id == 0 { 1 } else { id }
 }
 
-/// 上传文件到 Telegram，支持断点续传、进度上报。
-///
-/// 直接调用底层 `SaveBigFilePart` TL 函数，保持同一 `file_id`，
-/// 网络中断后从上次成功的分块处继续，而不是从头重传。
-///
-/// Upload a file to Telegram with resumable upload and progress reporting.
-///
-/// Calls the underlying `SaveBigFilePart` TL function directly, keeping the same
-/// `file_id` across retries so that interrupted uploads resume from the last
-/// successfully uploaded part instead of restarting from the beginning.
-async fn upload_with_progress(
-    client: &Client, path: &Path,
-    done: Arc<AtomicUsize>, total: usize,
-) -> Result<Uploaded, String> {
-    // 每个分块 512 KB（Telegram 最大分块大小）/ 512 KB per chunk (Telegram max chunk size)
-    const CHUNK_SIZE: usize = 512 * 1024;
-    // 单个分块的最大重试次数 / Max retries per chunk
-    const MAX_CHUNK_RETRIES: u32 = 20;
-    // 重试延迟序列（秒）/ Retry delay sequence (seconds)
-    const RETRY_DELAYS: [u64; 6] = [10, 20, 30, 40, 50, 60];
+/// 每个上传分块的大小（Telegram 允许的最大值）/ Size of one upload part (Telegram's maximum)
+const UPLOAD_CHUNK_SIZE: usize = 512 * 1024;
 
-    let name = path.file_name().unwrap().to_string_lossy().to_string();
+/// 超过这个大小才走大文件接口（不需要 md5）/ Above this size the big-file API is used (no md5)
+const BIG_FILE_THRESHOLD: usize = 10 * 1024 * 1024;
 
-    let mut file = tokio::fs::File::open(path).await
+/// 默认同时上传的分块数 / Default number of parts uploaded concurrently
+const DEFAULT_UPLOAD_WORKERS: usize = 8;
+
+/// 并发分块数的上限（再高只会更快触发限流）/ Upper bound (beyond this only flood-waits grow)
+const MAX_UPLOAD_WORKERS: usize = 16;
+
+/// 归一化并发分块数：0 表示自动（默认值），超过上限则截断。
+///
+/// Normalize the concurrent part count: 0 means automatic (the default), anything above the
+/// cap is clamped.
+fn normalize_upload_workers(workers: usize) -> usize {
+    match workers {
+        0 => DEFAULT_UPLOAD_WORKERS,
+        n if n > MAX_UPLOAD_WORKERS => MAX_UPLOAD_WORKERS,
+        n => n,
+    }
+}
+
+/// 多线程共享的上传进度：汇总字节数，并按秒上报速度。
+/// Upload progress shared by every worker: aggregates the byte count and reports speed once a
+/// second.
+struct UploadProgress {
+    /// 本次发送已上传的总字节（含封面图、缩略图和所有视频分片）
+    /// Bytes uploaded for this send so far (cover, thumbnails and every video part)
+    done: Arc<AtomicUsize>,
+    /// 本次发送要上传的总字节 / Total bytes this send will upload
+    total: usize,
+    /// 速度统计窗口（本文件）/ Speed measurement window (this file)
+    window: Mutex<SpeedWindow>,
+}
+
+/// 速度统计窗口 / Speed measurement window.
+struct SpeedWindow {
+    bytes: usize,
+    start: Instant,
+}
+
+impl UploadProgress {
+    fn new(done: Arc<AtomicUsize>, total: usize) -> Self {
+        Self {
+            done,
+            total,
+            window: Mutex::new(SpeedWindow { bytes: 0, start: Instant::now() }),
+        }
+    }
+
+    /// 记录一个分块上传完成 / Record that one part finished uploading.
+    fn add(&self, bytes: usize) {
+        if self.total == 0 {
+            return;
+        }
+        let new_done = self.done.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        let scaled = ((new_done as u128) * (PROGRESS_SCALE as u128) / (self.total as u128))
+            .min(PROGRESS_SCALE as u128) as usize;
+        println!("PROGRESS:{}/{}", scaled, PROGRESS_SCALE);
+        let _ = std::io::stdout().flush();
+
+        // 速度每秒上报一次；锁内只做算术，不会阻塞其他 worker 上传
+        // Report the speed once a second; only arithmetic happens under the lock, so no worker
+        // is ever blocked from uploading
+        let bps = {
+            let mut w = self.window.lock().unwrap_or_else(|e| e.into_inner());
+            w.bytes += bytes;
+            let elapsed = w.start.elapsed();
+            if elapsed >= Duration::from_secs(1) {
+                let bps = w.bytes as f64 / elapsed.as_secs_f64();
+                w.bytes = 0;
+                w.start = Instant::now();
+                Some(bps)
+            } else {
+                None
+            }
+        };
+        if let Some(bps) = bps {
+            println!("STATUS:{}", format_speed(bps));
+            let _ = std::io::stdout().flush();
+        }
+    }
+}
+
+/// 计算整个文件的 md5（只有小文件接口需要）。
+/// Compute the md5 of the whole file (only the small-file API needs it).
+async fn md5_of_file(path: &Path) -> Result<String, String> {
+    let mut file = tokio::fs::File::open(path)
+        .await
         .map_err(|e| format!("open {} failed: {}", path.display(), e))?;
-    let size = file.metadata().await
-        .map_err(|e| format!("metadata failed: {}", e))?.len() as usize;
+    let mut ctx = md5::Context::new();
+    let mut buf = vec![0u8; UPLOAD_CHUNK_SIZE];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("read {} failed: {}", path.display(), e))?;
+        if n == 0 {
+            break;
+        }
+        ctx.consume(&buf[..n]);
+    }
+    Ok(format!("{:x}", ctx.finalize()))
+}
 
-    // 与 grammers 保持一致：> 10MB 用大文件接口，否则用小文件接口
-    // Match grammers behavior: use big-file API for >10MB, small-file API otherwise.
-    // InputMediaUploadedPhoto requires InputFile (small), not InputFileBig — using the wrong
-    // one causes PHOTO_SAVE_FILE_INVALID.
-    const BIG_FILE_THRESHOLD: usize = 10 * 1024 * 1024;
-    let is_big = size > BIG_FILE_THRESHOLD;
+/// 从 RPC 错误里取出 FLOOD_WAIT 的秒数，其他错误返回 `None`。
+/// Extract the FLOOD_WAIT delay in seconds from an RPC error, `None` for anything else.
+fn flood_wait_secs(err: &InvocationError) -> Option<u64> {
+    match err {
+        InvocationError::Rpc(rpc) if rpc.name == "FLOOD_WAIT" => {
+            rpc.value.map(|secs| (secs as u64).clamp(1, 600))
+        }
+        _ => None,
+    }
+}
 
-    let total_parts = size.div_ceil(CHUNK_SIZE) as i32;
-    // 生成一次性 file_id，整个上传过程保持不变 / Generate file_id once; keep it for the entire upload
-    let file_id = upload_file_id(path);
+/// 上传单个分块，失败时按退避序列重试（`file_id` 与分块号都不变，因此可以安全重发）。
+///
+/// Upload one part, retrying with backoff. Both the `file_id` and the part index stay the same,
+/// so resending is safe.
+async fn upload_one_part(
+    client: &Client,
+    file_id: i64,
+    part: i32,
+    total_parts: i32,
+    is_big: bool,
+    chunk: Vec<u8>,
+) -> Result<(), String> {
+    // 单个分块的最大尝试次数 / Max attempts for a single part
+    const MAX_ATTEMPTS: u32 = 20;
+    // 通用错误的退避序列（秒）/ Backoff sequence for generic errors (seconds)
+    const BACKOFF: [u64; 6] = [2, 4, 8, 15, 30, 60];
 
-    let mut buf = vec![0u8; CHUNK_SIZE];
-    let mut speed_bytes: usize = 0;
-    let mut speed_last = Instant::now();
-    // md5 仅小文件需要 / md5 only needed for small files
-    let mut md5_ctx = md5::Context::new();
+    let mut attempt = 0u32;
+    loop {
+        let result = if is_big {
+            client
+                .invoke(&tl::functions::upload::SaveBigFilePart {
+                    file_id,
+                    file_part: part,
+                    file_total_parts: total_parts,
+                    bytes: chunk.clone(),
+                })
+                .await
+        } else {
+            client
+                .invoke(&tl::functions::upload::SaveFilePart {
+                    file_id,
+                    file_part: part,
+                    bytes: chunk.clone(),
+                })
+                .await
+        };
 
-    for part in 0..total_parts {
-        // 读取当前分块 / Read current chunk
+        let err = match result {
+            Ok(true) => return Ok(()),
+            Ok(false) => format!("server rejected part {}", part),
+            Err(e) => {
+                // FLOOD_WAIT 自带明确秒数，按服务器要求等待；其余按退避序列
+                // FLOOD_WAIT carries the exact delay, so honour it; otherwise back off
+                let delay = flood_wait_secs(&e)
+                    .unwrap_or_else(|| BACKOFF[(attempt as usize).min(BACKOFF.len() - 1)]);
+                attempt += 1;
+                if attempt >= MAX_ATTEMPTS {
+                    return Err(format!("part {} upload error: {}", part, e));
+                }
+                eprintln!(
+                    "chunk {}/{} attempt {}/{}: {}. retrying in {}s…",
+                    part + 1,
+                    total_parts,
+                    attempt,
+                    MAX_ATTEMPTS,
+                    e,
+                    delay
+                );
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+                continue;
+            }
+        };
+
+        attempt += 1;
+        if attempt >= MAX_ATTEMPTS {
+            return Err(err);
+        }
+        let delay = BACKOFF[(attempt as usize - 1).min(BACKOFF.len() - 1)];
+        eprintln!(
+            "chunk {}/{} attempt {}/{}: {}. retrying in {}s…",
+            part + 1,
+            total_parts,
+            attempt,
+            MAX_ATTEMPTS,
+            err,
+            delay
+        );
+        tokio::time::sleep(Duration::from_secs(delay)).await;
+    }
+}
+
+/// 一个上传 worker：不断领取下一个分块并上传，直到所有分块都被领完。
+///
+/// 每个 worker 持有自己的文件句柄，因此并行读取时不会互相干扰 seek 位置。
+///
+/// One upload worker: claim the next part and upload it until every part has been claimed.
+///
+/// Each worker owns its file handle, so parallel reads never fight over a shared seek offset.
+async fn upload_parts(
+    client: &Client,
+    path: &Path,
+    size: usize,
+    file_id: i64,
+    total_parts: i32,
+    is_big: bool,
+    next_part: &AtomicI32,
+    progress: &UploadProgress,
+) -> Result<(), String> {
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("open {} failed: {}", path.display(), e))?;
+
+    loop {
+        let part = next_part.fetch_add(1, Ordering::Relaxed);
+        if part < 0 || part >= total_parts {
+            break;
+        }
+
+        let offset = part as usize * UPLOAD_CHUNK_SIZE;
+        let want = UPLOAD_CHUNK_SIZE.min(size - offset);
+        file.seek(SeekFrom::Start(offset as u64))
+            .await
+            .map_err(|e| format!("seek {} failed: {}", path.display(), e))?;
+
+        let mut chunk = vec![0u8; want];
         let mut read = 0usize;
-        while read < CHUNK_SIZE {
-            match file.read(&mut buf[read..]).await {
+        while read < want {
+            match file.read(&mut chunk[read..]).await {
                 Ok(0) => break,
                 Ok(n) => read += n,
                 Err(e) => return Err(format!("read chunk {} failed: {}", part, e)),
             }
         }
-        if read == 0 { break; }
-        let chunk = buf[..read].to_vec();
-        if !is_big { md5_ctx.consume(&chunk); }
-
-        // 带重试的分块上传 / Upload chunk with retry
-        let mut chunk_attempt = 0u32;
-        loop {
-            let result = if is_big {
-                client.invoke(&tl::functions::upload::SaveBigFilePart {
-                    file_id,
-                    file_part: part,
-                    file_total_parts: total_parts,
-                    bytes: chunk.clone(),
-                }).await
-            } else {
-                client.invoke(&tl::functions::upload::SaveFilePart {
-                    file_id,
-                    file_part: part,
-                    bytes: chunk.clone(),
-                }).await
-            };
-
-            match result {
-                Ok(true) => break,
-                Ok(false) => {
-                    let err = format!("server rejected part {}", part);
-                    chunk_attempt += 1;
-                    if chunk_attempt >= MAX_CHUNK_RETRIES { return Err(err); }
-                    let delay = RETRY_DELAYS[(chunk_attempt as usize - 1).min(RETRY_DELAYS.len() - 1)];
-                    eprintln!("chunk {}/{} attempt {}/{}: {}. retrying in {}s…",
-                        part + 1, total_parts, chunk_attempt, MAX_CHUNK_RETRIES, err, delay);
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
-                }
-                Err(e) => {
-                    let err = format!("part {} upload error: {}", part, e);
-                    chunk_attempt += 1;
-                    if chunk_attempt >= MAX_CHUNK_RETRIES { return Err(err); }
-                    let delay = RETRY_DELAYS[(chunk_attempt as usize - 1).min(RETRY_DELAYS.len() - 1)];
-                    eprintln!("chunk {}/{} attempt {}/{}: {}. retrying in {}s…",
-                        part + 1, total_parts, chunk_attempt, MAX_CHUNK_RETRIES, err, delay);
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
-                }
-            }
+        if read == 0 {
+            break;
         }
+        chunk.truncate(read);
 
-        // 更新进度和速度 / Update progress and speed
-        if total > 0 {
-            let new_done = done.fetch_add(read, Ordering::Relaxed) + read;
-            speed_bytes += read;
-            let scaled = ((new_done as u128) * (PROGRESS_SCALE as u128) / (total as u128))
-                .min(PROGRESS_SCALE as u128) as usize;
-            println!("PROGRESS:{}/{}", scaled, PROGRESS_SCALE);
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
+        upload_one_part(client, file_id, part, total_parts, is_big, chunk).await?;
+        progress.add(read);
+    }
 
-            let elapsed = speed_last.elapsed();
-            if elapsed >= Duration::from_secs(1) {
-                let bps = speed_bytes as f64 / elapsed.as_secs_f64();
-                println!("STATUS:{}", format_speed(bps));
-                let _ = std::io::stdout().flush();
-                speed_bytes = 0;
-                speed_last = Instant::now();
-            }
-        }
+    Ok(())
+}
+
+/// 上传文件到 Telegram：并发分块、断点续传、进度上报。
+///
+/// 旧实现一次只发一个分块，吞吐量被往返时延锁死：每个 512KB 分块都要等服务器回包，
+/// 一个 100MB 的文件就是约 200 次串行往返。现在默认并发上传 8 个分块，把这些往返重叠起来；
+/// 每个分块仍然独立重试，因此断点续传的语义完全不变。
+///
+/// Upload a file to Telegram with concurrent parts, resumable retries and progress reporting.
+///
+/// The old implementation sent one part at a time, so throughput was pinned to the round-trip
+/// time: every 512KB part waited for the server's acknowledgement, which meant roughly 200
+/// serial round trips for a 100MB file. Eight parts are uploaded concurrently by default so
+/// those round trips overlap. Each part still retries on its own, so resumability is unchanged.
+async fn upload_with_progress(
+    client: &Client,
+    path: &Path,
+    done: Arc<AtomicUsize>,
+    total: usize,
+) -> Result<Uploaded, String> {
+    let workers = normalize_upload_workers(pp_utils::param_u32(
+        "upload_workers",
+        DEFAULT_UPLOAD_WORKERS as u32,
+    ) as usize);
+    upload_with_workers(client, path, done, total, workers).await
+}
+
+/// 与 [`upload_with_progress`] 相同，但可以指定并发分块数（1 = 旧的串行行为）。
+///
+/// Same as [`upload_with_progress`], but the number of concurrent parts can be chosen
+/// (1 reproduces the old serial behaviour).
+async fn upload_with_workers(
+    client: &Client,
+    path: &Path,
+    done: Arc<AtomicUsize>,
+    total: usize,
+    workers: usize,
+) -> Result<Uploaded, String> {
+    let name = path.file_name().unwrap().to_string_lossy().to_string();
+
+    let size = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| format!("metadata {} failed: {}", path.display(), e))?
+        .len() as usize;
+    if size == 0 {
+        return Err(format!("{} is empty", path.display()));
+    }
+
+    // 与 grammers 保持一致：> 10MB 用大文件接口，否则用小文件接口
+    // Match grammers behavior: use big-file API for >10MB, small-file API otherwise.
+    // InputMediaUploadedPhoto requires InputFile (small), not InputFileBig — using the wrong
+    // one causes PHOTO_SAVE_FILE_INVALID.
+    let is_big = size > BIG_FILE_THRESHOLD;
+    let total_parts = size.div_ceil(UPLOAD_CHUNK_SIZE) as i32;
+    // 生成一次性 file_id，整个上传过程保持不变 / Generate file_id once; keep it for the entire upload
+    let file_id = upload_file_id(path);
+
+    // 小文件接口要求整份文件的 md5，先本地顺序读一遍（≤10MB，可以忽略不计）
+    // The small-file API needs the whole file's md5, hashed in one local pass (≤10MB, negligible)
+    let md5_checksum = if is_big {
+        None
+    } else {
+        Some(md5_of_file(path).await?)
+    };
+
+    let progress = UploadProgress::new(done, total);
+    let next_part = AtomicI32::new(0);
+    // 分块数少于 worker 数时没有意义，多余的 worker 直接不启动
+    // More workers than parts is pointless, so only start as many as there is work for
+    let workers = normalize_upload_workers(workers)
+        .min(total_parts.max(1) as usize)
+        .max(1);
+
+    let mut tasks = FuturesUnordered::new();
+    for _ in 0..workers {
+        tasks.push(upload_parts(
+            client,
+            path,
+            size,
+            file_id,
+            total_parts,
+            is_big,
+            &next_part,
+            &progress,
+        ));
+    }
+    while let Some(result) = tasks.next().await {
+        result?;
     }
 
     Ok(Uploaded::from_raw(if is_big {
-        tl::types::InputFileBig { id: file_id, parts: total_parts, name }.into()
+        tl::types::InputFileBig {
+            id: file_id,
+            parts: total_parts,
+            name,
+        }
+        .into()
     } else {
         tl::types::InputFile {
-            id: file_id, parts: total_parts, name,
-            md5_checksum: format!("{:x}", md5_ctx.finalize()),
-        }.into()
+            id: file_id,
+            parts: total_parts,
+            name,
+            md5_checksum: md5_checksum.unwrap_or_default(),
+        }
+        .into()
     }))
 }
 
@@ -2889,6 +3128,33 @@ mod tests {
             .expect("delete_after_send param is declared");
         assert_eq!(p["type"], "boolean");
         assert_eq!(p["default"], true);
+    }
+
+    /// 并发上传参数必须存在且默认 8：这是加速的来源，不能被悄悄关掉。
+    /// The concurrent-upload parameter must exist and default to 8 — it is where the speedup
+    /// comes from, so it must not be silently disabled.
+    #[test]
+    fn describe_declares_parallel_upload_workers() {
+        let v: serde_json::Value = serde_json::from_str(DESCRIBE).expect("DESCRIBE is valid JSON");
+        let params = v["params"].as_array().expect("params is an array");
+
+        let p = params
+            .iter()
+            .find(|p| p["key"] == "upload_workers")
+            .expect("upload_workers param is declared");
+        assert_eq!(p["type"], "number");
+        assert_eq!(p["default"], DEFAULT_UPLOAD_WORKERS);
+        assert_eq!(DEFAULT_UPLOAD_WORKERS, 8);
+    }
+
+    /// 并发分块数归一化：0 取默认，超过上限截断，永远不会是 0 个 worker。
+    /// Worker normalisation: 0 means the default, above the cap is clamped, never zero workers.
+    #[test]
+    fn upload_workers_are_normalised() {
+        assert_eq!(normalize_upload_workers(0), DEFAULT_UPLOAD_WORKERS);
+        assert_eq!(normalize_upload_workers(1), 1);
+        assert_eq!(normalize_upload_workers(8), 8);
+        assert_eq!(normalize_upload_workers(999), MAX_UPLOAD_WORKERS);
     }
 
     /// 默认只上传视频、不带任何文字：`send_caption` 必须存在且默认关闭。

@@ -1,10 +1,10 @@
 [package]
 name = "notify_telegram"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2024"
 
 [[bin]]
-name = "notify_telegram_v043"
+name = "notify_telegram_v044"
 path = "src/main.rs"
 
 [dependencies]

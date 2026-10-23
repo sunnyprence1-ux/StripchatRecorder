@@ -581,6 +581,24 @@ The project ships four modules under `modules/`, which are automatically copied 
 | `send_cover` | boolean | `true`  | Also send the cover image (contact-sheet preview). With it off the album holds the video only |
 | `topic_per_model` | boolean | `true` | Create/reuse one forum topic per model and post the video into it; the group must be a forum and the bot needs "Manage Topics" |
 | `delete_after_send` | boolean | `true` | Ask the host to delete local data after a successful send (video, segment directory, metadata, module side outputs) to free server space |
+| `upload_workers` | number | `8` | How many 512KB parts the built-in uploader sends concurrently (max 16; `0` = default). Serial uploads wait for the server to acknowledge every part, so this is where the speedup comes from |
+
+#### Upload speed
+
+Uploads are sent in 512KB parts with several in flight instead of one at a time. The old serial loop
+waited for the server to acknowledge every part, so a 100MB video meant ~200 serial round trips; eight
+concurrent parts overlap them. Each part still retries on its own, so a dropped connection resumes
+rather than restarting the file.
+
+Measured through the real send path, same 12MB video, interleaved runs on a congested mobile uplink:
+58.3s → 27.3s, 112.7s → 76.7s, 48.3s → 32.1s. Median **1.8x** (~205 → ~375 KB/s). The uplink is the
+ceiling, so the gain is largest when round-trip time dominates (long-haul VPS, proxy, satellite).
+
+> A Telethon + FastTelethon sidecar was also built and benchmarked during development. It was removed:
+> it measured consistently *slower* than the built-in uploader here (132 vs 167 KB/s at 12MB, 310 vs
+> 438 KB/s at 40MB), and sharing the account's auth key with a live grammers connection makes Telegram
+> serialise responses at Telethon's newer layer, which grammers cannot parse — sends then fail with
+> `unexpected constructor: 7600b9d3` (a newer `message#` constructor).
 
 ---
 

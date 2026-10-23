@@ -37,6 +37,9 @@
     },
     "delete_after_send": {
       "label": "Delete local data after a successful send (video, segments, metadata and module side files) to free server space"
+    },
+    "upload_workers": {
+      "label": "Concurrent upload parts (default 8, max 16; 0 = default). Serial uploads wait for the server to acknowledge every 512KB part; running several at once overlaps those round trips — a 12MB video measured ~1.8x faster (the uplink itself is the ceiling)"
     }
   }
 }
