@@ -53,6 +53,9 @@ pub struct SendRequest {
     /// 覆盖「先单独发封面图」/ `cover_first` override
     #[serde(default)]
     pub cover_first: Option<bool>,
+    /// 同时上传多个文件时的批量大小（1=逐个，>1=并发）/ batch size for concurrent uploads
+    #[serde(default)]
+    pub batch_size: Option<u32>,
 }
 
 /// 手动发送界面需要的默认值（来自流水线节点，供前端预填表单）。
@@ -80,6 +83,8 @@ pub struct SendDefaults {
     pub send_cover: bool,
     /// 默认「先单独发封面图，再发视频」/ Default `cover_first`
     pub cover_first: bool,
+    /// 默认批量上传大小 / Default batch size
+    pub batch_size: u32,
     /// 登录方式（auto / user / bot）/ Login mode
     pub account: String,
     /// 是否已有可用账号（已登录用户会话或机器人 Token）
@@ -174,6 +179,7 @@ pub fn send_defaults(state: &AppState) -> SendDefaults {
         // 与模块保持一致：默认先把联系表作为图片发出去，再发视频
         // Match the module: the contact sheet is posted as an image before the video by default
         cover_first: param_bool(&params, "cover_first", true),
+        batch_size: params.get("batch_size").and_then(|v| v.as_u64()).map(|n| n as u32).unwrap_or(3),
         account,
         has_account,
         in_pipeline,
@@ -241,6 +247,12 @@ fn build_params(
         if let Some(v) = value {
             params.insert(key.to_string(), serde_json::Value::Bool(v));
         }
+    }
+    if let Some(v) = req.batch_size {
+        params.insert(
+            "batch_size".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(v)),
+        );
     }
 
     // 最终生效的群组 ID（用于任务记录与前端展示）
