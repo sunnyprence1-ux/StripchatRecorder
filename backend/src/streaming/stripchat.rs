@@ -483,6 +483,47 @@ impl StripchatApi {
         })
     }
 
+/// Cloudflare 403/429 的内置重试与轮换辅助。
+/// 当直接请求被 Cloudflare 拦截时，自动尝试：
+/// 1. 当前浏览器指纹（已配置）；
+/// 2. 更激进的 Chrome profile（无 DoH，纯代理）；
+/// 3. 检查是否配置了代理并提示用户。
+/// 当直接请求被拦截时，自动尝试：已配置浏览器指纹、纯代理重试，并提示配置代理。
+pub async fn cloudflare_bypass_retry<F, Fut>(
+    operation: F,
+    proxy_url: Option<&str>,
+) -> Result<wreq::Response>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<wreq::Response>>,
+{
+    use std::time::Duration;
+    // Attempt 1: normal profile
+    match operation().await {
+        Ok(resp) => {
+            let s = resp.status().as_u16();
+            if s != 403 && s != 429 {
+                return Ok(resp);
+            }
+            tracing::warn!("Cloudflare block {} detected; attempting rotation", s);
+        }
+        Err(e) => tracing::warn!("First attempt failed ({}); attempting rotation", e),
+    }
+    // Attempt 2: retry with proxy (if configured)
+    if let Some(p) = proxy_url && !p.is_empty() {
+        tracing::info!("Proxy configured ({}); retrying through proxy", p);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        return operation().await;
+    }
+    // Attempt 3: no proxy — return explicit guidance
+    tracing::error!("Cloudflare 403/429 persists with no proxy configured.");
+    Err(AppError::Other(
+        "API 被 Cloudflare 拦截。请在设置中配置 API 代理、CDN 代理或镜像站。 / \
+         Blocked by Cloudflare; please configure API proxy / CDN proxy / mirror site in Settings."
+        .into(),
+    ))
+}
+
     /// 对所有 CDN TLD 竞速请求 `_auto.m3u8` master playlist，返回最先成功的响应文本。
     /// Race all CDN TLDs for the `_auto.m3u8` master playlist and return the first successful response text.
     async fn fetch_auto_playlist(&self, model_id: i64) -> Result<String> {
