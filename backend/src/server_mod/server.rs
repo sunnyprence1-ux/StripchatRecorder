@@ -43,10 +43,29 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
     match FrontendAssets::get(path) {
         Some(content) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
-            ([(header::CONTENT_TYPE, mime.as_ref())], content.data).into_response()
+            // Hashed assets are immutable; index.html must always revalidate so
+            // the browser picks up a new bundle after a rebuild.
+            let cache = if path == "index.html" {
+                "no-cache"
+            } else {
+                "public, max-age=31536000, immutable"
+            };
+            (
+                [(header::CONTENT_TYPE, mime.as_ref().to_string()),
+                 (header::CACHE_CONTROL, cache.to_string())],
+                content.data,
+            )
+                .into_response()
         }
         None => match FrontendAssets::get("index.html") {
-            Some(content) => ([(header::CONTENT_TYPE, "text/html")], content.data).into_response(),
+            Some(content) => (
+                [
+                    (header::CONTENT_TYPE, "text/html".to_string()),
+                    (header::CACHE_CONTROL, "no-cache".to_string()),
+                ],
+                content.data,
+            )
+                .into_response(),
             None => StatusCode::NOT_FOUND.into_response(),
         },
     }

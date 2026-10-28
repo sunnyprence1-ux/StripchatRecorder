@@ -804,10 +804,62 @@ fn session_path(api_id: i32, mode: SessionMode) -> PathBuf {
     }
 }
 
+/// 为当前进程复制一份独立的会话文件副本。
+///
+/// 多个并发上传进程共用同一个会话文件时，grammers-session 的 SQLite 写锁
+/// 会互相冲突并在锁上 panic（`storages/sqlite.rs` 中的 `unwrap`）。这里把
+/// 会话复制到进程专属的临时路径：Telegram 允许同一个 auth key 建立多条
+/// 连接，所以副本不需要重新登录。
+///
+/// 原文件不存在（例如首次机器人登录）或复制失败时，退回原路径 —— 退回后
+/// 仍然可能发生锁冲突，但那只是降级为旧行为，而不是新问题。
+///
+/// Give this process its own copy of the session file.
+///
+/// When concurrent upload processes share one session file, grammers-session's
+/// SQLite write locks collide and panic on the `unwrap` in `storages/sqlite.rs`.
+/// The session is copied to a process-private temporary path instead: Telegram
+/// allows several connections with the same auth key, so the copy needs no
+/// re-login. When the original does not exist (first bot login) or the copy
+/// fails, the original path is returned unchanged — degrading to the old
+/// behaviour rather than introducing a new failure.
+fn private_session_copy(path: &Path) -> PathBuf {
+    // 首次登录（文件不存在）或复制失败时用原路径
+    // First login (file missing) or copy failure falls back to the original path
+    if !path.is_file() {
+        return path.to_path_buf();
+    }
+    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("session");
+    let copy = tmp_dir().join(format!("{}.{}.session", file_name, std::process::id()));
+    match std::fs::copy(path, &copy) {
+        Ok(_) => copy,
+        Err(_) => path.to_path_buf(),
+    }
+}
+
 /// 打开（或创建）会话文件并建立 MTProto 连接，但不做任何鉴权。
 /// Open (or create) the session file and connect over MTProto without authenticating.
-async fn open_client(api_id: i32, proxy: &str, mode: SessionMode) -> Result<Client, String> {
+/// 并发上传时多个模块进程同时打开同一个会话文件，SQLite 写锁会互相冲突
+/// （grammers-session 在锁上 `unwrap()`，直接 panic）。因此每个进程复制一份
+/// 独立的会话副本：Telegram 允许同一个 auth key 建立多条连接，副本不需要
+/// 重新登录，只在临时目录留下一个文件。
+///
+/// Concurrent processes would open the same session file and collide on the
+/// SQLite write lock (grammers-session `unwrap()s` and panics). Each process
+/// gets its own copy instead: Telegram allows multiple connections with the
+/// same auth key, so no re-login is needed.
+async fn open_client(api_id: i32, proxy: &str, mode: SessionMode, session_private: bool) -> Result<Client, String> {
     let path = session_path(api_id, mode);
+
+    // 复制出每个进程独立的会话副本，避免 SQLite 锁冲突；登录流程必须写回
+    // 原会话文件，因此不走副本
+    // Copy a per-process session file to avoid SQLite lock collisions; the login
+    // flow must write back to the real session file, so it never uses a copy
+    let path = if session_private {
+        private_session_copy(&path)
+    } else {
+        path
+    };
 
     // 打开或创建 SQLite 会话文件 / Open or create SQLite session file
     let session = Arc::new(
@@ -868,7 +920,7 @@ async fn connect_client(
         ));
     }
 
-    let client = open_client(api_id, proxy, mode).await?;
+    let client = open_client(api_id, proxy, mode, true).await?;
 
     let authorized = client
         .is_authorized()
@@ -2791,7 +2843,7 @@ async fn login_flow() -> Result<(), String> {
 
     // 已存在的用户会话直接复用，无需再次登录
     // Reuse an existing user session instead of signing in again
-    let client = open_client(api_id, &proxy, mode).await?;
+    let client = open_client(api_id, &proxy, mode, false).await?;
     login_state(&format!("session:{}", path.display()));
 
     if client
