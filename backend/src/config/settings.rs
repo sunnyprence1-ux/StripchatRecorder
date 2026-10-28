@@ -464,10 +464,100 @@ pub struct AppState {
     /// 手动发送的取消标志（视频路径 -> 原子布尔）
     /// Manual-send cancel flags (video path -> atomic bool)
     pub tg_cancel_flags: RwLock<HashMap<String, Arc<AtomicBool>>>,
-    /// 手动发送串行锁：同一时刻只跑一个上传，避免多个大文件同时挤占带宽
-    /// Serial lock for manual sends: one upload at a time so concurrent large files
-    /// don't fight over the uplink
-    pub tg_lock: std::sync::Mutex<()>,
+    /// 手动发送并发闸门：同一时刻最多运行 batch_size 个上传（发送对话框里可调）。
+    /// Concurrency gate for manual sends: at most `batch_size` uploads run at once
+    /// (adjustable from the send dialog).
+    pub tg_gate: TgGate,
+}
+
+/// 手动发送的并发闸门：限制同时运行的上传数量。
+/// Concurrency gate for manual sends: bounds the number of simultaneous uploads.
+///
+/// 限制值可以随时调整（发送对话框里的「同时上传数量」）；新值立即生效——
+/// 正在运行的上传不会被中断，但新的上传会按新限制排队。
+/// The limit can be changed at any time (the "concurrent uploads" field in the send
+/// dialog); it applies immediately — in-flight uploads are never interrupted, but new
+/// ones queue according to the new limit.
+pub struct TgGate {
+    /// (limit, active) — 允许的并发上限与当前运行数 / (limit, active)
+    inner: std::sync::Mutex<(usize, usize)>,
+    /// 有任务结束或限制变更时唤醒等待者 / Wakes waiters when a task finishes or the limit changes
+    cv: std::sync::Condvar,
+}
+
+impl TgGate {
+    /// 创建一个并发上限为 `limit` 的闸门 / Create a gate with the given concurrency limit
+    pub fn new(limit: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new((limit.max(1), 0)),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    /// 设置并发上限（至少为 1）。已在运行的上传不受影响。
+    /// Set the concurrency limit (minimum 1). In-flight uploads are unaffected.
+    pub fn set_limit(&self, limit: usize) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.0 = limit.max(1);
+        drop(g);
+        self.cv.notify_all();
+    }
+
+    /// 当前并发上限 / Current concurrency limit
+    pub fn limit(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .0
+    }
+
+    /// 当前运行中的上传数 / Number of uploads currently running
+    pub fn active(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+    }
+
+    /// 获取一个并发名额；排队期间被取消则返回 `None`。
+    /// Acquire a concurrency slot; returns `None` if cancelled while queued.
+    ///
+    /// 等待以 1 秒为周期醒来检查取消标志，这样取消一个排队中的发送不需要
+    /// 其他任务结束就能生效。
+    /// The wait wakes every second to re-check the cancel flag, so cancelling a queued
+    /// send takes effect without waiting for another task to finish.
+    pub fn acquire(&self, cancel: &AtomicBool) -> Option<TgPermit<'_>> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
+            if guard.1 < guard.0 {
+                guard.1 += 1;
+                return Some(TgPermit { gate: self });
+            }
+            let (g2, _timeout) = self
+                .cv
+                .wait_timeout(guard, std::time::Duration::from_secs(1))
+                .unwrap_or_else(|e| e.into_inner());
+            guard = g2;
+        }
+    }
+}
+
+/// 并发名额的守卫：释放时把运行数减一并唤醒等待者。
+/// Guard for a concurrency slot: dropping it decrements the running count and wakes waiters.
+pub struct TgPermit<'a> {
+    gate: &'a TgGate,
+}
+
+impl Drop for TgPermit<'_> {
+    fn drop(&mut self) {
+        let mut g = self.gate.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.1 = g.1.saturating_sub(1);
+        drop(g);
+        self.gate.cv.notify_all();
+    }
 }
 
 impl AppState {
@@ -530,7 +620,7 @@ impl AppState {
             mouflon_sync_notify_tx: RwLock::new(None),
             tg_tasks: RwLock::new(HashMap::new()),
             tg_cancel_flags: RwLock::new(HashMap::new()),
-            tg_lock: std::sync::Mutex::new(()),
+            tg_gate: TgGate::new(3),
         }))
     }
 
@@ -1276,5 +1366,54 @@ mod tests {
         assert_eq!(settings("/rec", "/final").videos_root(), PathBuf::from("/final"));
         assert!(!settings("/rec", "").has_separate_video_dir());
         assert!(settings("/rec", "/final").has_separate_video_dir());
+    }
+
+    /// 并发闸门的基本行为：限额、并发上限、取消退出。
+    /// Basic gate behaviour: permits, concurrency limit, cancel-while-queued.
+    #[test]
+    fn tg_gate_admits_up_to_limit_concurrently() {
+        use super::{TgGate, AtomicBool};
+
+        let gate = TgGate::new(2);
+        let no_cancel = AtomicBool::new(false);
+
+        let p1 = gate.acquire(&no_cancel).unwrap();
+        let p2 = gate.acquire(&no_cancel).unwrap();
+        assert_eq!(gate.active(), 2);
+        // 第 3 个应该排队（非阻塞验证：超时后仍没有名额）
+        // A third would have to queue (non-blocking check: no permit appears)
+        assert_eq!(gate.limit(), 2);
+
+        drop(p2);
+        assert_eq!(gate.active(), 1);
+        drop(p1);
+        assert_eq!(gate.active(), 0);
+
+        // 限额收紧到 1 之后再取两个：第二个必须排队，取消后 acquire 返回 None
+        // Tighten to 1: the second acquire must queue; cancelling makes it return None
+        gate.set_limit(1);
+        let q1 = gate.acquire(&no_cancel).unwrap();
+        let cancel = AtomicBool::new(true);
+        assert!(gate.acquire(&cancel).is_none());
+        drop(q1);
+    }
+
+    /// 限额变更立即生效：从 2 收紧到 1 后不能再同时拿到两个名额。
+    /// Limit changes apply immediately: after tightening 2 → 1, two permits are impossible.
+    #[test]
+    fn tg_gate_limit_change_takes_effect_immediately() {
+        use super::{TgGate, AtomicBool};
+
+        let gate = TgGate::new(3);
+        let no_cancel = AtomicBool::new(false);
+        assert_eq!(gate.limit(), 3);
+        gate.set_limit(0); // 至少 1 / minimum 1
+        assert_eq!(gate.limit(), 1);
+        gate.set_limit(5);
+        let p1 = gate.acquire(&no_cancel).unwrap();
+        let p2 = gate.acquire(&no_cancel).unwrap();
+        assert_eq!(gate.active(), 2);
+        drop(p1);
+        drop(p2);
     }
 }

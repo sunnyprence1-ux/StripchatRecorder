@@ -146,6 +146,8 @@ export interface TgSendOptions {
 	sendCover?: boolean;
 	/** 先把封面图单独发出去，再发视频 / Post the cover image on its own before the video */
 	coverFirst?: boolean;
+	/** 同时上传的文件数量（1 = 逐个排队，>1 = 并发上传）/ Concurrent uploads (1 = one by one) */
+	batchSize?: number;
 }
 
 /**
@@ -163,6 +165,8 @@ export interface TgSendDefaults {
 	sendCaption: boolean;
 	sendCover: boolean;
 	coverFirst: boolean;
+	/** 默认的同时上传数量 / Default concurrent-upload count */
+	batchSize: number;
 	account: string;
 	hasAccount: boolean;
 	inPipeline: boolean;
@@ -177,8 +181,10 @@ export async function fetchTelegramDefaults(): Promise<TgSendDefaults> {
 }
 
 /**
- * 发送一个或多个视频到 Telegram（后端串行执行）。
- * Send one or more videos to Telegram (the backend runs them one at a time).
+ * 发送一个或多个视频到 Telegram。每次调用都会带上同样的覆盖参数（含并发数量），
+ * 后端按 batchSize 控制同时运行的上传数量，其余排队。
+ * Send one or more videos to Telegram. Every call carries the same overrides (including
+ * the concurrency count); the backend runs at most batchSize uploads at once, the rest queue.
  *
  * @param paths - 要发送的视频路径列表 / Video paths to send
  * @param opts - 覆盖参数 / Override options

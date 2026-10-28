@@ -329,24 +329,29 @@ pub fn send_inner(req: SendRequest, emitter: &Arc<dyn Emitter>, state: &Arc<AppS
         &serde_json::json!({ "path": path_str, "chatId": chat_id }),
     );
 
-    // 串行上传：多个大文件同时上传会把上行带宽切碎，也会让 Telegram 触发限流
-    // Serialise uploads: concurrent large files fragment the uplink and trip Telegram's rate limits
-    let _guard = state.tg_lock.lock().unwrap_or_else(|e| e.into_inner());
-
-    // 排队期间可能已被取消 / The task may have been cancelled while queued
-    if cancel.load(Ordering::Relaxed) {
-        state.tg_task_finish(&path_str, "cancelled", "cancelled");
-        emitter.emit(
-            "telegram-send-done",
-            &serde_json::json!({
-                "path": path_str,
-                "success": false,
-                "cancelled": true,
-                "message": "cancelled",
-            }),
-        );
-        return;
+    // 并发上传：同一时刻最多 batch_size 个上传，其余排队（发送对话框里可调）。
+    // 正在运行的上传不会被压缩；取消排队中的任务立即生效。
+    // Concurrent uploads: at most `batch_size` at once, the rest queue (set in the send dialog).
+    // In-flight uploads are never squeezed; cancelling a queued task takes effect immediately.
+    if let Some(n) = req.batch_size {
+        state.tg_gate.set_limit(n.max(1) as usize);
     }
+    let _permit = match state.tg_gate.acquire(&cancel) {
+        Some(p) => p,
+        None => {
+            state.tg_task_finish(&path_str, "cancelled", "cancelled");
+            emitter.emit(
+                "telegram-send-done",
+                &serde_json::json!({
+                    "path": path_str,
+                    "success": false,
+                    "cancelled": true,
+                    "message": "cancelled",
+                }),
+            );
+            return;
+        }
+    };
 
     let video = std::path::PathBuf::from(&path_str);
     let result = run_module_once(
@@ -580,6 +585,7 @@ mod tests {
             account: "auto".to_string(),
             has_account: false,
             in_pipeline: !params.is_empty(),
+            batch_size: params.get("batch_size").and_then(|v| v.as_u64()).unwrap_or(3) as u32,
         }
     }
 

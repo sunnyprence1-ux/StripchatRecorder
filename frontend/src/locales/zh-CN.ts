@@ -390,6 +390,8 @@ export default {
 		chatIdPlaceholder: "-100xxxxxxxxxx",
 		chatIdHint: "私有群组没有 username，只填数字 ID 即可；超级群组形如 -100xxxxxxxxxx。",
 		advanced: "高级选项",
+		batchSize: "同时上传数量",
+		batchSizeHint: "多少个文件同时上传（1–10）。",
 		username: "群组 Username",
 		usernamePlaceholder: "mygroup（仅公开群组）",
 		sendVideo: "同时发送视频文件",

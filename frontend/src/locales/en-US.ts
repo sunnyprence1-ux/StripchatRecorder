@@ -393,6 +393,8 @@ export default {
 		chatIdPlaceholder: "-100xxxxxxxxxx",
 		chatIdHint: "Private groups have no username — use the numeric ID only. Supergroups look like -100xxxxxxxxxx.",
 		advanced: "Advanced options",
+		batchSize: "Concurrent uploads",
+		batchSizeHint: "How many files upload at the same time (1–10).",
 		username: "Group username",
 		usernamePlaceholder: "mygroup (public groups only)",
 		sendVideo: "Also send the video file",

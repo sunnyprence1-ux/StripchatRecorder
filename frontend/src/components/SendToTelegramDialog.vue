@@ -52,6 +52,8 @@
 		sendCaption: false,
 		sendCover: true,
 		coverFirst: true,
+		/** 同时上传的文件数量（1 = 逐个，>1 = 并发）/ Concurrent upload count */
+		batchSize: 3,
 	});
 
 	/** 是否正在加载默认值 / Whether the defaults are loading */
@@ -127,6 +129,7 @@
 			form.sendCaption = d.sendCaption ?? false;
 			form.sendCover = d.sendCover ?? true;
 			form.coverFirst = d.coverFirst ?? true;
+			form.batchSize = d.batchSize && d.batchSize > 0 ? d.batchSize : 3;
 		} catch {
 			// 读取默认值失败不阻塞发送：用户仍可手动填写群组 ID
 			// Failing to read defaults doesn't block sending: the user can still type a chat id
@@ -169,6 +172,7 @@
 			sendCaption: form.sendCaption,
 			sendCover: form.sendCover,
 			coverFirst: form.coverFirst,
+			batchSize: Math.max(1, Math.min(10, Math.floor(form.batchSize) || 1)),
 		});
 	}
 
@@ -318,6 +322,27 @@
 					</button>
 
 					<div v-if="showAdvanced" class="flex flex-col gap-3 rounded-md border p-3">
+						<div v-if="paths.length > 1" class="flex flex-col gap-2">
+							<Label for="tg-batch-size" class="text-xs">{{
+								t("telegram.batchSize")
+							}}</Label>
+							<div class="flex items-center gap-2">
+								<Input
+									id="tg-batch-size"
+									v-model.number="form.batchSize"
+									type="number"
+									inputmode="numeric"
+									min="1"
+									max="10"
+									step="1"
+									class="w-24"
+									:disabled="loading || sending"
+								/>
+								<span class="text-[11px] text-muted-foreground">{{
+									t("telegram.batchSizeHint")
+								}}</span>
+							</div>
+						</div>
 						<div class="flex flex-col gap-2">
 							<Label for="tg-username" class="text-xs">{{ t("telegram.username") }}</Label>
 							<Input
