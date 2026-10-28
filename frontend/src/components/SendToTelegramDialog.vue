@@ -309,6 +309,28 @@
 						<p class="text-[11px] text-muted-foreground">{{ t("telegram.chatIdHint") }}</p>
 					</div>
 
+					<div class="flex flex-col gap-2">
+						<Label for="tg-batch-size" class="text-xs">{{
+							t("telegram.batchSize")
+						}}</Label>
+						<div class="flex items-center gap-2">
+							<Input
+								id="tg-batch-size"
+								v-model.number="form.batchSize"
+								type="number"
+								inputmode="numeric"
+								min="1"
+								max="10"
+								step="1"
+								class="w-24"
+								:disabled="loading || sending"
+							/>
+							<span class="text-[11px] text-muted-foreground">{{
+								t("telegram.batchSizeHint")
+							}}</span>
+						</div>
+					</div>
+
 					<button
 						type="button"
 						class="flex items-center gap-1 text-xs text-muted-foreground self-start"
@@ -322,27 +344,6 @@
 					</button>
 
 					<div v-if="showAdvanced" class="flex flex-col gap-3 rounded-md border p-3">
-						<div v-if="paths.length > 1" class="flex flex-col gap-2">
-							<Label for="tg-batch-size" class="text-xs">{{
-								t("telegram.batchSize")
-							}}</Label>
-							<div class="flex items-center gap-2">
-								<Input
-									id="tg-batch-size"
-									v-model.number="form.batchSize"
-									type="number"
-									inputmode="numeric"
-									min="1"
-									max="10"
-									step="1"
-									class="w-24"
-									:disabled="loading || sending"
-								/>
-								<span class="text-[11px] text-muted-foreground">{{
-									t("telegram.batchSizeHint")
-								}}</span>
-							</div>
-						</div>
 						<div class="flex flex-col gap-2">
 							<Label for="tg-username" class="text-xs">{{ t("telegram.username") }}</Label>
 							<Input
