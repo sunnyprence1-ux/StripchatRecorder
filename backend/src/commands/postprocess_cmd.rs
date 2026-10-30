@@ -35,10 +35,11 @@ pub fn run_postprocess_for_path(
 }
 
 /// 后处理流水线执行的核心实现（同步，在阻塞线程中调用）。
-/// 获取串行锁 → 检查取消标志 → 执行流水线 → 上报进度和结果。
+/// 获取并发名额 → 检查取消标志 → 执行流水线 → 上报进度和结果。
+/// 名额上限由 `pp_concurrency` 设置控制（默认 3），可与上传并发数独立调整。
 ///
 /// Core implementation of post-processing pipeline execution (synchronous, called in a blocking thread).
-/// Acquires serial lock → checks cancel flag → runs pipeline → reports progress and results.
+/// Acquires a concurrency slot (from `pp_gate`, limit = `pp_concurrency`, default 3) → checks cancel flag → runs pipeline → reports progress and results.
 pub fn run_postprocess_for_path_inner(
     video_path: &std::path::Path,
     pipeline: &PipelineConfig,
@@ -47,17 +48,37 @@ pub fn run_postprocess_for_path_inner(
 ) {
     let path_str = video_path.to_string_lossy().to_string();
 
-    // 获取串行锁，确保同一时刻只有一个后处理任务运行
-    // Acquire serial lock to ensure only one post-processing task runs at a time
-    let _pp_guard = state.pp_lock.lock().unwrap_or_else(|e| e.into_inner());
+    // 先创建取消标志（供 gate 等待时检查，也供后续流程复用）
+    // Create cancel flag first (checked while gate waits; reused by the pipeline below)
+    let cancel_flag = state.pp_task_make_cancel_flag(&path_str);
 
-    // 检查是否在等待锁期间已被取消 / Check if cancelled while waiting for the lock
-    let already_cancelled = state
-        .pp_cancel_flags
-        .read()
-        .get(&path_str)
-        .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
-        .unwrap_or(false);
+    // 获取并发名额（取代原来的串行 pp_lock）：同一时刻最多 pp_concurrency 个后处理/上传
+    // 任务运行，其余排队（等待时每秒检查取消标志，取消排队中的任务即时生效）。
+    // Get a concurrency slot instead of the old serial `pp_lock`: at most
+    // `pp_concurrency` post-processing/upload tasks run at once, others queue.
+    // While waiting, the cancel flag is checked every second, so cancelling a queued
+    // task takes effect immediately.
+    let gate = &state.pp_gate;
+    let _permit = match gate.acquire(&cancel_flag) {
+        Some(p) => p,
+        None => {
+            state.pp_task_finish(&path_str, false);
+            emitter.emit(
+                "postprocess-done",
+                &serde_json::json!({ "path": path_str, "results": [{
+                    "nodeId": "",
+                    "moduleId": "pipeline",
+                    "success": false,
+                    "message": "cancelled while waiting for a slot",
+                    "output": null,
+                }]}),
+            );
+            return;
+        }
+    };
+
+    // 检查是否在等待名额期间已被取消 / Check if cancelled while waiting for the slot
+    let already_cancelled = cancel_flag.load(std::sync::atomic::Ordering::Relaxed);
     if already_cancelled {
         state.pp_task_clear_cancel_flag(&path_str);
         state.pp_tasks.write().remove(&path_str);
@@ -132,7 +153,6 @@ pub fn run_postprocess_for_path_inner(
     let total = effective_pipeline.nodes.iter().filter(|n| n.enabled).count();
 
     state.pp_task_start(&path_str, total);
-    let cancel_flag = state.pp_task_make_cancel_flag(&path_str);
     emitter.emit(
         "postprocess-started",
         &serde_json::json!({ "path": path_str }),

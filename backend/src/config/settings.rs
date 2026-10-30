@@ -137,6 +137,10 @@ pub struct Settings {
     /// Whether the first-launch setup wizard has been completed (false = show Setup page)
     #[serde(default)]
     pub setup_done: bool,
+    /// 后处理并发上限（同一时刻最多运行几个后处理流水线/上传）/ Max concurrent post-processing
+    /// tasks (pipelines + Telegram uploads) running at once (1 = serial, higher = parallel).
+    #[serde(default = "default_pp_concurrency")]
+    pub pp_concurrency: usize,
 }
 
 /// Mouflon 同步地址的默认值 / Default value for Mouflon sync URL
@@ -167,6 +171,11 @@ fn default_language() -> String {
 /// Server 端口的默认值 / Default value for server port
 fn default_server_port() -> u16 {
     3030
+}
+
+/// 后处理并发的默认值（3）/ Default post-processing concurrency
+fn default_pp_concurrency() -> usize {
+    3
 }
 
 /// 返回可执行文件所在目录，用于定位配置文件和模块目录。
@@ -283,6 +292,7 @@ impl Default for Settings {
             mouflon_sync_url: default_mouflon_sync_url(),
             mouflon_sync_token: None,
             setup_done: false,
+            pp_concurrency: default_pp_concurrency(),
         }
     }
 }
@@ -448,11 +458,16 @@ pub struct AppState {
     pub pp_tasks: RwLock<HashMap<String, PpTaskStatus>>,
     /// 后处理取消标志（文件路径 -> 原子布尔）/ Post-processing cancel flags (file path -> atomic bool)
     pub pp_cancel_flags: RwLock<HashMap<String, Arc<AtomicBool>>>,
-    /// 后处理串行锁，确保同一时刻只有一个后处理任务运行 / Serial lock ensuring only one post-processing task runs at a time
-    pub pp_lock: std::sync::Mutex<()>,
+    /// 后处理并发闸门：限制同时运行的后处理流水线数量。
+    /// 后处理包含分钟级的 Telegram 上传；串行执行会让合并/上传互相排队。
+    /// 上限通过设置 `pp_concurrency` 调整（默认 3，在载入设置时生效）。
+    /// Concurrency gate for post-processing: bounds how many pipeline runs execute
+    /// simultaneously. Post-processing includes minutes-long Telegram uploads; a
+    /// serial lock made merges and uploads queue behind each other. The limit is
+    /// adjustable via the `pp_concurrency` setting (default 3, applied on load).
+    pub pp_gate: TgGate,
     /// 启动合并锁，防止启动时的合并与正常录制并发 / Startup merge lock preventing concurrent startup merge and normal recording
-    pub startup_lock: std::sync::Mutex<()>,
-    /// 通知监控器 poll_interval_secs 已变更的发送端（可选，启动后注入）
+    pub startup_lock: std::sync::Mutex<()>,    /// 通知监控器 poll_interval_secs 已变更的发送端（可选，启动后注入）
     /// Sender to notify the monitor that poll_interval_secs has changed (optional, injected after startup)
     pub poll_interval_notify_tx: RwLock<Option<tokio::sync::mpsc::Sender<()>>>,
     /// 通知 Mouflon 同步调度器立即触发同步的发送端（可选，启动后注入）
@@ -604,6 +619,7 @@ impl AppState {
             })
             .unwrap_or_default();
 
+        let pp_concurrency = settings.pp_concurrency.max(1);
         let data = AppData { settings, streamers, mouflon_keys, pipeline, pp_results };
 
         fs::create_dir_all(&data.settings.output_dir)?;
@@ -614,7 +630,7 @@ impl AppState {
             config_dir,
             pp_tasks: RwLock::new(HashMap::new()),
             pp_cancel_flags: RwLock::new(HashMap::new()),
-            pp_lock: std::sync::Mutex::new(()),
+            pp_gate: TgGate::new(pp_concurrency),
             startup_lock: std::sync::Mutex::new(()),
             poll_interval_notify_tx: RwLock::new(None),
             mouflon_sync_notify_tx: RwLock::new(None),

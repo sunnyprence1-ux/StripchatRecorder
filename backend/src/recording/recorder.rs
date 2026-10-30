@@ -298,6 +298,12 @@ impl RecorderManager {
             crate::recording::meta::set_status(&settings, &merged_path, "merging_waiting");
         }
 
+        // 后处理线程句柄：合并线程内 spawn，此处 join。
+        // Postprocess thread handles: spawned inside the merge thread, joined here.
+        let pp_handles: Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pp_handles_inner = Arc::clone(&pp_handles);
+
         let video_duration_secs = tokio::task::spawn_blocking(move || {
             let _startup_guard = state_clone
                 .startup_lock
@@ -341,25 +347,47 @@ impl RecorderManager {
                 .write()
                 .remove(&session_dir_clone);
 
-            if duration.is_some() {
-                if merged_path_clone.exists() {
-                    let pipeline = state_clone.get_pipeline();
-                    if !pipeline.nodes.is_empty() {
-                        // 有后处理流水线：status → "pp_waiting"（由 run_postprocess_for_path 设置）
-                        // Has pipeline: status → "pp_waiting" (set by run_postprocess_for_path)
-                        crate::commands::postprocess_cmd::run_postprocess_for_path(
-                            &merged_path_clone,
-                            &pipeline,
-                            &emitter_clone,
-                            &state_clone,
-                        );
-                    } else {
-                        // 无后处理流水线：直接标记为 finish
-                        // No pipeline: mark as finish directly
-                        crate::recording::meta::set_status(&merge_settings, &merged_path_clone, "finish");
-                    }
+            // 有流水线时：先释放 startup_lock 再启动后处理——后处理包含分钟级
+            // 的 Telegram 上传，若在锁内运行，其他录制的合并会被上传阻塞
+            // （表现为卡在 "waiting for merge"）。
+            // With a pipeline: release startup_lock *before* starting post-processing —
+            // post-processing includes minutes-long Telegram uploads; running it inside
+            // the lock blocks other recordings' merges (stuck at "waiting for merge").
+            let pipeline_non_empty = {
+                let pipeline = state_clone.get_pipeline();
+                !pipeline.nodes.is_empty()
+            };
+            drop(_startup_guard);
+            if pipeline_non_empty && duration.is_some() && merged_path_clone.exists() {
+                let pp_state = Arc::clone(&state_clone);
+                let pp_emitter = Arc::clone(&emitter_clone);
+                let pp_merged_path = merged_path_clone.clone();
+                let handle = std::thread::spawn(move || {
+                    // 有后处理流水线：status → "pp_waiting"（由 run_postprocess_for_path 设置）
+                    // Has pipeline: status → "pp_waiting" (set by run_postprocess_for_path)
+                    let pipeline = pp_state.get_pipeline();
+                    crate::commands::postprocess_cmd::run_postprocess_for_path(
+                        &pp_merged_path,
+                        &pipeline,
+                        &pp_emitter,
+                        &pp_state,
+                    );
+                });
+                pp_handles_inner.lock().unwrap_or_else(|e| e.into_inner()).push(handle);
+            }
+
+            if pipeline_non_empty {
+                // 有后处理流水线：后处理完成后由 pipeline/finish 逻辑处理状态
+                // （已在上面 spawn 的线程内处理）。此处无需额外动作。
+                // Has pipeline: post-processing thread handles the status transitions.
+                if duration.is_some() && merged_path_clone.exists() {
+                    // 已进入后处理队列，等待其完成 / Queued for post-processing
                 }
-            } else {
+            } else if duration.is_some() && merged_path_clone.exists() {
+                // 无后处理流水线：直接标记为 finish
+                // No pipeline: mark as finish directly
+                crate::recording::meta::set_status(&merge_settings, &merged_path_clone, "finish");
+            } else if duration.is_none() {
                 // 合并失败（无分片或 ffmpeg 出错）：删除孤立的 meta 文件和空会话目录，
                 // 避免 meta 永久卡在 "merging" 状态。
                 // Merge failed (no segments or ffmpeg error): delete orphaned meta file and
@@ -384,6 +412,15 @@ impl RecorderManager {
         })
         .await
         .unwrap_or(None);
+
+        // 等待本会话的后处理线程结束（后处理自身有自己的并发闸门）
+        // Wait for this session's postprocess thread (postprocess has its own concurrency gate)
+        let handles: Vec<std::thread::JoinHandle<()>> = std::mem::take(
+            &mut *pp_handles.lock().unwrap_or_else(|e| e.into_inner()),
+        );
+        for handle in handles {
+            let _ = handle.join();
+        }
 
         let merged_video_path = merged_path.to_string_lossy().to_string();
         emitter.emit(

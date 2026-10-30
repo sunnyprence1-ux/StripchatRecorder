@@ -102,7 +102,7 @@ pub fn find_module() -> Option<ModuleInfo> {
 
 /// 读取流水线中 Telegram 节点的参数作为默认值。
 /// Read the Telegram node's parameters from the pipeline as defaults.
-fn pipeline_params(state: &AppState) -> HashMap<String, serde_json::Value> {
+pub(crate) fn pipeline_params(state: &AppState) -> HashMap<String, serde_json::Value> {
     let pipeline = state.get_pipeline();
     pipeline
         .nodes
@@ -113,7 +113,7 @@ fn pipeline_params(state: &AppState) -> HashMap<String, serde_json::Value> {
 }
 
 /// 取参数中的字符串值 / Read a string parameter value
-fn param_str(params: &HashMap<String, serde_json::Value>, key: &str) -> String {
+pub(crate) fn param_str(params: &HashMap<String, serde_json::Value>, key: &str) -> String {
     match params.get(key) {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Null) | None => String::new(),
@@ -691,4 +691,50 @@ mod tests {
         assert_eq!(merged.get("send_cover"), None);
         let _ = std::fs::remove_file(&tmp);
     }
+}
+
+/// 刷新 Telegram 会话（不重新登录，不输入验证码）。
+///
+/// Spawns the notify_telegram module in `--refresh` mode: it re-opens the
+/// existing session file, re-syncs the auth key and peer cache, and exits.
+/// No phone number / code is needed (the session must already be authorized).
+///
+/// 返回 (success, stdout, stderr) / Returns (success, stdout, stderr).
+pub fn run_refresh(exe: &std::path::Path, api_id: &str, proxy: &str) -> (bool, String, String) {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    let mut cmd = Command::new(exe);
+    cmd.arg("--refresh");
+    cmd.env("PP_API_ID", api_id);
+    if !proxy.is_empty() {
+        cmd.env("PP_PROXY", proxy);
+    }
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return (false, String::new(), format!("failed to spawn: {}", e)),
+    };
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines().flatten() {
+            stdout.push_str(&line);
+            stdout.push('\n');
+        }
+    }
+    if let Some(err) = child.stderr.take() {
+        for line in BufReader::new(err).lines().flatten() {
+            stderr.push_str(&line);
+            stderr.push('\n');
+        }
+    }
+
+    let status = child.wait();
+    let ok = status.is_ok_and(|s| s.success());
+    (ok, stdout, stderr)
 }

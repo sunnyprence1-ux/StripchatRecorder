@@ -176,6 +176,7 @@ pub fn build_router(state: ServerState) -> Router {
         .route("/api/telegram/send/cancel", post(telegram_send_cancel))
         .route("/api/telegram/tasks", get(telegram_tasks))
         .route("/api/telegram/tasks/dismiss", post(telegram_tasks_dismiss))
+        .route("/api/telegram/relogin", post(telegram_relogin))
         .route("/api/locale/{locale_code}", get(get_locale_handler))
         .route("/api/locales", get(list_locales_handler))
         .route("/api/files", get(serve_output_file))
@@ -875,6 +876,65 @@ async fn telegram_tasks_dismiss(
 ) -> ApiResult<serde_json::Value> {
     s.app_state.tg_task_remove(&body.path);
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// 刷新 Telegram 会话 / Refresh the Telegram session (re-login without re-entering the code)
+///
+/// Spawns the notify_telegram module in `--refresh` mode: it re-opens the
+/// existing session file, re-syncs the auth key and peer cache, and exits.
+/// No phone number / code is needed (the session must already be authorized).
+async fn telegram_relogin(AxumState(s): AxumState<ServerState>) -> ApiResult<serde_json::Value> {
+    let state = Arc::clone(&s.app_state);
+    let params = crate::commands::telegram_cmd::pipeline_params(&state);
+    let api_id = crate::commands::telegram_cmd::param_str(&params, "api_id");
+    let proxy = crate::commands::telegram_cmd::param_str(&params, "proxy");
+    let module = crate::commands::telegram_cmd::find_module();
+
+    if api_id.is_empty() {
+        if let Some(m) = module {
+            return Ok(Json(serde_json::json!({
+                "ok": false,
+                "message": "No api_id configured. Run the module with --login first: notify_telegram --login",
+                "moduleName": m.name,
+            })));
+        }
+        return Ok(Json(serde_json::json!({
+            "ok": false,
+            "message": "Telegram module not installed",
+        })));
+    }
+
+    if let Some(module) = module {
+        let exe = module.exe_path.clone();
+        let api_id = api_id.clone();
+        let proxy = proxy.clone();
+        let (success, stdout, stderr) = tokio::task::spawn_blocking(move || {
+            crate::commands::telegram_cmd::run_refresh(&exe, &api_id, &proxy)
+        })
+        .await
+        .map_err(|e| ApiError(e.to_string()))?;
+
+        if success {
+            Ok(Json(serde_json::json!({
+                "ok": true,
+                "message": "Session refreshed",
+                "stdout": stdout,
+                "stderr": stderr,
+            })))
+        } else {
+            Ok(Json(serde_json::json!({
+                "ok": false,
+                "message": stderr.trim().to_string(),
+                "stdout": stdout,
+                "stderr": stderr,
+            })))
+        }
+    } else {
+        Ok(Json(serde_json::json!({
+            "ok": false,
+            "message": "Telegram module not installed",
+        })))
+    }
 }
 
 async fn save_pipeline(

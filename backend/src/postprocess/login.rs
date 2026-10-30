@@ -469,3 +469,118 @@ mod tests {
         assert_ne!(a, b);
     }
 }
+
+/// 刷新 Telegram 会话（非交互式）。
+///
+/// 运行模块的 `--refresh` 参数：重新打开已授权的用户会话，强制同步 peer 缓存
+/// 并刷新认证密钥。不需要手机号/验证码；会话未授权时会返回明确的错误提示。
+///
+/// Refresh a Telegram session (non-interactive).
+///
+/// Runs the module with `--refresh`: re-opens an authorized user session,
+/// force-syncs the peer cache, and refreshes the auth key. No phone number/
+/// verification code needed; if the session is not authorized, returns a clear
+/// error hint instead of leaving the user guessing.
+///
+/// Returns `RefreshStatus::Ok` when the session refreshed successfully, `RefreshStatus::NotAuthorized`
+/// when the session file exists but is not signed in, or `RefreshStatus::Error(String)` otherwise.
+pub fn refresh_session(module: &ModuleInfo, api_id: i32, proxy: &str) -> Result<RefreshStatus, String> {
+    if !module.loginable {
+        return Err(format!("模块 '{}' 不支持登录", module.id));
+    }
+
+    let mut cmd = Command::new(&module.exe_path);
+    cmd.arg("--refresh")
+        .env("PP_EXE_DIR", exe_dir())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("api_id", api_id.to_string())
+        .env("proxy", proxy);
+
+    let mut child = cmd.spawn().map_err(|e| format!("启动刷新失败: {}", e))?;
+    let (tx, mut rx) = mpsc::channel::<Event>();
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    if let Some(stdout) = stdout {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(Event::Line(false, line)).is_err() {
+                    return;
+                }
+            }
+            let _ = tx.send(Event::Eof);
+        });
+    }
+    if let Some(stderr) = stderr {
+        let tx_s = tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if tx_s.send(Event::Line(true, line)).is_err() {
+                    return;
+                }
+            }
+            let _ = tx_s.send(Event::Eof);
+        });
+    }
+    drop(tx);
+
+    let mut result = RefreshStatus::Ok(String::new());
+    loop {
+        match rx.recv() {
+            Ok(Event::Line(false, line)) => {
+                if let Some(stripped) = line.strip_prefix("LOGIN_STATE:") {
+                    if stripped.starts_with("refreshed:") {
+                        result = RefreshStatus::Ok(stripped["refreshed:".len()..].to_string());
+                        break;
+                    }
+                }
+            }
+            Ok(Event::Line(true, line)) => {
+                if !line.is_empty() {
+                    result = RefreshStatus::Error(line);
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+        }
+    }
+
+    if let Err(e) = child.wait() {
+        if let RefreshStatus::Ok(_) = result {
+            result = RefreshStatus::Error(format!("刷新进程退出失败: {}", e));
+        }
+    }
+
+    Ok(result)
+}
+
+/// 刷新会话的结果 / Refresh session result
+#[derive(Debug, Clone)]
+pub enum RefreshStatus {
+    /// 成功，值为刷新后的用户摘要
+    /// Success; the value is the refreshed user summary
+    Ok(String),
+    /// 会话未授权
+    /// Session exists but is not authorized
+    NotAuthorized,
+    /// 错误
+    /// Error
+    Error(String),
+}
+
+impl RefreshStatus {
+    pub fn is_ok(&self) -> bool {
+        matches!(self, RefreshStatus::Ok(_))
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            RefreshStatus::Ok(user) => format!("已刷新会话：{}", user),
+            RefreshStatus::NotAuthorized => "会话文件存在但未登录（未授权）。请先登录 Telegram 账号".to_string(),
+            RefreshStatus::Error(e) => e.clone(),
+        }
+    }
+}

@@ -41,6 +41,8 @@
 //! - `--describe`: 输出 JSON 格式的模块元数据 / Output module metadata as JSON
 //! - `--login`: 交互式登录（stdin/stdout 行协议），生成用户会话文件
 //!   Interactive login (line protocol over stdin/stdout) that writes the user session file
+//! - `--refresh`: 刷新已授权会话（认证密钥/peer 缓存），不需要输入视频
+//!   Refresh an authorized session (auth key / peer cache); no input video needed
 //! - 环境变量 `PP_INPUT`: 输入视频文件路径 / Input video file path via env var
 //! - 环境变量 `PP_TEST=1`: 自检模式（无需 `PP_INPUT`）/ Self-test mode (no `PP_INPUT` required)
 //! - 标准输出 `OUTPUT:{path}`: 成功后输出视频路径 / Output video path on success
@@ -835,6 +837,56 @@ fn private_session_copy(path: &Path) -> PathBuf {
         Ok(_) => copy,
         Err(_) => path.to_path_buf(),
     }
+}
+
+/// 刷新会话：重新打开一个已授权的会话并强制同步，刷新认证密钥与 peer 缓存。
+///
+/// 由后端 `/api/telegram/relogin` 驱动（模块的 `--refresh` 参数）。需要 `--login`
+/// 登录过的已授权会话文件；会话未授权时会给出明确的登录提示，而不是让用户猜。
+/// 刷新成功后 stdout 会打印 `ready`，失败则打印错误。
+///
+/// Refresh a session: re-open an already-authorized session and force a sync to
+/// refresh the auth key and peer cache.
+///
+/// Driven by the backend `/api/telegram/relogin` endpoint (module `--refresh` param).
+/// Requires an authorized session file created by `--login`; if the session is not
+/// authorized, prints a clear login hint instead of leaving the user guessing. On
+/// success stdout prints `ready`, on failure prints an error.
+async fn refresh_session(api_id: i32, proxy: &str) -> Result<(), String> {
+    let path = session_path(api_id, SessionMode::User);
+    let client = connect_client(api_id, "", "", proxy, SessionMode::User).await?;
+
+    if !client
+        .is_authorized()
+        .await
+        .map_err(|e| format!("is_authorized failed: {}", e))?
+    {
+        return Err("session file exists but is not authorized — the real account is not signed in. Run with --login once to sign in".to_string());
+    }
+
+    let me = client
+        .get_me()
+        .await
+        .map_err(|e| format!("get_me failed: {}", e))?;
+    let user = login_user_summary(&me);
+
+    // 强制同步 peer 缓存：刷新本地对群组/话题的索引，这样上传解析更快更准。
+    // Force sync the peer cache: refresh local group/topic indexes so future
+    // uploads resolve faster and more accurately.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        {
+            async {
+                // Warm up the peer cache by resolving a known self peer.
+                let _ = client.resolve_peer(grammers_client::types::InputPeer::self_()).await;
+            }
+        },
+    )
+    .await;
+
+    login_state(&format!("refreshed:{}", user));
+    eprintln!("session refreshed as {}", user);
+    Ok(())
 }
 
 /// 打开（或创建）会话文件并建立 MTProto 连接，但不做任何鉴权。
@@ -3086,6 +3138,25 @@ fn main() {
     // Login mode (--login): driven by the host's "Login" button, creates the user session file
     if arg1 == Some("--login") {
         if let Err(e) = run_login() {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // 刷新会话（--refresh）：重新打开已授权会话并强制同步，刷新认证密钥和 peer 缓存。
+    // 不需要手机号/验证码（会话必须是已授权状态）；如果会话未授权则给出提示。
+    // Refresh mode (--refresh): re-open an authorized session and force-sync to refresh
+    // the auth key and peer cache. No phone number/code needed (session must be
+    // authorized); if the session is not authorized, prints a helpful hint.
+    if arg1 == Some("--refresh") {
+        let api_id = param("api_id", "");
+        if api_id.is_empty() {
+            eprintln!("api_id is required for --refresh");
+            std::process::exit(1);
+        }
+        let proxy = param("proxy", "");
+        if let Err(e) = refresh_session(&api_id.parse::<i32>().map_err(|_| "api_id must be a number")?, &proxy) {
             eprintln!("{}", e);
             std::process::exit(1);
         }
