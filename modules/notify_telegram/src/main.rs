@@ -870,20 +870,6 @@ async fn refresh_session(api_id: i32, proxy: &str) -> Result<(), String> {
         .map_err(|e| format!("get_me failed: {}", e))?;
     let user = login_user_summary(&me);
 
-    // 强制同步 peer 缓存：刷新本地对群组/话题的索引，这样上传解析更快更准。
-    // Force sync the peer cache: refresh local group/topic indexes so future
-    // uploads resolve faster and more accurately.
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        {
-            async {
-                // Warm up the peer cache by resolving a known self peer.
-                let _ = client.resolve_peer(grammers_client::types::InputPeer::self_()).await;
-            }
-        },
-    )
-    .await;
-
     login_state(&format!("refreshed:{}", user));
     eprintln!("session refreshed as {}", user);
     Ok(())
@@ -3138,25 +3124,6 @@ fn main() {
     // Login mode (--login): driven by the host's "Login" button, creates the user session file
     if arg1 == Some("--login") {
         if let Err(e) = run_login() {
-            eprintln!("{}", e);
-            std::process::exit(1);
-        }
-        return;
-    }
-
-    // 刷新会话（--refresh）：重新打开已授权会话并强制同步，刷新认证密钥和 peer 缓存。
-    // 不需要手机号/验证码（会话必须是已授权状态）；如果会话未授权则给出提示。
-    // Refresh mode (--refresh): re-open an authorized session and force-sync to refresh
-    // the auth key and peer cache. No phone number/code needed (session must be
-    // authorized); if the session is not authorized, prints a helpful hint.
-    if arg1 == Some("--refresh") {
-        let api_id = param("api_id", "");
-        if api_id.is_empty() {
-            eprintln!("api_id is required for --refresh");
-            std::process::exit(1);
-        }
-        let proxy = param("proxy", "");
-        if let Err(e) = refresh_session(&api_id.parse::<i32>().map_err(|_| "api_id must be a number")?, &proxy) {
             eprintln!("{}", e);
             std::process::exit(1);
         }

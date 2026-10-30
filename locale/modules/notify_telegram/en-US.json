@@ -1,0 +1,48 @@
+{
+  "name": "Telegram Notification 0.5.0",
+  "description": "Send finished videos to Telegram via MTProto (files over 50 MB and HTTP/SOCKS5 proxies supported). Posts the video only by default — no text at all; the text caption and the cover image each have their own switch. Can create/reuse one group forum topic per model and post the video into it. Uses your signed-in account by default: it can list existing topics (no duplicates) and premium accounts can upload single files up to 4 GB",
+  "params": {
+    "account": {
+      "label": "Login mode (auto = your signed-in account wins / user = your account only / bot = bot account only)"
+    },
+    "api_id": {
+      "label": "API ID (from my.telegram.org)"
+    },
+    "api_hash": {
+      "label": "API Hash (bot accounts only — leave empty for a user account)"
+    },
+    "bot_token": {
+      "label": "Bot Token (from @BotFather, bot accounts only)"
+    },
+    "chat_id": {
+      "label": "Chat ID (groups and supergroups: -100xxxxxxxxxx; a private group has no username, so the id is the only way to target it)"
+    },
+    "username": {
+      "label": "Group username (optional — public groups only, e.g. mygroupname, without @; leave empty for private groups and use Chat ID)"
+    },
+    "proxy": {
+      "label": "Proxy (http:// or socks5://)"
+    },
+    "send_video": {
+      "label": "Also send video file"
+    },
+    "send_caption": {
+      "label": "Attach a text caption (model name, timestamp, duration, file name, size). With this off the message carries no text at all — just the video"
+    },
+    "send_cover": {
+      "label": "Also send the cover image (contact-sheet preview). With this off the album holds the video only"
+    },
+    "cover_first": {
+      "label": "Post the cover image on its own first, then upload and send the video. With this off the cover and the video go out together as one album message"
+    },
+    "topic_per_model": {
+      "label": "Create/reuse a group topic per model and upload into it"
+    },
+    "delete_after_send": {
+      "label": "Delete local data after a successful send (video, segments, metadata and module side files) to free server space"
+    },
+    "upload_workers": {
+      "label": "Concurrent upload parts (default 8, max 16; 0 = default). Serial uploads wait for the server to acknowledge every 512KB part; running several at once overlaps those round trips — a 12MB video measured ~1.8x faster (the uplink itself is the ceiling)"
+    }
+  }
+}
