@@ -767,26 +767,20 @@ impl AppState {
         self.save()
     }
 
-    /// 从 Cloudflare Worker 同步 Mouflon 密钥。
+    /// 从 Cloudflare Worker 或远程源同步 Mouflon 密钥。
     /// 比对 Worker 返回的 updated_at 与本地 auto_synced_at：
-    ///   - 相同 → 跳过，返回 false（无需更新）
-    ///   - 不同 → 覆盖 keys、更新 auto_synced_at，返回 true（已更新）
+    ///   - 相同 → 检查并补全缺失 key，无新 key 则返回 false（无需更新）
+    ///   - 不同 → 覆盖/更新 keys、更新 auto_synced_at，返回 true（已更新）
     ///
-    /// Sync Mouflon keys from the Cloudflare Worker.
+    /// Sync Mouflon keys from the Cloudflare Worker or remote source.
     /// Compares Worker's `updated_at` against local `auto_synced_at`:
-    ///   - Equal   → skip, return false (no update needed)
-    ///   - Different → overwrite keys, update auto_synced_at, return true (updated)
+    ///   - Equal   → supplement missing keys if any, return false if up-to-date
+    ///   - Different → insert/update keys, update auto_synced_at, return true (updated)
     pub async fn sync_mouflon_keys_from_worker(
         &self,
         worker_url: &str,
         auth_token: Option<&str>,
     ) -> Result<bool> {
-        #[derive(Deserialize)]
-        struct WorkerResponse {
-            keys: HashMap<String, String>,
-            updated_at: String,
-        }
-
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .build()
@@ -809,26 +803,35 @@ impl AppState {
             )));
         }
 
-        let body: WorkerResponse = resp
-            .json()
+        let resp_text = resp
+            .text()
             .await
-            .map_err(|e| AppError::Other(format!("Worker 响应解析失败: {}", e)))?;
+            .map_err(|e| AppError::Other(format!("Worker 响应读取失败: {}", e)))?;
 
-        // 比对 updated_at：解析为时间点后比较，避免格式差异导致误判
-        // Compare updated_at by parsing to a time point, avoiding false mismatches due to format differences
-        let worker_ts = chrono::DateTime::parse_from_rfc3339(&body.updated_at)
+        let (extracted_keys, updated_at) = parse_mouflon_worker_response(&resp_text)?;
+
+        // 比对 updated_at：
+        // 1. 若两者非空且完全相同（如相同的哈希值或版本串），视为同一版本
+        // 2. 若两者均能解析为 RFC 3339 时间戳且对应同一 UTC 时间点，视为同一版本
+        let worker_ts = chrono::DateTime::parse_from_rfc3339(&updated_at)
             .map(|dt| dt.with_timezone(&chrono::Utc))
             .ok();
 
         let same_timestamp = {
             let data = self.data.read();
-            match (&worker_ts, &data.mouflon_keys.auto_synced_at) {
-                (Some(wt), Some(local)) => {
-                    chrono::DateTime::parse_from_rfc3339(local)
-                        .map(|lt| lt.with_timezone(&chrono::Utc) == *wt)
-                        .unwrap_or(false)
+            match &data.mouflon_keys.auto_synced_at {
+                Some(local) => {
+                    if !updated_at.is_empty() && *local == updated_at {
+                        true
+                    } else if let Some(wt) = &worker_ts {
+                        chrono::DateTime::parse_from_rfc3339(local)
+                            .map(|lt| lt.with_timezone(&chrono::Utc) == *wt)
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    }
                 }
-                _ => false,
+                None => false,
             }
         };
 
@@ -836,7 +839,7 @@ impl AppState {
             // 时间戳相同，检查是否有本地缺失的 key / Same timestamp, check for locally missing keys
             let missing: Vec<(String, String)> = {
                 let data = self.data.read();
-                body.keys
+                extracted_keys
                     .iter()
                     .filter(|(pkey, _)| !data.mouflon_keys.keys.contains_key(pkey.as_str()))
                     .map(|(k, v)| (k.clone(), v.clone()))
@@ -855,17 +858,21 @@ impl AppState {
             return Ok(true);
         }
 
-        // 时间戳不同，插入本地不存在的键对，更新 auto_synced_at
-        // Different timestamp: insert missing key pairs, update auto_synced_at
+        // 时间戳不同或首次同步：更新/覆盖键对，更新 auto_synced_at
+        // Different timestamp or first sync: insert/update key pairs, update auto_synced_at
         {
-            // 将 Worker 返回的时间戳规范化为 chrono RFC 3339 格式，与 manual_updated_at 保持一致
-            // Normalize Worker timestamp to chrono RFC 3339 format, consistent with manual_updated_at
-            let normalized_at = chrono::DateTime::parse_from_rfc3339(&body.updated_at)
-                .map(|dt| dt.with_timezone(&chrono::Utc).to_rfc3339())
-                .unwrap_or(body.updated_at);
+            let normalized_at = worker_ts
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_else(|| {
+                    if updated_at.is_empty() {
+                        chrono::Utc::now().to_rfc3339()
+                    } else {
+                        updated_at.clone()
+                    }
+                });
             let mut data = self.data.write();
-            for (pkey, pdkey) in body.keys {
-                data.mouflon_keys.keys.entry(pkey).or_insert(pdkey);
+            for (pkey, pdkey) in extracted_keys {
+                data.mouflon_keys.keys.insert(pkey, pdkey);
             }
             data.mouflon_keys.auto_synced_at = Some(normalized_at);
         }
@@ -1310,6 +1317,68 @@ pub async fn schedule_mouflon_sync(
     }
 }
 
+/// 解析 Worker 返回的 Mouflon 密钥响应 JSON。
+/// 兼容多种 Worker/API 响应格式：
+/// 1. `{"pkey2pdkey": { ... }, "updated_at": "..."}`（mouflon.chantrail.com 格式）
+/// 2. `{"keys": { ... }, "updated_at": "..."}`（旧版格式）
+/// 3. `{"<pkey>": "<pdkey>", ...}`（平铺格式）
+///
+/// Parse the Mouflon key response JSON from a Worker.
+/// Compatible with various formats:
+/// 1. `{"pkey2pdkey": { ... }, "updated_at": "..."}` (mouflon.chantrail.com format)
+/// 2. `{"keys": { ... }, "updated_at": "..."}` (legacy format)
+/// 3. Flat `{"<pkey>": "<pdkey>", ...}` map
+pub fn parse_mouflon_worker_response(json_str: &str) -> Result<(HashMap<String, String>, String)> {
+    let json_val: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|e| AppError::Other(format!("Worker 响应解析失败: {}", e)))?;
+
+    let mut extracted_keys = HashMap::new();
+    let mut updated_at = String::new();
+
+    if let Some(obj) = json_val.as_object() {
+        if let Some(serde_json::Value::String(u)) = obj.get("updated_at") {
+            updated_at = u.clone();
+        }
+
+        // 1. 优先提取 pkey2pdkey 字段（mouflon.chantrail.com 格式）
+        if let Some(p2p) = obj.get("pkey2pdkey").and_then(|v| v.as_object()) {
+            for (k, v) in p2p {
+                if let Some(val_str) = v.as_str() {
+                    extracted_keys.insert(k.clone(), val_str.to_string());
+                }
+            }
+        }
+
+        // 2. 提取 keys 字段（旧版/备用格式）
+        if let Some(keys_obj) = obj.get("keys").and_then(|v| v.as_object()) {
+            for (k, v) in keys_obj {
+                if let Some(val_str) = v.as_str() {
+                    extracted_keys.insert(k.clone(), val_str.to_string());
+                }
+            }
+        }
+
+        // 3. 若既无 pkey2pdkey 也无 keys，检查是否为平铺的 pkey -> pdkey 键值对表
+        if extracted_keys.is_empty() {
+            for (k, v) in obj {
+                if k != "updated_at" && k != "pkey2keystream" {
+                    if let Some(val_str) = v.as_str() {
+                        extracted_keys.insert(k.clone(), val_str.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if extracted_keys.is_empty() {
+        return Err(AppError::Other(
+            "Worker 响应中未找到有效的 Mouflon 密钥（缺少 keys 或 pkey2pdkey）".to_string(),
+        ));
+    }
+
+    Ok((extracted_keys, updated_at))
+}
+
 #[cfg(test)]
 mod tests {
     use super::Settings;
@@ -1431,5 +1500,49 @@ mod tests {
         assert_eq!(gate.active(), 2);
         drop(p1);
         drop(p2);
+    }
+
+    /// 验证 Mouflon Worker 响应解析兼容性：支持 mouflon.chantrail.com 的 pkey2pdkey 格式与哈希 updated_at。
+    #[test]
+    fn parse_mouflon_worker_response_supports_pkey2pdkey_and_hash() {
+        use super::parse_mouflon_worker_response;
+
+        let json = r#"{
+            "pkey2pdkey": {
+                "1Dzcc6OjP73LKbtI": "Y64UVwX5RrIWnOLp",
+                "7uUnbD0jMCB9GH32": "lzCQ6QBTnLpB0zMF"
+            },
+            "pkey2keystream": {
+                "qjfc0a2Mi4ngsau6": "b8a651203a2caeca73eca302e161e30e"
+            },
+            "updated_at": "5b329ab0447ccfd1e6d49aa2892778d339ba80ba9cf8f59d3c8a832c91b48fdc"
+        }"#;
+
+        let (keys, updated_at) = parse_mouflon_worker_response(json).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys.get("1Dzcc6OjP73LKbtI"), Some(&"Y64UVwX5RrIWnOLp".to_string()));
+        assert_eq!(keys.get("7uUnbD0jMCB9GH32"), Some(&"lzCQ6QBTnLpB0zMF".to_string()));
+        assert_eq!(updated_at, "5b329ab0447ccfd1e6d49aa2892778d339ba80ba9cf8f59d3c8a832c91b48fdc");
+    }
+
+    /// 验证 Mouflon Worker 响应解析兼容性：支持旧版 keys 字段及平铺键值对。
+    #[test]
+    fn parse_mouflon_worker_response_supports_legacy_keys_and_flat() {
+        use super::parse_mouflon_worker_response;
+
+        let legacy = r#"{
+            "keys": { "k1": "v1" },
+            "updated_at": "2026-10-31T18:00:00Z"
+        }"#;
+        let (keys, updated_at) = parse_mouflon_worker_response(legacy).unwrap();
+        assert_eq!(keys.get("k1"), Some(&"v1".to_string()));
+        assert_eq!(updated_at, "2026-10-31T18:00:00Z");
+
+        let flat = r#"{
+            "k2": "v2"
+        }"#;
+        let (keys, updated_at) = parse_mouflon_worker_response(flat).unwrap();
+        assert_eq!(keys.get("k2"), Some(&"v2".to_string()));
+        assert_eq!(updated_at, "");
     }
 }

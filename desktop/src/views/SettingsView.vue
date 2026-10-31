@@ -323,10 +323,12 @@
 		}
 	}
 
-	/** 格式化 RFC 3339 时间戳为本地时间字符串 / Format RFC 3339 timestamp to local time string */
+	/** 格式化 RFC 3339 时间戳或版本标识为可读字符串 / Format timestamp or version string */
 	function formatTs(ts: string | null): string {
 		if (!ts) return t("settings.mouflonNever");
-		return new Date(ts).toLocaleString();
+		const d = new Date(ts);
+		if (!isNaN(d.getTime())) return d.toLocaleString();
+		return ts.length > 16 ? `${ts.slice(0, 12)}…` : ts;
 	}
 </script>
 
