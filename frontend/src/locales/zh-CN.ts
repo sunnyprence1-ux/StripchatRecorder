@@ -208,6 +208,7 @@ export default {
 			retry: "重新开始",
 			useAccount: "让本节点使用该账号",
 			accountActive: "本节点已使用该账号",
+			reloginNewNumber: "换号登录 / 创建全新会话",
 		},
 	},
 	finder: {
@@ -392,6 +393,10 @@ export default {
 		advanced: "高级选项",
 		batchSize: "同时上传数量",
 		batchSizeHint: "多少个文件同时上传（1–10）。",
+		relogin: "刷新 Telegram 会话",
+		reloginHint: "重新打开已有的会话文件并同步授权密钥，无需重新输入手机号和验证码。",
+		reloginSuccess: "Telegram 会话刷新成功。",
+		reloginFailed: "Telegram 会话刷新失败。",
 		username: "群组 Username",
 		usernamePlaceholder: "mygroup（仅公开群组）",
 		sendVideo: "同时发送视频文件",

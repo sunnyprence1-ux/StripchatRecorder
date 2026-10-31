@@ -227,7 +227,7 @@ const COMMAND_MAP: Record<
 	login_start: {
 		method: "POST",
 		url: () => "/api/modules/login/start",
-		body: (a) => ({ moduleId: a.moduleId, params: a.params }),
+		body: (a) => ({ moduleId: a.moduleId, params: a.params, force: a.force }),
 	},
 	login_input: {
 		method: "POST",
@@ -257,6 +257,10 @@ const COMMAND_MAP: Record<
 			topicPerModel: a.topicPerModel,
 			deleteAfterSend: a.deleteAfterSend,
 			sendVideo: a.sendVideo,
+			sendCaption: a.sendCaption,
+			sendCover: a.sendCover,
+			coverFirst: a.coverFirst,
+			batchSize: a.batchSize,
 		}),
 	},
 	telegram_send_cancel: {
@@ -264,6 +268,7 @@ const COMMAND_MAP: Record<
 		url: () => "/api/telegram/send/cancel",
 		body: (a) => ({ path: a.path }),
 	},
+	telegram_relogin: { method: "POST", url: () => "/api/telegram/relogin" },
 	telegram_tasks: { method: "GET", url: () => "/api/telegram/tasks" },
 	telegram_tasks_dismiss: {
 		method: "POST",

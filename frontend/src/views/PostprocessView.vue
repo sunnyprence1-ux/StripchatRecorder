@@ -25,7 +25,7 @@
 	import { useNotify } from "@/composables/useNotify";
 	import { call } from "@/lib/api";
 	import { Button } from "@/components/ui/button";
-	import { GripVertical, ChevronUp, ChevronDown, X, Loader2, FlaskConical, KeyRound } from "@lucide/vue";
+	import { GripVertical, ChevronUp, ChevronDown, X, Loader2, FlaskConical, KeyRound, RefreshCw } from "@lucide/vue";
 	import { Switch } from "@/components/ui/switch";
 	import { Input } from "@/components/ui/input";
 	import { Label } from "@/components/ui/label";
@@ -269,6 +269,33 @@
 		if (testTarget.value) runTest(testTarget.value.node);
 	}
 
+	// ─── Telegram 会话刷新 / Telegram session refresh ──────────────────────────
+
+	/** 是否正在刷新 Telegram 会话 / Whether a Telegram relogin is in progress */
+	const reloginRunning = ref(false);
+
+	/**
+	 * 刷新 Telegram 会话：重新打开已有的 session 文件、同步 auth key，无需重新输入手机号。
+	 * Refresh the Telegram session: re-open the existing session file and re-sync
+	 * the auth key. No phone number or code is required.
+	 */
+	async function telegramRelogin() {
+		if (reloginRunning.value) return;
+		reloginRunning.value = true;
+		try {
+			const res = await call<{ ok: boolean; message?: string }>("telegram_relogin");
+			if (res.ok) {
+				toast(t("telegram.reloginSuccess"), "success");
+			} else {
+				toast(res.message || t("telegram.reloginFailed"), "error");
+			}
+		} catch (e) {
+			toast(String(e) || t("telegram.reloginFailed"), "error");
+		} finally {
+			reloginRunning.value = false;
+		}
+	}
+
 	// ─── 交互式登录 / Interactive login ───────────────────────────────────────
 
 	/** 登录交互结果 / Login interaction result */
@@ -357,8 +384,9 @@
 	 * Open the login dialog and start a login session.
 	 *
 	 * @param node - 要登录的流水线节点 / Pipeline node to sign in
+	 * @param force - 是否强制全新登录（清除旧会话，重新输入手机号）/ Whether to force fresh login
 	 */
-	async function openLogin(node: PipelineNode) {
+	async function openLogin(node: PipelineNode, force = false) {
 		loginNodeId.value = node.nodeId;
 		loginState.value = "";
 		loginDetail.value = "";
@@ -374,6 +402,7 @@
 				await call<LoginUpdate>("login_start", {
 					moduleId: node.moduleId,
 					params: { ...node.params },
+					force,
 				}),
 			);
 		} catch (e) {
@@ -381,6 +410,13 @@
 			loginDetail.value = e instanceof Error ? e.message : String(e);
 		} finally {
 			loginRunning.value = false;
+		}
+	}
+
+	/** 强制重新登录（清除已有会话，输入新手机号）/ Fresh re-login with a new number */
+	function reloginFresh() {
+		if (loginTarget.value) {
+			openLogin(loginTarget.value.node, true);
 		}
 	}
 
@@ -543,6 +579,18 @@
 							>
 								<KeyRound class="size-3.5" />
 								{{ t("postprocess.login.button") }}
+							</Button>
+							<Button
+								v-if="info?.loginable && !isModuleMissing(node) && info?.id === 'notify_telegram'"
+								variant="outline"
+								size="sm"
+								class="h-7 text-xs gap-1.5"
+								:title="t('telegram.reloginHint')"
+								:disabled="reloginRunning"
+								@click="telegramRelogin()"
+							>
+								<RefreshCw class="size-3.5" :class="reloginRunning ? 'animate-spin' : ''" />
+								{{ t("telegram.relogin") }}
 							</Button>
 							<Button
 								v-if="info?.testable && !isModuleMissing(node)"
@@ -888,19 +936,31 @@
 									})
 								}}
 							</span>
-							<Button
-								v-if="loginNodeUsesUser"
-								size="sm"
-								class="self-start mt-1"
-								@click="useLoggedInAccount"
-							>
-								{{ t("postprocess.login.useAccount") }}
-							</Button>
-							<span
-								v-else
-								class="text-muted-foreground text-xs"
-								>✓ {{ t("postprocess.login.accountActive") }}</span
-							>
+							<div class="flex flex-wrap items-center gap-2 mt-2">
+								<Button
+									v-if="loginNodeUsesUser"
+									size="sm"
+									class="self-start"
+									@click="useLoggedInAccount"
+								>
+									{{ t("postprocess.login.useAccount") }}
+								</Button>
+								<span
+									v-else
+									class="text-muted-foreground text-xs"
+									>✓ {{ t("postprocess.login.accountActive") }}</span
+								>
+								<Button
+									variant="outline"
+									size="sm"
+									class="text-xs gap-1.5"
+									:disabled="loginRunning"
+									@click="reloginFresh"
+								>
+									<RefreshCw class="size-3.5" :class="loginRunning ? 'animate-spin' : ''" />
+									{{ t("postprocess.login.reloginNewNumber") }}
+								</Button>
+							</div>
 						</div>
 					</template>
 

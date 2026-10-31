@@ -33,7 +33,8 @@
 	import { Progress } from "@/components/ui/progress";
 	import { useNotify } from "@/composables/useNotify";
 	import { useTelegramSend } from "@/composables/useTelegramSend";
-	import { ChevronDown, Loader2, Send, Square, Trash2, TriangleAlert } from "@lucide/vue";
+	import { call } from "@/lib/api";
+	import { ChevronDown, Loader2, RefreshCw, Send, Square, Trash2, TriangleAlert } from "@lucide/vue";
 
 	const props = defineProps<{ paths: string[] }>();
 	const emit = defineEmits<{ close: [] }>();
@@ -189,6 +190,29 @@
 		toast(t("telegram.cancelled"), "warning");
 	}
 
+	/** 是否正在刷新 Telegram 会话 / Whether relogin is in progress */
+	const reloginRunning = ref(false);
+
+	/** 快速刷新 Telegram 会话 / Quick refresh Telegram session */
+	async function quickRelogin() {
+		if (reloginRunning.value) return;
+		reloginRunning.value = true;
+		try {
+			const res = await call<{ ok: boolean; message?: string }>("telegram_relogin");
+			if (res.ok) {
+				toast(t("telegram.reloginSuccess"), "success");
+				const d = await tg.fetchDefaults();
+				hasAccount.value = d.hasAccount;
+			} else {
+				toast(res.message || t("telegram.reloginFailed"), "error");
+			}
+		} catch (e) {
+			toast(String(e) || t("telegram.reloginFailed"), "error");
+		} finally {
+			reloginRunning.value = false;
+		}
+	}
+
 	/**
 	 * 关闭对话框；正在发送时不允许直接关闭，避免用户误以为已经取消。
 	 * Close the dialog; while sending, close is blocked so it can't be mistaken for a cancel.
@@ -230,9 +254,21 @@
 				<!-- 没有可用账号 / No account -->
 				<div
 					v-else-if="!loading && !hasAccount"
-					class="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs"
+					class="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs flex flex-col gap-2"
 				>
-					{{ t("telegram.noAccount") }}
+					<p>{{ t("telegram.noAccount") }}</p>
+					<div class="flex items-center gap-2">
+						<Button
+							variant="outline"
+							size="sm"
+							class="h-7 text-xs gap-1.5"
+							:disabled="reloginRunning"
+							@click="quickRelogin"
+						>
+							<RefreshCw class="size-3.5" :class="reloginRunning ? 'animate-spin' : ''" />
+							{{ t("telegram.relogin") }}
+						</Button>
+					</div>
 				</div>
 
 				<!-- 文件列表 / File list -->

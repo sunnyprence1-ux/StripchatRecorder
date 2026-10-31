@@ -262,9 +262,11 @@ fn wait_for_state(
 /// # 参数 / Parameters
 /// - `module`: 模块信息（需支持 `loginable`）/ Module info (must be `loginable`)
 /// - `params`: 节点参数值（传给模块的环境变量）/ Node parameter values (passed as env vars)
+/// - `force`: 是否强制全新登录（清除已有的会话文件，重新输入手机号）/ Whether to force fresh login
 pub fn start_login(
     module: &ModuleInfo,
     params: &HashMap<String, serde_json::Value>,
+    force: bool,
 ) -> Result<LoginUpdate, String> {
     if !module.loginable {
         return Err(format!("模块 '{}' 不支持登录", module.id));
@@ -273,8 +275,13 @@ pub fn start_login(
     cleanup_idle();
 
     let mut cmd = Command::new(&module.exe_path);
-    cmd.arg("--login")
-        .env("PP_EXE_DIR", exe_dir())
+    cmd.arg("--login");
+    if force {
+        cmd.arg("--fresh");
+        cmd.env("PP_FORCE_LOGIN", "1");
+        cmd.env("PP_PARAM_FORCE_LOGIN", "1");
+    }
+    cmd.env("PP_EXE_DIR", exe_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -499,7 +506,7 @@ pub fn refresh_session(module: &ModuleInfo, api_id: i32, proxy: &str) -> Result<
         .env("proxy", proxy);
 
     let mut child = cmd.spawn().map_err(|e| format!("启动刷新失败: {}", e))?;
-    let (tx, mut rx) = mpsc::channel::<Event>();
+    let (tx, rx) = mpsc::channel::<Event>();
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();

@@ -834,27 +834,55 @@ fn private_session_copy(path: &Path) -> PathBuf {
     let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("session");
     let copy = tmp_dir().join(format!("{}.{}.session", file_name, std::process::id()));
     match std::fs::copy(path, &copy) {
-        Ok(_) => copy,
+        Ok(_) => {
+            let wal = format!("{}-wal", path.display());
+            let shm = format!("{}-shm", path.display());
+            if Path::new(&wal).is_file() {
+                let _ = std::fs::copy(&wal, format!("{}-wal", copy.display()));
+            }
+            if Path::new(&shm).is_file() {
+                let _ = std::fs::copy(&shm, format!("{}-shm", copy.display()));
+            }
+            copy
+        }
         Err(_) => path.to_path_buf(),
     }
 }
 
-/// 刷新会话：重新打开一个已授权的会话并强制同步，刷新认证密钥与 peer 缓存。
+/// 清理本进程创建的临时会话副本 / Clean up the temp session copy for this process
+fn cleanup_session_copy(api_id: i32, mode: SessionMode) {
+    let path = session_path(api_id, mode);
+    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("session");
+    let copy = tmp_dir().join(format!("{}.{}.session", file_name, std::process::id()));
+    let _ = std::fs::remove_file(&copy);
+    let _ = std::fs::remove_file(format!("{}-wal", copy.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", copy.display()));
+}
+
+/// 刷新会话：重新打开一个已授权的会话并强制同步，刷新认证密钥与状态。
 ///
 /// 由后端 `/api/telegram/relogin` 驱动（模块的 `--refresh` 参数）。需要 `--login`
 /// 登录过的已授权会话文件；会话未授权时会给出明确的登录提示，而不是让用户猜。
-/// 刷新成功后 stdout 会打印 `ready`，失败则打印错误。
+/// 刷新成功后 stdout 会打印 `LOGIN_STATE:refreshed:{user}`，失败则打印错误。
 ///
-/// Refresh a session: re-open an already-authorized session and force a sync to
-/// refresh the auth key and peer cache.
+/// Refresh a session: re-open an already-authorized session and sync to
+/// refresh the auth key and status.
 ///
 /// Driven by the backend `/api/telegram/relogin` endpoint (module `--refresh` param).
 /// Requires an authorized session file created by `--login`; if the session is not
 /// authorized, prints a clear login hint instead of leaving the user guessing. On
-/// success stdout prints `ready`, on failure prints an error.
+/// success stdout prints `LOGIN_STATE:refreshed:...`, on failure prints an error.
 async fn refresh_session(api_id: i32, proxy: &str) -> Result<(), String> {
     let path = session_path(api_id, SessionMode::User);
-    let client = connect_client(api_id, "", "", proxy, SessionMode::User).await?;
+    if !path.is_file() {
+        return Err(format!(
+            "session file not found at {} — click \"Login\" in the pipeline UI to sign in first",
+            path.display()
+        ));
+    }
+    // 刷新时必须操作真实会话文件（session_private: false），避免在临时副本上操作
+    // Refresh must operate directly on the real session file (session_private: false)
+    let client = open_client(api_id, proxy, SessionMode::User, false).await?;
 
     if !client
         .is_authorized()
@@ -873,6 +901,16 @@ async fn refresh_session(api_id: i32, proxy: &str) -> Result<(), String> {
     login_state(&format!("refreshed:{}", user));
     eprintln!("session refreshed as {}", user);
     Ok(())
+}
+
+/// 刷新模式入口（`--refresh`）：验证并刷新已授权用户会话（无需手机号或验证码）。
+/// Refresh entry point (`--refresh`): verify and refresh an authorized user session.
+fn run_refresh(api_id: i32, proxy: &str) -> Result<(), String> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime error: {}", e))?
+        .block_on(refresh_session(api_id, proxy))
 }
 
 /// 打开（或创建）会话文件并建立 MTProto 连接，但不做任何鉴权。
@@ -2879,12 +2917,26 @@ async fn login_flow() -> Result<(), String> {
     let mode = SessionMode::User;
     let path = session_path(api_id, mode);
 
+    let is_force = {
+        let val = param("force_login", "");
+        val == "1" || val.eq_ignore_ascii_case("true")
+            || env::var("PP_FORCE_LOGIN").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false)
+            || env::args().any(|a| a == "--fresh" || a == "--force")
+    };
+
+    if is_force && path.exists() {
+        eprintln!("fresh login requested: removing existing session {}", path.display());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
     // 已存在的用户会话直接复用，无需再次登录
     // Reuse an existing user session instead of signing in again
     let client = open_client(api_id, &proxy, mode, false).await?;
     login_state(&format!("session:{}", path.display()));
 
-    if client
+    if !is_force && client
         .is_authorized()
         .await
         .map_err(|e| format!("is_authorized failed: {}", e))?
@@ -3105,11 +3157,12 @@ fn run() -> Result<(), String> {
         println!("DELETE_INPUT");
     }
 
+    cleanup_session_copy(api_id, mode);
     Ok(())
 }
 
-/// 程序入口：处理 `--describe` / `--login` 参数或执行主逻辑。
-/// Entry point: handle the `--describe` / `--login` argument or run the main logic.
+/// 程序入口：处理 `--describe` / `--login` / `--refresh` 参数或执行主逻辑。
+/// Entry point: handle `--describe` / `--login` / `--refresh` argument or run the main logic.
 fn main() {
     let args: Vec<String> = env::args().collect();
     let arg1 = args.get(1).map(|s| s.as_str());
@@ -3124,6 +3177,34 @@ fn main() {
     // Login mode (--login): driven by the host's "Login" button, creates the user session file
     if arg1 == Some("--login") {
         if let Err(e) = run_login() {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // 刷新模式（--refresh）：验证并刷新已授权用户会话（无需手机号或验证码）
+    // Refresh mode (--refresh): verify and refresh an authorized user session
+    if arg1 == Some("--refresh") {
+        let mut api_id = param("api_id", "");
+        if api_id.is_empty() {
+            if let Some(arg2) = args.get(2) {
+                api_id = arg2.to_string();
+            }
+        }
+        if api_id.is_empty() {
+            eprintln!("api_id is required for --refresh");
+            std::process::exit(1);
+        }
+        let proxy = param("proxy", "");
+        let id: i32 = match api_id.parse() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("api_id must be a number");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = run_refresh(id, &proxy) {
             eprintln!("{}", e);
             std::process::exit(1);
         }

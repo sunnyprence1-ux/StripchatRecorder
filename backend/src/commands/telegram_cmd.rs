@@ -336,6 +336,13 @@ pub fn send_inner(req: SendRequest, emitter: &Arc<dyn Emitter>, state: &Arc<AppS
     if let Some(n) = req.batch_size {
         state.tg_gate.set_limit(n.max(1) as usize);
     }
+
+    state.tg_task_status_text(&path_str, "Queued (waiting for upload slot)");
+    emitter.emit(
+        "telegram-send-progress",
+        &serde_json::json!({ "path": path_str, "statusText": "Queued (waiting for upload slot)" }),
+    );
+
     let _permit = match state.tg_gate.acquire(&cancel) {
         Some(p) => p,
         None => {
@@ -352,6 +359,12 @@ pub fn send_inner(req: SendRequest, emitter: &Arc<dyn Emitter>, state: &Arc<AppS
             return;
         }
     };
+
+    state.tg_task_status_text(&path_str, "Starting upload...");
+    emitter.emit(
+        "telegram-send-progress",
+        &serde_json::json!({ "path": path_str, "statusText": "Starting upload..." }),
+    );
 
     let video = std::path::PathBuf::from(&path_str);
     let result = run_module_once(
@@ -706,9 +719,14 @@ pub fn run_refresh(exe: &std::path::Path, api_id: &str, proxy: &str) -> (bool, S
 
     let mut cmd = Command::new(exe);
     cmd.arg("--refresh");
+    if !api_id.is_empty() {
+        cmd.arg(api_id);
+    }
     cmd.env("PP_API_ID", api_id);
+    cmd.env("PP_PARAM_API_ID", api_id);
     if !proxy.is_empty() {
         cmd.env("PP_PROXY", proxy);
+        cmd.env("PP_PARAM_PROXY", proxy);
     }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());

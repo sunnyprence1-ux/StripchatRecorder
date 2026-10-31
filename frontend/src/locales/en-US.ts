@@ -210,6 +210,7 @@ export default {
 			retry: "Start Over",
 			useAccount: "Use this account for the node",
 			accountActive: "This node already uses your account",
+			reloginNewNumber: "Log in with new number / fresh session",
 		},
 	},
 	finder: {
@@ -395,6 +396,10 @@ export default {
 		advanced: "Advanced options",
 		batchSize: "Concurrent uploads",
 		batchSizeHint: "How many files upload at the same time (1–10).",
+		relogin: "Refresh Telegram session",
+		reloginHint: "Re-open the existing session file and re-sync the auth key. No phone number or code needed.",
+		reloginSuccess: "Telegram session refreshed successfully.",
+		reloginFailed: "Telegram session refresh failed.",
 		username: "Group username",
 		usernamePlaceholder: "mygroup (public groups only)",
 		sendVideo: "Also send the video file",

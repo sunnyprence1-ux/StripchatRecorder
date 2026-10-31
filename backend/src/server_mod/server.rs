@@ -648,6 +648,9 @@ struct LoginStartBody {
     /// 节点参数值 / Node parameter values
     #[serde(default)]
     params: std::collections::HashMap<String, serde_json::Value>,
+    /// 是否强制全新登录（清除已有的会话文件，重新输入手机号）/ Whether to force fresh login
+    #[serde(default)]
+    force: bool,
 }
 
 /// 登录会话请求体（输入一行命令）/ Login request body (submit one command line)
@@ -671,7 +674,7 @@ async fn login_start(Json(body): Json<LoginStartBody>) -> ApiResult<serde_json::
             .into_iter()
             .find(|m| m.id == body.module_id);
         match module {
-            Some(m) => crate::postprocess::login::start_login(&m, &body.params)
+            Some(m) => crate::postprocess::login::start_login(&m, &body.params, body.force)
                 .map_err(crate::core::error::AppError::Other),
             None => Err(crate::core::error::AppError::Other(format!(
                 "模块 '{}' 不存在",
