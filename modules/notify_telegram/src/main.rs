@@ -174,10 +174,16 @@ const DESCRIBE: &str = r#"{
         "default": true
         },
         {
-        "key": "upload_workers",
-        "label": "并发上传分块数（默认 8，上限 16；0 = 默认）。串行上传时每个 512KB 分块都要等服务器回包，并发后这些往返重叠起来，12MB 视频实测快约 1.8 倍（链路本身才是上限）",
+        "key": "batch_size",
+        "label": "批量并发上传视频数（默认 3，范围 1–10）。多个成片同时发送时，最多同时上传多少个视频，其余自动排队",
         "type": "number",
-        "default": 8
+        "default": 3
+        },
+        {
+        "key": "upload_workers",
+        "label": "每个视频的并发上传分块数（默认 16，上限 16；0 = 默认）。每个 512KB 分块并发传输，16 线程满速上传",
+        "type": "number",
+        "default": 16
         }
     ]
 }"#;
@@ -269,20 +275,54 @@ fn resize_cover_for_telegram(img: &Path) -> Result<Option<PathBuf>, String> {
 /// # 返回值 / Returns
 /// 缩略图文件路径，失败时返回错误。
 /// Thumbnail file path, or error on failure.
+/// 提取视频缩略图（用于上传视频消息内嵌的 thumb）。
+/// Telegram MTProto 要求缩略图为 JPEG 格式且建议 320x320 尺寸。
+///
+/// Extract video thumbnail (used as embedded thumb for InputMediaUploadedDocument).
+/// Telegram MTProto requires the thumbnail to be JPEG and ideally <= 320x320.
 fn extract_video_thumbnail(input: &Path) -> Result<PathBuf, String> {
     let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("recording");
-    let thumb_path = tmp_dir().join(format!("{}.tg_thumb.png", stem));
+    let thumb_path = tmp_dir().join(format!("{}.tg_thumb.jpg", stem));
+    let dur = pp_utils::video_duration(input).unwrap_or(0.0);
+    let ss = if dur > 10.0 { "5" } else if dur > 2.0 { "1" } else { "0" };
     let status = Command::new("ffmpeg")
-        .args(["-y", "-i"])
+        .args(["-y", "-ss", ss, "-i"])
         .arg(input)
-        .args(["-frames:v", "1", "-q:v", "2"])
+        .args([
+            "-frames:v", "1",
+            "-vf", "scale='if(gt(iw,ih),320,-1)':'if(gt(iw,ih),-1,320)'",
+            "-q:v", "2",
+        ])
         .arg(&thumb_path)
         .stdout(Stdio::null()).stderr(Stdio::null())
         .status()
         .map_err(|e| format!("ffmpeg not found: {}", e))?;
-    if !status.success() { return Err("ffmpeg failed to extract video thumbnail".to_string()); }
-    if !thumb_path.exists() { return Err("video thumbnail file was not created".to_string()); }
+    if !status.success() || !thumb_path.exists() {
+        return Err("ffmpeg failed to extract video thumbnail".to_string());
+    }
     Ok(thumb_path)
+}
+
+/// 从视频中截取一帧画面作为封面图（当本地没有联系表图片且开启了 send_cover 时使用）。
+///
+/// Extract a video frame as cover image (used when no contact sheet exists and send_cover is on).
+fn extract_video_frame(input: &Path) -> Result<PathBuf, String> {
+    let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("recording");
+    let frame_path = tmp_dir().join(format!("{}.tg_cover.jpg", stem));
+    let dur = pp_utils::video_duration(input).unwrap_or(0.0);
+    let ss = if dur > 10.0 { "5" } else if dur > 2.0 { "1" } else { "0" };
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-ss", ss, "-i"])
+        .arg(input)
+        .args(["-frames:v", "1", "-q:v", "2"])
+        .arg(&frame_path)
+        .stdout(Stdio::null()).stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("ffmpeg not found: {}", e))?;
+    if !status.success() || !frame_path.exists() {
+        return Err("ffmpeg failed to extract video frame for cover".to_string());
+    }
+    Ok(frame_path)
 }
 
 /// 将视频文件按大小分割为多个片段（用于绕过 Telegram 2GB 文件大小限制）。
@@ -1520,8 +1560,9 @@ const UPLOAD_CHUNK_SIZE: usize = 512 * 1024;
 /// 超过这个大小才走大文件接口（不需要 md5）/ Above this size the big-file API is used (no md5)
 const BIG_FILE_THRESHOLD: usize = 10 * 1024 * 1024;
 
-/// 默认同时上传的分块数 / Default number of parts uploaded concurrently
-const DEFAULT_UPLOAD_WORKERS: usize = 8;
+/// 默认同时上传的分块数（16 线程满速并发，与 Telegram-Fast-Uploader 保持一致）
+/// Default number of parts uploaded concurrently (16 parallel workers matching Telegram-Fast-Uploader)
+const DEFAULT_UPLOAD_WORKERS: usize = 16;
 
 /// 并发分块数的上限（再高只会更快触发限流）/ Upper bound (beyond this only flood-waits grow)
 const MAX_UPLOAD_WORKERS: usize = 16;
@@ -3090,7 +3131,24 @@ fn run() -> Result<(), String> {
     let name_str  = input.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
     let size_str  = format_bytes(file_size);
 
-    let cover = find_cover(&input);
+    // 查找或自动从视频截取封面图 / Find or automatically extract a video frame as cover image
+    let (cover_path_buf, is_auto_cover) = match find_cover(&input) {
+        Some(p) => (Some(p), false),
+        None if send_cover => {
+            match extract_video_frame(&input) {
+                Ok(p) => {
+                    eprintln!("no contact sheet found; extracted video frame as cover: {}", p.display());
+                    (Some(p), true)
+                }
+                Err(e) => {
+                    eprintln!("could not extract cover frame from video: {}", e);
+                    (None, false)
+                }
+            }
+        }
+        None => (None, false),
+    };
+    let cover = cover_path_buf.as_deref();
 
     // 构建 Tokio 运行时，先连接（同时确定单文件上限），再上传发送
     // Build the Tokio runtime, connect (which also determines the per-file limit), then upload
@@ -3141,6 +3199,13 @@ fn run() -> Result<(), String> {
     if is_split {
         for part in &video_parts {
             if part != &input { let _ = fs::remove_file(part); }
+        }
+    }
+
+    // 清理自动截取的临时封面图 / Clean up temporary auto-extracted cover image
+    if is_auto_cover {
+        if let Some(ref p) = cover_path_buf {
+            let _ = fs::remove_file(p);
         }
     }
 
@@ -3442,9 +3507,8 @@ mod tests {
         assert_eq!(p["default"], true);
     }
 
-    /// 并发上传参数必须存在且默认 8：这是加速的来源，不能被悄悄关掉。
-    /// The concurrent-upload parameter must exist and default to 8 — it is where the speedup
-    /// comes from, so it must not be silently disabled.
+    /// 并发上传参数必须存在且默认 16：与 Telegram-Fast-Uploader 一致，16 线程满速上传。
+    /// The concurrent-upload parameter must exist and default to 16 — matching Telegram-Fast-Uploader.
     #[test]
     fn describe_declares_parallel_upload_workers() {
         let v: serde_json::Value = serde_json::from_str(DESCRIBE).expect("DESCRIBE is valid JSON");
@@ -3456,7 +3520,22 @@ mod tests {
             .expect("upload_workers param is declared");
         assert_eq!(p["type"], "number");
         assert_eq!(p["default"], DEFAULT_UPLOAD_WORKERS);
-        assert_eq!(DEFAULT_UPLOAD_WORKERS, 8);
+        assert_eq!(DEFAULT_UPLOAD_WORKERS, 16);
+    }
+
+    /// 批量并发参数必须存在且默认 3。
+    /// The batch_size parameter must exist and default to 3.
+    #[test]
+    fn describe_declares_batch_size() {
+        let v: serde_json::Value = serde_json::from_str(DESCRIBE).expect("DESCRIBE is valid JSON");
+        let params = v["params"].as_array().expect("params is an array");
+
+        let p = params
+            .iter()
+            .find(|p| p["key"] == "batch_size")
+            .expect("batch_size param is declared");
+        assert_eq!(p["type"], "number");
+        assert_eq!(p["default"], 3);
     }
 
     /// 并发分块数归一化：0 取默认，超过上限截断，永远不会是 0 个 worker。
@@ -3466,6 +3545,7 @@ mod tests {
         assert_eq!(normalize_upload_workers(0), DEFAULT_UPLOAD_WORKERS);
         assert_eq!(normalize_upload_workers(1), 1);
         assert_eq!(normalize_upload_workers(8), 8);
+        assert_eq!(normalize_upload_workers(16), 16);
         assert_eq!(normalize_upload_workers(999), MAX_UPLOAD_WORKERS);
     }
 

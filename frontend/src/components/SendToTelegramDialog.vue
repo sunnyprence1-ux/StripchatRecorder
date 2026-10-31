@@ -28,6 +28,13 @@
 	} from "@/components/ui/dialog";
 	import { Button } from "@/components/ui/button";
 	import { Input } from "@/components/ui/input";
+	import {
+		NumberField,
+		NumberFieldContent,
+		NumberFieldDecrement,
+		NumberFieldIncrement,
+		NumberFieldInput,
+	} from "@/components/ui/number-field";
 	import { Label } from "@/components/ui/label";
 	import { Switch } from "@/components/ui/switch";
 	import { Progress } from "@/components/ui/progress";
@@ -43,6 +50,9 @@
 	const { toast } = useNotify();
 	const tg = useTelegramSend();
 
+	const STORAGE_KEY_BATCH = "tg_send_batch_size";
+	const savedBatch = typeof localStorage !== "undefined" ? parseInt(localStorage.getItem(STORAGE_KEY_BATCH) || "", 10) : 0;
+
 	/** 表单参数 / Form values */
 	const form = reactive({
 		chatId: "",
@@ -54,8 +64,16 @@
 		sendCover: true,
 		coverFirst: true,
 		/** 同时上传的文件数量（1 = 逐个，>1 = 并发）/ Concurrent upload count */
-		batchSize: 3,
+		batchSize: savedBatch && savedBatch > 0 ? savedBatch : 3,
 	});
+
+	function setBatchSize(val: number | undefined) {
+		const n = val !== undefined && Number.isFinite(val) ? Math.max(1, Math.min(10, Math.floor(val))) : 1;
+		form.batchSize = n;
+		try {
+			localStorage.setItem(STORAGE_KEY_BATCH, String(n));
+		} catch {}
+	}
 
 	/** 是否正在加载默认值 / Whether the defaults are loading */
 	const loading = ref(true);
@@ -130,7 +148,9 @@
 			form.sendCaption = d.sendCaption ?? false;
 			form.sendCover = d.sendCover ?? true;
 			form.coverFirst = d.coverFirst ?? true;
-			form.batchSize = d.batchSize && d.batchSize > 0 ? d.batchSize : 3;
+			if (!savedBatch) {
+				form.batchSize = d.batchSize && d.batchSize > 0 ? d.batchSize : 3;
+			}
 		} catch {
 			// 读取默认值失败不阻塞发送：用户仍可手动填写群组 ID
 			// Failing to read defaults doesn't block sending: the user can still type a chat id
@@ -349,19 +369,41 @@
 						<Label for="tg-batch-size" class="text-xs">{{
 							t("telegram.batchSize")
 						}}</Label>
-						<div class="flex items-center gap-2">
-							<Input
+						<div class="flex items-center gap-2 flex-wrap">
+							<NumberField
 								id="tg-batch-size"
-								v-model.number="form.batchSize"
-								type="number"
-								inputmode="numeric"
-								min="1"
-								max="10"
-								step="1"
-								class="w-24"
+								:model-value="form.batchSize"
+								:min="1"
+								:max="10"
+								:step="1"
 								:disabled="loading || sending"
-							/>
-							<span class="text-[11px] text-muted-foreground">{{
+								class="w-32"
+								@update:model-value="setBatchSize"
+							>
+								<NumberFieldContent>
+									<NumberFieldDecrement />
+									<NumberFieldInput />
+									<NumberFieldIncrement />
+								</NumberFieldContent>
+							</NumberField>
+							<div class="flex items-center gap-1">
+								<Button
+									v-for="n in [1, 2, 3, 5, 8]"
+									:key="n"
+									type="button"
+									size="sm"
+									variant="outline"
+									:class="[
+										'h-8 px-2 text-xs font-mono',
+										form.batchSize === n ? 'border-primary bg-primary/10 text-primary font-semibold' : ''
+									]"
+									:disabled="loading || sending"
+									@click="setBatchSize(n)"
+								>
+									{{ n }}
+								</Button>
+							</div>
+							<span class="text-[11px] text-muted-foreground w-full">{{
 								t("telegram.batchSizeHint")
 							}}</span>
 						</div>
